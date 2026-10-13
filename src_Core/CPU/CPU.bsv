@@ -243,6 +243,11 @@ module mkCPU (CPU_IFC);
    FIFOF #(Bool)  f_reset_rsps <- mkFIFOF;
 
    // ----------------
+   // Performance-monitoring pulses (consumed by Core/SoC_Info counters)
+   PulseWire pw_perf_retire   <- mkPulseWire;
+   PulseWire pw_perf_redirect <- mkPulseWire;
+
+   // ----------------
    // Communication to/from External debug module
 
 `ifdef INCLUDE_GDB_CONTROL
@@ -685,6 +690,7 @@ module mkCPU (CPU_IFC);
 	 // Note: this instr cannot be a CSRRx updating INSTRET, since
 	 // CSRRx is done off-pipe
 	 csr_regfile.csr_minstret_incr;
+	 pw_perf_retire.send;
 	 fa_emit_instr_trace (minstret, stage2.out.data_to_stage3.pc, stage2.out.data_to_stage3.instr, rg_cur_priv);
       end
 
@@ -710,6 +716,7 @@ module mkCPU (CPU_IFC);
 	       if (stage1.out.redirect) begin
 		  rg_next_pc <= stage1.out.next_pc;
 		  redirect    = True;
+		  pw_perf_redirect.send;
 	       end
 	    end
 	 end
@@ -1893,6 +1900,23 @@ module mkCPU (CPU_IFC);
    // Misc. status; 0 = running, no error
    method Bit #(8) mv_status;
       return near_mem.mv_status;
+   endmethod
+
+   // Performance-monitoring taps (see interface comment)
+   method Bool mv_perf_retire;
+      return pw_perf_retire;
+   endmethod
+
+   method Bool mv_perf_redirect;
+      return pw_perf_redirect;
+   endmethod
+
+   method Bool mv_perf_imiss;
+      return near_mem.mv_perf_imiss;
+   endmethod
+
+   method Bool mv_perf_dmiss;
+      return near_mem.mv_perf_dmiss;
    endmethod
 
 endmodule: mkCPU

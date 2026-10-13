@@ -36,47 +36,42 @@ typedef AXI4_Fabric_IFC #(Num_Masters,
 (* synthesize *)
 module mkFabric_AXI4 (Fabric_AXI4_IFC);
 
-   SoC_Map_IFC soc_map <- mkSoC_Map;
+   // Decode from the SAME declarative table the manifest is emitted
+   // from (SoC_Map.fn_soc_memmap): fabric-decoded regions only, first
+   // match wins.  Semantically identical to the former if-chain, but
+   // the address ranges now have a single source of truth.
+   List #(MemRegion) soc_memmap = fn_soc_memmap ();
+
+   function Bool fn_is_fabric_region (MemRegion r);
+      return r.fabric_decoded;
+   endfunction
+
+   function Tuple3 #(Fabric_Addr, Fabric_Addr, Slave_Num) fn_mk_entry (MemRegion r);
+      return tuple3 (zeroExtend (r.base),
+                     zeroExtend (r.base + r.size),
+                     fn_dev_slave_num (r.device));
+   endfunction
+
+   List #(Tuple3 #(Fabric_Addr, Fabric_Addr, Slave_Num)) axi_decode_tbl =
+      List::map (fn_mk_entry, List::filter (fn_is_fabric_region, soc_memmap));
+
+   function Tuple2 #(Bool, Slave_Num) fn_decode (Fabric_Addr addr,
+                                                 List #(Tuple3 #(Fabric_Addr,
+                                                                 Fabric_Addr,
+                                                                 Slave_Num)) rs);
+      if (rs == nil)
+         return tuple2 (False, ?);
+      else begin
+         match { .rb, .rl, .rsn } = List::head (rs);
+         if ((rb <= addr) && (addr < rl))
+            return tuple2 (True, rsn);
+         else
+            return fn_decode (addr, List::tail (rs));
+      end
+   endfunction
 
    function Tuple2 #(Bool, Slave_Num) fn_addr_to_slave_num  (Fabric_Addr addr);
-
-      // Main Mem
-      if (   (soc_map.m_mem0_controller_addr_base <= addr)
-	  && (addr < soc_map.m_mem0_controller_addr_lim))
-	 return tuple2 (True, fromInteger (mem0_controller_slave_num));
-
-      // Boot ROM
-      else if (   (soc_map.m_boot_rom_addr_base <= addr)
-	  && (addr < soc_map.m_boot_rom_addr_lim))
-	 return tuple2 (True, fromInteger (boot_rom_slave_num));
-
-`ifdef Near_Mem_TCM
-      // TCM
-      else if (   (soc_map.m_tcm_addr_base <= addr)
-	       && (addr < soc_map.m_tcm_addr_lim))
-	 return tuple2 (True, fromInteger (tcm_back_door_slave_num));
-`endif
-
-      // UART
-      else if (   (soc_map.m_uart0_addr_base <= addr)
-	       && (addr < soc_map.m_uart0_addr_lim))
-	 return tuple2 (True, fromInteger (uart0_slave_num));
-
-`ifdef HTIF_MEMORY
-      else if (   (soc_map.m_htif_addr_base <= addr)
-	       && (addr < soc_map.m_htif_addr_lim))
-	 return tuple2 (True, fromInteger (htif_slave_num));
-`endif
-
-`ifdef INCLUDE_ACCEL0
-      // Accelerator 0
-      else if (   (soc_map.m_accel0_addr_base <= addr)
-	       && (addr < soc_map.m_accel0_addr_lim))
-	 return tuple2 (True, fromInteger (accel0_slave_num));
-`endif
-
-      else
-	 return tuple2 (False, ?);
+      return fn_decode (addr, axi_decode_tbl);
    endfunction
 
    AXI4_Fabric_IFC #(Num_Masters, Num_Slaves, Wd_Id, Wd_Addr, Wd_Data, Wd_User)

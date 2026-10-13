@@ -131,6 +131,19 @@ typedef Bit #(4)  AXI4_Region;
 // RESP
 typedef Bit #(2)  AXI4_Resp;
 
+// ================================================================
+// Bus error event: emitted by the AXI4 fabric when a transaction
+// decodes to no slave (unmapped address) so a monitor peripheral can
+// capture faulting address/master/id (see AXI4_Fabric.err_events and
+// the SoC_Info register block).
+
+typedef struct {
+   Bit #(64) addr;
+   Bool      is_wr;
+   Bit #(8)  master;
+   Bit #(2)  resp;
+} BusErrEvent deriving (Bits, Eq);
+
 AXI4_Resp  axi4_resp_okay   = 2'b_00;
 AXI4_Resp  axi4_resp_exokay = 2'b_01;
 AXI4_Resp  axi4_resp_slverr = 2'b_10;

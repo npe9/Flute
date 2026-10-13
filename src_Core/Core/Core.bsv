@@ -454,6 +454,23 @@ module mkCore
    method Bit #(8) mv_status;
       return cpu.mv_status;
    endmethod
+
+   // Performance-monitoring taps (see Core_IFC comment)
+   method Bool mv_perf_retire;
+      return cpu.mv_perf_retire;
+   endmethod
+
+   method Bool mv_perf_redirect;
+      return cpu.mv_perf_redirect;
+   endmethod
+
+   method Bool mv_perf_imiss;
+      return cpu.mv_perf_imiss;
+   endmethod
+
+   method Bool mv_perf_dmiss;
+      return cpu.mv_perf_dmiss;
+   endmethod
 endmodule: mkCore
 
 endpackage

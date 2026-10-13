@@ -133,6 +133,13 @@ interface Near_Mem_IFC;
    (* always_ready *)
    method Bit #(8) mv_status;
 
+   // Performance-monitoring taps: one-cycle pulses on cache-miss refill
+   // starts (I-side and D-side respectively).
+   (* always_ready *)
+   method Bool mv_perf_imiss;
+   (* always_ready *)
+   method Bool mv_perf_dmiss;
+
 endinterface
    
 // ================================================================

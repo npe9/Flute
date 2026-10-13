@@ -12,6 +12,7 @@ package AXI4_Fabric;
 import Vector       :: *;
 import FIFOF        :: *;
 import SpecialFIFOs :: *;
+import GetPut       :: *;
 import ConfigReg    :: *;
 
 // ----------------
@@ -34,6 +35,9 @@ interface AXI4_Fabric_IFC #(numeric type tn_num_masters,
 			    numeric type wd_addr,
 			    numeric type wd_data,
 			    numeric type wd_user);
+   // Decode-error events (unmapped addresses): faulting address, master,
+   // id, read/write.  Drained by a monitor peripheral (SoC_Info BUSERR_*).
+   interface Get #(BusErrEvent) err_events;
    method Action reset;
    method Action set_verbosity (Bit #(4) verbosity);
 
@@ -60,7 +64,9 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
    provisos (Log #(tn_num_masters, log_nm),
 	     Log #(tn_num_slaves,  log_ns),
 	     Log #(TAdd #(tn_num_slaves,  1),  log_ns_plus_1),
-	     Log #(TAdd #(tn_num_masters,  1), log_nm_plus_1));
+	     Log #(TAdd #(tn_num_masters,  1), log_nm_plus_1),
+	     // bus-error monitor events carry a 64-bit address
+	     Add #(a__, wd_addr, 64));
 
    Integer num_masters = valueOf (tn_num_masters);
    Integer num_slaves  = valueOf (tn_num_slaves);
@@ -107,10 +113,12 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
    // (0 => ready for next burst)
    Vector #(tn_num_masters, Reg #(AXI4_Len)) v_rg_wd_beat_count <- replicateM (mkReg (0));
 
-   // On a write-transaction to non-existent slave, record id and user for error response
+   // On a write-transaction to non-existent slave, record id, user and
+   // address for the error response and the bus-error monitor
    Vector #(tn_num_masters,
-	    FIFOF #(Tuple2 #(Bit #(wd_id),
-			     Bit #(wd_user))))  v_f_wr_err_info <- replicateM (mkSizedFIFOF (8));
+	    FIFOF #(Tuple3 #(Bit #(wd_id),
+			     Bit #(wd_user),
+			     Bit #(wd_addr))))  v_f_wr_err_info <- replicateM (mkSizedFIFOF (8));
 
    // ----------------
    // Read-transaction book-keeping
@@ -127,9 +135,10 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
 
    // On a read-transaction to non-exisitent slave, record id and user for error response
    Vector #(tn_num_masters,
-	    FIFOF #(Tuple3 #(AXI4_Len,
+	    FIFOF #(Tuple4 #(AXI4_Len,
 			     Bit #(wd_id),
-			     Bit #(wd_user)))) v_f_rd_err_info <- replicateM (mkSizedFIFOF (8));
+			     Bit #(wd_user),
+			     Bit #(wd_addr)))) v_f_rd_err_info <- replicateM (mkSizedFIFOF (8));
 
    // On an mi->non-existent-slave read-transaction,
    // this register is the R-channel burst beat_count
@@ -166,6 +175,10 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
       end
       rg_reset <= False;
    endrule
+
+   // Bus-error monitor tap: one entry per decode-error response (dropped
+   // if the monitor is not draining; its count register is saturating).
+   FIFOF #(BusErrEvent) f_err_events <- mkSizedFIFOF (8);
 
    // ----------------------------------------------------------------
    // BEHAVIOR
@@ -234,7 +247,7 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
 
 	    // Special value 'num_slaves' (not a legal sj) means "no such slave"
 	    v_f_wr_sjs        [mi].enq (fromInteger (num_slaves));
-	    v_f_wr_err_info   [mi].enq (tuple2 (a.awid, a.awuser));
+	    v_f_wr_err_info   [mi].enq (tuple3 (a.awid, a.awuser, a.awaddr));
 
 	    // Enqueue a task for the W channel (must consume the write-data burst)
 	    v_f_wd_tasks      [mi].enq (tuple2 (fromInteger (num_slaves), a.awlen));
@@ -315,7 +328,13 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
 	 v_f_wr_sjs [mi].deq;
 	 v_f_wr_err_info [mi].deq;
 
-	 match { .awid, .awuser } = v_f_wr_err_info [mi].first;
+	 match { .awid, .awuser, .awaddr } = v_f_wr_err_info [mi].first;
+
+	 if (f_err_events.notFull)
+	    f_err_events.enq (BusErrEvent {addr:   zeroExtend (awaddr),
+					   is_wr:  True,
+					   master: fromInteger (mi),
+					   resp:   axi4_resp_decerr});
 
 	 let b = AXI4_Wr_Resp {bid:   awid,
 			       bresp: axi4_resp_decerr,
@@ -359,7 +378,7 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
 	    AXI4_Rd_Addr #(wd_id, wd_addr, wd_user) a <- pop_o (xactors_from_masters [mi].o_rd_addr);
 
 	    v_f_rd_sjs      [mi].enq (fromInteger (num_slaves));
-	    v_f_rd_err_info [mi].enq (tuple3 (a.arlen, a.arid, a.aruser));
+	    v_f_rd_err_info [mi].enq (tuple4 (a.arlen, a.arid, a.aruser, a.araddr));
 
 	    $display ("%0d: ERROR: rl_rd_xaction_no_such_slave: m%0d -> ?", cur_cycle, mi);
 	    $display ("    %m");
@@ -415,7 +434,13 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
    for (Integer mi = 0; mi < num_masters; mi = mi + 1)
 
       rule rl_rd_resp_err_to_master (v_f_rd_sjs [mi].first == fromInteger (num_slaves));
-	 match { .arlen, .arid, .aruser } = v_f_rd_err_info [mi].first;
+	 match { .arlen, .arid, .aruser, .araddr } = v_f_rd_err_info [mi].first;
+
+	 if ((f_err_events.notFull) && (v_rg_r_err_beat_count [mi] == arlen))
+	    f_err_events.enq (BusErrEvent {addr:   zeroExtend (araddr),
+					   is_wr:  False,
+					   master: fromInteger (mi),
+					   resp:   axi4_resp_decerr});
 
 	 Bit #(wd_data) data = 0;
 	 let r = AXI4_Rd_Data {rid:    arid,
@@ -461,6 +486,12 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
 
    interface v_from_masters = genWith (f1);
    interface v_to_slaves    = genWith (f2);
+   interface Get err_events;
+      method ActionValue #(BusErrEvent) get ();
+         f_err_events.deq;
+         return f_err_events.first;
+      endmethod
+   endinterface
 endmodule
 
 // ================================================================

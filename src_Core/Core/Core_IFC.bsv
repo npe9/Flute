@@ -136,6 +136,24 @@ interface Core_IFC #(numeric type t_n_interrupt_sources);
    (* always_ready *)
    method Bit #(8) mv_status;
 
+   // ----------------------------------------------------------------
+   // Performance-monitoring taps (one-cycle pulses), consumed by the
+   // SoC_Info performance counters.
+
+   // An instruction retired (Stage2 -> Stage3)
+   (* always_ready *)
+   method Bool mv_perf_retire;
+
+   // A branch redirect was taken (pipeline flush and refetch)
+   (* always_ready *)
+   method Bool mv_perf_redirect;
+
+   // I-cache / D-cache miss committed to a line refill
+   (* always_ready *)
+   method Bool mv_perf_imiss;
+   (* always_ready *)
+   method Bool mv_perf_dmiss;
+
 endinterface
 
 // ================================================================

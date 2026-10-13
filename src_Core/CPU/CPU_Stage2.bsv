@@ -305,12 +305,12 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
                // Bypassing GPR values
                if (rg_stage2.rd != 0) begin    // TODO: is this test necessary?
 		  // Option 1: longer critical path: data bypassed back to previous stage
-		  bypass.bypass_state = ((ostatus == OSTATUS_PIPE)
-					 ? BYPASS_RD_RDVAL : BYPASS_RD);
-		  bypass.rd_val       = result;
+		  // bypass.bypass_state = ((ostatus == OSTATUS_PIPE)
+		  //			 ? BYPASS_RD_RDVAL : BYPASS_RD);
+		  // bypass.rd_val       = result;
 
 		  // Option 2: shorter critical path: data not bypassed to previous stage
-		  // bypass.bypass_state = BYPASS_RD;
+		  bypass.bypass_state = BYPASS_RD;
 	       end
 	    end
 

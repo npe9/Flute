@@ -41,7 +41,7 @@ import External_Control :: *;
 (* synthesize *)
 module mkTop_HW_Side (Empty) ;
 
-   SoC_Top_IFC    soc_top   <- mkSoC_Top;
+   SoC_Top_IFC    soc_top   <- mkSoC_Top (25_000_000);
    Mem_Model_IFC  mem_model <- mkMem_Model;
 
    // Connect SoC to raw memory

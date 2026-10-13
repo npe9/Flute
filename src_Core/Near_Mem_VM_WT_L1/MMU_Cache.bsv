@@ -45,6 +45,7 @@ import Vector       :: *;
 import BRAMCore     :: *;
 import ConfigReg    :: *;
 import FIFOF        :: *;
+import SpecialFIFOs :: *;
 import GetPut       :: *;
 import ClientServer :: *;
 
@@ -135,6 +136,11 @@ interface MMU_Cache_IFC;
    (* always_ready *)
    method Bit #(8) mv_status;
 
+   // Performance-monitoring tap: pulses for one cycle when a cache-line
+   // refill starts (i.e., a cache miss commits to refilling).
+   (* always_ready *)
+   method Bool mv_perf_miss;
+
 endinterface
 
 // ****************************************************************
@@ -168,6 +174,7 @@ typedef enum {MODULE_PRERESET,              // After power on reset, before soft
 	      PTW_LEVEL_0,                  // Page Table Walk, Request Level 0
 
               CACHE_START_REFILL,           // On cache miss, initiate refill of cache line in cache
+              CACHE_SNAPSHOT,               // Snapshot victim line's other-way words (BRAM read-only)
               CACHE_REFILL,                 // Refill
               CACHE_REREQ,                  // After refill, redo request that missed
               CACHE_ST_AMO_RSP,             // Provide ST/SC/AMO response
@@ -545,9 +552,20 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // and ram_cword_set
    Reg #(CSet_CWord_in_Cache) rg_cset_cword_in_cache <- mkRegU;
    Reg #(Bool)                rg_error_during_refill <- mkRegU;
+   // Refill snapshot: the victim line's OTHER-way word64s, captured from the
+   // data RAM before the refill loop starts writing (see rl_cache_snapshot).
+   // The refill loop then never needs to read the data RAM while writing it,
+   // which removes every read/write scheduling constraint on the BRAM ports
+   // (a same-port read while a write is pending loses its data on real
+   // DP16KD hardware even though Bluesim's BRAM model returns it).
+   Reg #(Vector #(CWords_per_CLine, CWord)) rg_other_way_line <- mkRegU;
+   Reg #(Bit #(8))                          rg_snap_cnt        <- mkReg (0);
    // In 32b fabrics, these hold the lower word32 while we're fetching the upper word32 of a word64
    Reg #(Bool)      rg_lower_word32_full <- mkReg (False);
    Reg #(Bit #(32)) rg_lower_word32      <- mkRegU;
+
+   // Performance-monitoring: pulses when a cache miss commits to a refill.
+   PulseWire pw_perf_miss <- mkPulseWire;
 
    // When a CSet is full and we need to replace a cache line due to a refill,
    // the victim is picked 'randomly' according to this register
@@ -562,6 +580,47 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    Reg #(Bit #(64)) rg_tohost_value <- mkReg (0);
 `endif
 
+`ifdef BRAM_HAZARD_ASSERT
+   // Simulation-only BRAM access-discipline assertions (see AGENTS.md,
+   // "Bluesim vs hardware").  Bluesim's BRAM model serializes same-port
+   // accesses and never loses a pending read; real ECP5 DP16KD hardware
+   // DOES lose it (confirmed in the pipe2/pipe3 bring-up).  These guards
+   // enforce the discipline that keeps the design out of that corner:
+   //   port A = write-only, port B = read-only (both RAMs).
+   // Sim builds define BRAM_HAZARD_ASSERT; synthesis never defines it, so
+   // hardware cost is zero.
+   //
+   // Only the historically fatal class is guarded here: a read put on
+   // port A (the pipe2/pipe3 bug).  Both helpers are PURE literal checks
+   // at each put site -- no wires, no shared state -- because any
+   // same-cycle observation channel from inside 'req' makes BSC compute
+   // an Enable(imem_req) -> ReturnValue(imem_instr) edge and every CPU
+   // rule self-dependent (G0033).  Cross-port same-cycle access is
+   // unreachable in this FSM (A-writing rules live in reset/store/refill
+   // states; B-read issuers live in READY/REREQ/SNAPSHOT states) and is
+   // covered by the F1 strict Verilator BRAM model instead.
+
+   function Action fa_haz_A_write (Bool is_tag, Bool write, Bit #(32) addr);
+      action
+	 if (write != bram_cmd_write) begin
+	    $display ("%0d: %s ASSERT FAIL: %s port A READ put issued (port A is write-only), addr 0x%0h",
+		      cur_cycle, d_or_i, is_tag ? "tag RAM" : "data RAM", addr);
+	    $finish (1);
+	 end
+      endaction
+   endfunction
+
+   function Action fa_haz_B_read (Bool is_tag, Bool write, Bit #(32) addr);
+      action
+	 if (write != bram_cmd_read) begin
+	    $display ("%0d: %s ASSERT FAIL: %s port B WRITE put issued (port B is read-only), addr 0x%0h",
+		      cur_cycle, d_or_i, is_tag ? "tag RAM" : "data RAM", addr);
+	    $finish (1);
+	 end
+      endaction
+   endfunction
+`endif
+
    // ----------------------------------------------------------------
    // This function initiates a read request on the 'B' ports of the rams
    // Invoked from original cache request method, and internally after refills
@@ -571,10 +630,16 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	 // Request tag RAM
 	 let cset_in_cache = fn_Addr_to_CSet_in_Cache (addr);
 	 ram_state_and_ctag_cset.b.put (bram_cmd_read, cset_in_cache,    ?);
+`ifdef BRAM_HAZARD_ASSERT
+	 fa_haz_B_read (True, bram_cmd_read, extend (cset_in_cache));
+`endif
 
 	 // Request data RAM
 	 let cset_cword_in_cache = fn_Addr_to_CSet_CWord_in_Cache (addr);
 	 ram_cword_set.b.put          (bram_cmd_read, cset_cword_in_cache, ?);
+`ifdef BRAM_HAZARD_ASSERT
+	 fa_haz_B_read (False, bram_cmd_read, extend (cset_cword_in_cache));
+`endif
 
 	 if (cfg_verbosity > 1)
 	    $display ("    fa_req_ram_B tagCSet [0x%0x] cword_set [0x%0d]",
@@ -584,9 +649,40 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
    // ----------------------------------------------------------------
    // Outputs of RAM read-ports (B ports)
+   //
+   // The BRAM read responses are registered (rg_tag_ram_q / rg_data_ram_q)
+   // via a free-running capture rule: a read launched by 'req' in cycle C0
+   // has raw B-port output valid in C1, captured at the C1->C2 edge, and
+   // is consumed by the probe in C2 (MODULE_PROBE).  This is +1 cycle on
+   // hit latency, and buys a large slice of timing margin (previously:
+   // BRAM DO -> hit test -> FSM -> fabric FIFO within one cycle).
 
-   let state_and_ctag_cset = ram_state_and_ctag_cset.b.read;
-   let cword_set          = ram_cword_set.b.read;
+   Reg #(State_and_CTag_CSet) rg_tag_ram_q  <- mkRegU;
+   Reg #(CWord_Set)           rg_data_ram_q <- mkRegU;
+
+   rule rl_capture_ram_outputs;
+      rg_tag_ram_q    <= ram_state_and_ctag_cset.b.read;
+      rg_data_ram_q   <= ram_cword_set.b.read;
+   endrule
+
+   let state_and_ctag_cset = rg_tag_ram_q;
+   let cword_set           = rg_data_ram_q;
+
+   // One wait cycle after a RAM B-port read is launched.  The launch
+   // One wait cycle after a RAM B-port read is launched.  'req' (and
+   // rl_rereq) toggle rg_req_seq; rl_age_ram_rsp copies the new level into
+   // rg_age_seen one cycle later, when the capture registers above have
+   // sampled the raw BRAM outputs.  The probe rule fires only when the two
+   // levels match, so the hit test and all RAM-data consumers see the
+   // registered (captured) values.  Two disjoint registers (no write
+   // conflict with the req method, which must remain callable while the
+   // cache is in MODULE_RUNNING).
+   Reg #(Bool) rg_req_seq   <- mkReg (False);
+   Reg #(Bool) rg_age_seen  <- mkReg (False);
+
+   rule rl_age_ram_rsp ((rg_state == MODULE_RUNNING) && (rg_age_seen != rg_req_seq));
+      rg_age_seen <= rg_req_seq;
+   endrule
 
    // Test cache hit or miss; if hit, return which 'way', and the word64 data
    // ---- This pure function is an ActionValue only for the $display inside
@@ -830,6 +926,9 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    rule rl_reset (rg_state == MODULE_RESETTING);
       let state_and_ctag = State_and_CTag { state: CTAG_EMPTY, ctag: ? };
       ram_state_and_ctag_cset.a.put (bram_cmd_write, rg_cset_in_cache, replicate (state_and_ctag));
+`ifdef BRAM_HAZARD_ASSERT
+      fa_haz_A_write (True, bram_cmd_write, extend (rg_cset_in_cache));
+`endif
 
       if (rg_cset_in_cache == fromInteger (csets_per_cache - 1)) begin
 	 // This is the last cset; exit the loop
@@ -858,7 +957,8 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    (* descending_urgency = "rl_probe_and_immed_rsp, rl_writeback_updated_PTE" *)
 `endif
 
-   rule rl_probe_and_immed_rsp (rg_ddr4_ready && (rg_state == MODULE_RUNNING));
+   rule rl_probe_and_immed_rsp (rg_ddr4_ready && (rg_state == MODULE_RUNNING)
+				&& (rg_age_seen == rg_req_seq));
 
       // Print some initial information for debugging
       if (cfg_verbosity > 1) begin
@@ -1018,6 +1118,9 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 		     // Update cache line in cache
 		     let new_cword_set = fn_update_cword_set (cword_set, way_hit, vm_xlate_result.pa, rg_f3, rg_st_amo_val);
 		     ram_cword_set.a.put (bram_cmd_write, cset_cword_in_cache, new_cword_set);
+`ifdef BRAM_HAZARD_ASSERT
+		     fa_haz_A_write (False, bram_cmd_write, extend (cset_cword_in_cache));
+`endif
 
 		     if (cfg_verbosity > 1) begin
 			$display ("        Write-Cache-Hit: pa 0x%0h word64 0x%0h", vm_xlate_result.pa, rg_st_amo_val);
@@ -1076,6 +1179,9 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 		  // Update cache line in cache
 		  let new_cword_set = fn_update_cword_set (cword_set, way_hit, vm_xlate_result.pa, rg_f3, new_st_val);
 		  ram_cword_set.a.put (bram_cmd_write, cset_cword_in_cache, new_cword_set);
+`ifdef BRAM_HAZARD_ASSERT
+		  fa_haz_A_write (False, bram_cmd_write, extend (cset_cword_in_cache));
+`endif
 
 		  if (cfg_verbosity > 1) begin
 		     $display ("          0x%0h  op  0x%0h -> 0x%0h", word64, word64, new_st_val);
@@ -1441,21 +1547,69 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       // only after observing the first read-response, to assure that
       // the read is successfule and not an access error.
 
-      // Request read of first Word64_Set in CLine (BRAM port B)
-      // for set read-modify-write (not relevant for direct-mapped)
-      let cword_in_cline      = 0;
-      let cset_cword_in_cache  = { cset_in_cache, cword_in_cline };
-      rg_cset_cword_in_cache  <= cset_cword_in_cache;
-      ram_cword_set.b.put (bram_cmd_read, cset_cword_in_cache, ?);
+      // The refill loop preserves the victim line's OTHER-way word64s via a
+      // pre-refill snapshot (see rl_cache_snapshot), so no data-RAM read is
+      // needed here.  Do NOT serve any refill read from port A: port A is
+      // write-only during refills, and a same-port read while a write is
+      // pending loses its data on real DP16KD hardware (READ_FIRST shows
+      // the write address's old data) even though Bluesim's BRAM model
+      // returns the pending read data -- a sim/hardware divergence that
+      // corrupts the other way's word64 on multi-way configs.
+      rg_cset_cword_in_cache  <= { cset_in_cache, 0 };
+      rg_snap_cnt             <= 0;
 
-      // Enter cache refill loop, awaiting refill responses from mem
+      // Enter snapshot phase (captures other-way words, then CACHE_REFILL)
       rg_lower_word32_full   <= False;
       rg_error_during_refill <= False;
-      rg_state               <= CACHE_REFILL;
+      rg_state               <= CACHE_SNAPSHOT;
+      pw_perf_miss.send;
 
       if (cfg_verbosity > 1)
-	 $display ("    Victim way %0d; => CACHE_REFILL", new_victim_way);
+	 $display ("    Victim way %0d; => CACHE_SNAPSHOT", new_victim_way);
    endrule: rl_start_cache_refill
+
+   // ----------------------------------------------------------------
+   // Snapshot the victim line's OTHER-way word64s before the refill loop
+   // starts writing.  One data-RAM read per cycle, purely on port B, with
+   // port A idle: zero read/write interleave, so the capture registers
+   // always see clean read data (on both Bluesim's BRAM model and real
+   // DP16KD).  Costs cwords_per_cline+2 cycles per refill -- negligible
+   // against a ~30-cycle SDRAM miss.
+   //
+   // Note the tag RAM's B port is untouched here, so the tag capture
+   // (rg_tag_ram_q) from the original request stays valid for the
+   // State_and_CTag update in the refill loop's first response.
+
+   rule rl_cache_snapshot (rg_state == CACHE_SNAPSHOT);
+      // Issue this cycle's read (cnt = word index being read)
+      Bit #(8) cnt = rg_snap_cnt;
+      if (cnt <= fromInteger (cwords_per_cline - 1)) begin
+	 CSet_CWord_in_Cache snap_addr = { cset_in_cache, truncate (cnt) };
+	 ram_cword_set.b.put (bram_cmd_read, snap_addr, ?);
+`ifdef BRAM_HAZARD_ASSERT
+	 fa_haz_B_read (False, bram_cmd_read, extend (snap_addr));
+`endif
+      end
+
+      // Capture the read issued two cycles ago (cnt-2); its data is in the
+      // capture registers now.  Extract the non-victim way's word64.
+      if (cnt >= 2) begin
+	 let captured = cword_set;    // rg_data_ram_q
+	 Way_in_CSet other_way = (ways_per_cset == 1) ? 0 : (rg_victim_way ^ 1);
+	 CWord_in_CLine widx = truncate (cnt - 2);
+	 let v = rg_other_way_line;
+	 v [widx] = captured [other_way];
+	 rg_other_way_line <= v;
+      end
+
+      if (cnt == fromInteger (cwords_per_cline + 1)) begin
+	 rg_state <= CACHE_REFILL;
+	 if (cfg_verbosity > 1)
+	    $display ("%0d: %s.rl_cache_snapshot: snapshot done; => CACHE_REFILL",
+		      cur_cycle, d_or_i);
+      end
+      rg_snap_cnt <= cnt + 1;
+   endrule: rl_cache_snapshot
 
    // ----------------------------------------------------------------
    // TODO (possibly): we complete a cache refill (in rl_cache_refill_loop) and
@@ -1527,19 +1681,33 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	    new_state_and_ctag_cset [rg_victim_way] = State_and_CTag {state: CTAG_CLEAN,
 								      ctag : fn_PA_to_CTag (rg_pa)};
 	    ram_state_and_ctag_cset.a.put (bram_cmd_write, cset_in_cache, new_state_and_ctag_cset);
+`ifdef BRAM_HAZARD_ASSERT
+	    fa_haz_A_write (True, bram_cmd_write, extend (cset_in_cache));
+`endif
 	 end
 
-	 // Update the Word64_Set (BRAM port A) (if this response was not an error)
-	 let new_cword_set = cword_set;
-	 new_cword_set [rg_victim_way] = new_word64;
-	 if (! err_rsp)
+	 // Update the Word64_Set (BRAM port A) (if this response was not an
+	 // error).  The new word64 goes into the victim way; the other way's
+	 // word64 comes from the pre-refill snapshot (rl_cache_snapshot), never
+	 // from a RAM read racing the refill writes.
+	 CWord_in_CLine cword_idx = truncate (rg_cset_cword_in_cache);
+	 let other_word64 = rg_other_way_line [cword_idx];
+	 Vector #(Ways_per_CSet, CWord) new_cword_set = newVector;
+	 for (Integer w = 0; w < ways_per_cset; w = w + 1)
+	    new_cword_set [w] = (fromInteger (w) == rg_victim_way)
+				? new_word64
+				: other_word64;
+	 if (! err_rsp) begin
 	    ram_cword_set.a.put (bram_cmd_write, rg_cset_cword_in_cache, new_cword_set);
+`ifdef BRAM_HAZARD_ASSERT
+	    fa_haz_A_write (False, bram_cmd_write, extend (rg_cset_cword_in_cache));
+`endif
+	 end
 
-	 // If more cword_sets in cacheline, initiate RAM read for next cword_set
+	 // If more cword_sets in cacheline: advance the write index.  No RAM
+	 // reads here -- the snapshot already holds the other way's old words.
 	 if (cword_in_cline != fromInteger (cwords_per_cline - 1)) begin
-	    let next_cset_cword_in_cache = rg_cset_cword_in_cache + 1;
-	    ram_cword_set.b.put (bram_cmd_read, next_cset_cword_in_cache, ?);
-	    rg_cset_cword_in_cache <= next_cset_cword_in_cache;
+	    rg_cset_cword_in_cache <= rg_cset_cword_in_cache + 1;
 	 end
 
 	 // else final Word64 of CLine; raise exception if pending,
@@ -1574,6 +1742,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
    rule rl_rereq (rg_state == CACHE_REREQ);
       rg_state <= MODULE_RUNNING;
+      rg_req_seq <= ! rg_req_seq;
       fa_req_ram_B (rg_addr);
    endrule
 
@@ -1870,6 +2039,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 `endif
       rg_addr        <= addr;
       rg_st_amo_val  <= st_value;
+      rg_req_seq     <= ! rg_req_seq;
 
       rg_priv        <= priv;
       rg_sstatus_SUM <= sstatus_SUM;
@@ -1965,12 +2135,19 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // Inform core that DDR4 has been initialized and is ready to accept requests
    method Action ma_ddr4_ready;
       rg_ddr4_ready <= True;
+`ifdef TB_PROBES
       $display ("%0d: %m.ma_ddr4_ready: Enabling MMU_Cache", cur_cycle);
+`endif
    endmethod
 
    // Misc. status; 0 = running, no error
    method Bit #(8) mv_status;
       return (rg_wr_rsp_err ? 1 : 0);
+   endmethod
+
+   // Performance-monitoring tap (see interface comment)
+   method Bool mv_perf_miss;
+      return pw_perf_miss;
    endmethod
 
 endmodule: mkMMU_Cache

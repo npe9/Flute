@@ -56,6 +56,502 @@ import SoC_Map :: *;
 // Exports
 
 export mkNear_Mem;
+export Imem_Decoup_IFC (..), mkNear_Mem_Imem_Decoup;
+
+// ================================================================
+// STEP 5 shim-lean: near-mem-side I-fetch decoupling queue, the
+// margin-first redesign of the step-4 shim.  Same functional contract
+// (build/timing-exp/step3/DESIGN.md "STEP 4 FULL DESIGN" + "AS-BUILT
+// REVISIONS", executable contract test/Imem_Decoup_Unit_Tb.bsv) with the
+// CPU-visible response mux and the shim-internal cones REGISTERED:
+//   - the word re-shown to the CPU comes from a presentation register
+//     (rg_pres_*) loaded by the shim rule at arm time; the CPU-visible
+//     cone is a 2:1 mux (pres vs live inner word) + the arrival kill,
+//     not a live 4-slot mux (the step-4 s2/s3 critical-path cone).
+//   - arrival detection is a single 2-bit compare (wr vs 1-cycle-delayed
+//     wr), not a seen-register D-logic chain.
+//   - exc responses are never forwarded to the CPU unless the ask stream
+//     asked exactly that word (rg_await + wait-selector guards); un-asked
+//     faulting spec words are dropped.  (Step 4 forwarded the FSM's raw
+//     exc drive.)
+//   - the req method is a PURE ENQUEUE (no submodule calls, no reads of
+//     rule-written state): a 0-cycle inline launch there is unschedulable
+//     (its inner.req call and the rule's launch calls cannot be proven
+//     exclusive, and the tb's descending_urgency then starves this rule
+//     on every consume cycle).  Launches are register-sourced in the one
+//     shim rule: demand = queue-head register, spec = inflight+4.
+//     Idle-pipe first fetches pay one cycle (rule-side launch at the
+//     ask's arrival cycle); the cost is cycle-locked and mid-stream
+//     timing is stock-exact.
+
+interface Imem_Decoup_IFC;
+   interface IMem_IFC imem;
+   (* always_ready *) method Action ma_clear;
+endinterface
+
+typedef struct {
+   Bit #(3)   f3;
+   WordXL     addr;
+   Priv_Mode  priv;
+   Bit #(1)   sstatus_SUM;
+   Bit #(1)   mstatus_MXR;
+   WordXL     satp;
+} Imem_Ask
+deriving (Bits, FShow);
+
+typedef struct {
+   Bool     exc;
+   Exc_Code exc_code;
+   WordXL   addr;
+   Instr    instr;
+} Imem_Rsp
+deriving (Bits, FShow);
+
+module mkNear_Mem_Imem_Decoup #(MMU_Cache_IFC inner) (Imem_Decoup_IFC);
+
+   // Ask queue: two entries, circular (physical index = counter bit 0).
+   // rg_q_wr is written ONLY by the req method; rg_q_rd and rg_q_wr_d
+   // ONLY by the shim rule (one writer each; occupancy <= 2 by the
+   // wrapper's deposit rate, sim-asserted).
+   Reg #(Imem_Ask) rg_q0      <- mkReg (Imem_Ask { f3: 3'b010, addr: 32'h0000_1000,
+                                                   priv: m_Priv_Mode,
+                                                   sstatus_SUM: 0, mstatus_MXR: 0,
+                                                   satp: 0 });
+   Reg #(Imem_Ask) rg_q1      <- mkReg (Imem_Ask { f3: 3'b010, addr: 32'h0000_1000,
+                                                   priv: m_Priv_Mode,
+                                                   sstatus_SUM: 0, mstatus_MXR: 0,
+                                                   satp: 0 });
+   Reg #(Bit #(2)) rg_q_wr    <- mkReg (0);
+   Reg #(Bit #(2)) rg_q_rd    <- mkReg (0);
+   Reg #(Bit #(2)) rg_q_wr_d  <- mkReg (0);
+
+   // Outstanding inner read (sole writer: the shim rule).
+   Reg #(Bool)     rg_inflight_valid <- mkReg (False);
+   Reg #(WordXL)   rg_inflight_addr  <- mkReg (32'h0000_1000);
+
+   // Previous cycle's inner response observation (fresh detection: a new
+   // response is valid with the inflight addr after an invalid or
+   // different-address cycle -- every launch kills the re-drive for at
+   // least one cycle, so responses are always separated by a gap).
+   Reg #(Bool)     rg_prev_inner_valid <- mkReg (False);
+   Reg #(WordXL)   rg_prev_inner_addr  <- mkReg (32'h0000_1000);
+
+   // VM args of the most recently launched demand ask (spec chain
+   // reuses them; I-side is VM-off and every priv/satp change arrives with
+   // a redirect that becomes the newest launched demand).
+   Reg #(Bit #(3))   rg_cur_f3           <- mkReg (3'b010);
+   Reg #(Priv_Mode)  rg_cur_priv         <- mkReg (m_Priv_Mode);
+   Reg #(Bit #(1))   rg_cur_sstatus_SUM  <- mkReg (0);
+   Reg #(Bit #(1))   rg_cur_mstatus_MXR  <- mkReg (0);
+   Reg #(WordXL)     rg_cur_satp         <- mkReg (0);
+
+   // Response hold: four slots (provable bound: 1 armed re-show + 2 queued
+   // covered asks + 1 chain word).  Sole writer: the shim rule.
+   Reg #(Bool)     rg_s0_valid <- mkReg (False);
+   Reg #(WordXL)   rg_s0_addr  <- mkReg (32'h0000_1000);
+   Reg #(Instr)    rg_s0_instr <- mkReg (32'h0000_0001);
+   Reg #(Bool)     rg_s0_exc   <- mkReg (False);
+   Reg #(Exc_Code) rg_s0_code  <- mkReg (0);
+   Reg #(Bool)     rg_s1_valid <- mkReg (False);
+   Reg #(WordXL)   rg_s1_addr  <- mkReg (32'h0000_1000);
+   Reg #(Instr)    rg_s1_instr <- mkReg (32'h0000_0001);
+   Reg #(Bool)     rg_s1_exc   <- mkReg (False);
+   Reg #(Exc_Code) rg_s1_code  <- mkReg (0);
+   Reg #(Bool)     rg_s2_valid <- mkReg (False);
+   Reg #(WordXL)   rg_s2_addr  <- mkReg (32'h0000_1000);
+   Reg #(Instr)    rg_s2_instr <- mkReg (32'h0000_0001);
+   Reg #(Bool)     rg_s2_exc   <- mkReg (False);
+   Reg #(Exc_Code) rg_s2_code  <- mkReg (0);
+   Reg #(Bool)     rg_s3_valid <- mkReg (False);
+   Reg #(WordXL)   rg_s3_addr  <- mkReg (32'h0000_1000);
+   Reg #(Instr)    rg_s3_instr <- mkReg (32'h0000_0001);
+   Reg #(Bool)     rg_s3_exc   <- mkReg (False);
+   Reg #(Exc_Code) rg_s3_code  <- mkReg (0);
+
+   // Registered CPU-visible presentation (the lean response mux): the
+   // re-shown word is copied here at arm time, so the CPU-visible data
+   // cone is a 2:1 mux instead of the live slot array.
+   Reg #(Bool)     rg_shown      <- mkReg (False);
+   Reg #(Bool)     rg_pres_exc   <- mkReg (False);
+   Reg #(Exc_Code) rg_pres_code  <- mkReg (0);
+   Reg #(WordXL)   rg_pres_addr  <- mkReg (32'h0000_1000);
+   Reg #(Instr)    rg_pres_instr <- mkReg (32'h0000_0001);
+
+   // Word presented last cycle (slot-freeing key: a deposit this cycle
+   // consumed it; free every slot holding it).
+   Reg #(Bool)     rg_w_valid <- mkReg (False);
+   Reg #(WordXL)   rg_w_addr  <- mkReg (32'h0000_1000);
+
+   // Ask-driven response await: set when a head pops whose word is not yet
+   // available -- the wrapper is waiting for a response that has not
+   // arrived; gates exc presentation so an un-asked faulting (speculative)
+   // word can never trap the CPU.
+   Reg #(Bool)     rg_await_valid <- mkReg (False);
+   Reg #(WordXL)   rg_await_addr  <- mkReg (32'h0000_1000);
+
+   // Most recently popped ask: with the queue head (when nonempty) it
+   // selects which word the CPU-visible port presents (the wrapper only
+   // ever waits for its outstanding ask).
+   Reg #(Bool)     rg_last_valid <- mkReg (False);
+   Reg #(WordXL)   rg_last_addr  <- mkReg (32'h0000_1000);
+
+   // Re-show pending: a re-show arm (an ask covered by an available word)
+   // owns the presentation until the armed word is presented-then-
+   // consumed; while set, fresh-capture arms must not hijack pres (the
+   // run-away spec chain would otherwise shadow the asked word).
+   Reg #(Bool)     rg_reshow_pend <- mkReg (False);
+
+
+   // CPU-visible presentation: DWires driven by the shim rule from
+   // committed state + the live inner response (the same discipline as
+   // the stock FSM's dw_valid/dw_output_ld_val).  The consuming rules
+   // read wires, not registers, so Bluesim's cross-rule visibility
+   // orders this rule BEFORE them -- the same direction its enqueue
+   // reads require -- instead of inhibiting (deferring) it on every
+   // consume cycle.  In synthesis the wires are plain combinational
+   // logic from registers + inner, identical to the stock adapter.
+   Reg #(Bool)     dw_valid  <- mkDWire (False);
+   Reg #(Bool)     dw_exc    <- mkDWire (False);
+   Reg #(Exc_Code) dw_code   <- mkDWire (?);
+   Reg #(WordXL)   dw_pc     <- mkDWire (?);
+   Reg #(Instr)    dw_instr  <- mkDWire (?);
+   Reg #(WordXL)   dw_tval   <- mkDWire (?);
+
+   // Flush observation (fence.i / sfence / reset notify).
+   Reg #(Bool)     rg_flush_tog  <- mkReg (False);
+   Reg #(Bool)     rg_flush_seen <- mkReg (False);
+
+   // ----------------
+   // Current-cycle observations (rule CanFire is constant true; see the
+   // DESIGN G0033 note: CPU rules already condition on imem.valid while
+   // calling imem.req).
+
+   Bool fresh      = inner.valid && rg_inflight_valid
+                                  && (inner.addr == rg_inflight_addr)
+                                  && (! rg_prev_inner_valid
+                                      || (inner.addr != rg_prev_inner_addr));
+   Bool arrival    = (rg_q_wr != rg_q_wr_d);
+   Bool flush      = (rg_flush_tog != rg_flush_seen);
+
+   Imem_Ask head       = (rg_q_rd [0] == 1'b0) ? rg_q0 : rg_q1;
+   Bool     head_valid = (rg_q_wr != rg_q_rd);
+
+   Bool await_match = rg_await_valid && (inner.addr == rg_await_addr);
+
+   Imem_Rsp inner_rsp = Imem_Rsp { exc:      inner.exc,
+                                   exc_code: inner.exc_code,
+                                   addr:     inner.addr,
+                                   instr:    truncate (inner.cword) };
+
+   // Slot lookups for head coverage and capture.
+   Bool s0_head = rg_s0_valid && (rg_s0_addr == head.addr);
+   Bool s1_head = rg_s1_valid && (rg_s1_addr == head.addr);
+   Bool s2_head = rg_s2_valid && (rg_s2_addr == head.addr);
+   Bool s3_head = rg_s3_valid && (rg_s3_addr == head.addr);
+   Bool slot_head_match = s0_head || s1_head || s2_head || s3_head;
+
+   Bool s0_cap = rg_s0_valid && (rg_s0_addr == inner.addr);
+   Bool s1_cap = rg_s1_valid && (rg_s1_addr == inner.addr);
+   Bool s2_cap = rg_s2_valid && (rg_s2_addr == inner.addr);
+   Bool s3_cap = rg_s3_valid && (rg_s3_addr == inner.addr);
+   Bool cap_refresh = s0_cap || s1_cap || s2_cap || s3_cap;
+
+   Bool s0_free = ! rg_s0_valid;
+   Bool s1_free = ! rg_s1_valid;
+   Bool s2_free = ! rg_s2_valid;
+   Bool s3_free = ! rg_s3_valid;
+   Bool cap_ok  = cap_refresh || s0_free || s1_free || s2_free || s3_free;
+   Bool cap_go  = fresh && cap_ok && (! inner.exc || await_match);
+
+   // Head coverage by the available/inflight word set.
+   Bool head_cov_slot  = slot_head_match;
+   Bool head_cov_live  = inner.valid && (head.addr == inner.addr);
+   Bool head_cov_infl  = rg_inflight_valid && (head.addr == rg_inflight_addr);
+   Bool covered        = head_cov_slot || head_cov_live || head_cov_infl;
+   Bool head_cov_avail = head_cov_slot || head_cov_live;
+
+   // STEP 5D: SPECULATION OFF.  The spec chain was proven (5c) to be
+   // the X-fragility itself -- any spec launch against seeded stock
+   // X-state wedges early boot at any run-ahead depth.  Launches are
+   // demand-only (queue head on its arrival); the ask queue still
+   // decouples the CPU from the FSM round-trip.  No speculative
+   // coverage either: with the spec target gone, a head matching
+   // nothing available or inflight MUST launch (popping it without a
+   // launch would lose the ask -- the reqq-wedge class).  The I3
+   // timing contract is re-based to the measured spec-off milestones
+   // (documented re-base, see step5/STATUS.md).
+   Bool launch_demand = head_valid && ! covered;
+   Bool any_launch    = launch_demand;
+
+   // ----------------------------------------------------------------
+   // Wait-selector: the CPU-visible port presents exactly the word the
+   // wrapper is waiting for -- its outstanding ask (queue head if any,
+   // else the most recently popped ask).  Over-presenting any other word
+   // is invisible to the conds-gated wrapper for plain words, but an
+   // un-asked faulting word must never trap the CPU, so the selector also
+   // gates the exc presentation (with the rg_await guard below).
+
+   Bool   wait_valid = head_valid || rg_last_valid;
+   WordXL wait_addr  = head_valid ? head.addr : rg_last_addr;
+
+   Bool pres_sel  = rg_shown && wait_valid && (rg_pres_addr == wait_addr);
+   Bool inner_sel = inner.valid && wait_valid && (inner.addr == wait_addr);
+
+   // Presentation arm: re-show arm (an ask covered by an available word;
+   // served at exactly the stock re-fetch cycle), else fresh-capture arm
+   // (the new response stays presented -- stock's re-drive -- so a
+   // consume at fresh+1 still sees it; blocked while a re-show is pending
+   // so the run-away spec chain cannot hijack the asked word's
+   // presentation).  Ask-driven exc words arm too; un-asked exc words
+   // are dropped (never captured/presented).
+   Bool arm_reshow = arrival && head_valid && head_cov_avail;
+   Bool arm        = arm_reshow
+                     || (fresh && cap_go && (! rg_reshow_pend)
+                         && (! inner.exc || await_match));
+
+   Bool show_now = (! arrival) && (pres_sel || inner_sel)
+                   && (! inner.exc || await_match);
+
+   // ----------------------------------------------------------------
+   // The single shim rule (unconditional; no CanFire edges -> no G0095).
+
+   rule rl_shim_step;
+      rg_q_wr_d <= rg_q_wr;
+
+      // Drive the CPU-visible presentation (committed state + live
+      // inner response; pure function of this tick's inputs).
+      dw_valid <= show_now;
+      dw_pc    <= pres_sel ? rg_pres_addr : inner.addr;
+      dw_instr <= pres_sel ? rg_pres_instr : truncate (inner.cword);
+      dw_exc   <= pres_sel ? rg_pres_exc : (inner_sel && inner.exc);
+      dw_code  <= pres_sel ? rg_pres_code : inner.exc_code;
+      dw_tval  <= pres_sel ? rg_pres_addr : inner.addr;
+
+      if (flush) begin
+`ifdef SHIM_DEBUG
+         $display ("%0d: SHIM flush", cur_cycle);
+`endif
+         rg_q_rd           <= rg_q_wr;
+         rg_inflight_valid <= False;
+         rg_shown          <= False;
+         rg_s0_valid <= False;
+         rg_s1_valid <= False;
+         rg_s2_valid <= False;
+         rg_s3_valid <= False;
+         rg_w_valid        <= False;
+         rg_await_valid    <= False;
+         rg_last_valid     <= False;
+         rg_prev_inner_valid <= False;
+         rg_reshow_pend    <= False;
+         rg_flush_seen     <= rg_flush_tog;
+      end
+      else begin
+         // Capture target: refresh the same-addr slot, else the lowest
+         // free slot (cap_ok guarantees one exists when cap_go).
+         Bit #(2) cap_sel = s0_cap ? 2'd0 : s1_cap ? 2'd1 : s2_cap ? 2'd2 : s3_cap ? 2'd3
+                          : s0_free ? 2'd0 : s1_free ? 2'd1 : s2_free ? 2'd2 : 2'd3;
+         Bool cap_s0 = cap_go && (cap_sel == 2'd0);
+         Bool cap_s1 = cap_go && (cap_sel == 2'd1);
+         Bool cap_s2 = cap_go && (cap_sel == 2'd2);
+         Bool cap_s3 = cap_go && (cap_sel == 2'd3);
+
+         // Free every slot holding the word presented-then-consumed last
+         // cycle (pres is a register copy, so freeing never corrupts an
+         // armed re-show).  A slot freed and re-captured the same cycle
+         // stays valid with the fresh data.
+         Bool free_s0 = arrival && rg_w_valid && rg_s0_valid && (rg_s0_addr == rg_w_addr);
+         Bool free_s1 = arrival && rg_w_valid && rg_s1_valid && (rg_s1_addr == rg_w_addr);
+         Bool free_s2 = arrival && rg_w_valid && rg_s2_valid && (rg_s2_addr == rg_w_addr);
+         Bool free_s3 = arrival && rg_w_valid && rg_s3_valid && (rg_s3_addr == rg_w_addr);
+
+         rg_s0_valid <= (rg_s0_valid && ! free_s0) || cap_s0;
+         rg_s1_valid <= (rg_s1_valid && ! free_s1) || cap_s1;
+         rg_s2_valid <= (rg_s2_valid && ! free_s2) || cap_s2;
+         rg_s3_valid <= (rg_s3_valid && ! free_s3) || cap_s3;
+         if (cap_s0) begin
+            rg_s0_addr  <= inner.addr;
+            rg_s0_instr <= truncate (inner.cword);
+            rg_s0_exc   <= inner.exc;
+            rg_s0_code  <= inner.exc_code;
+         end
+         if (cap_s1) begin
+            rg_s1_addr  <= inner.addr;
+            rg_s1_instr <= truncate (inner.cword);
+            rg_s1_exc   <= inner.exc;
+            rg_s1_code  <= inner.exc_code;
+         end
+         if (cap_s2) begin
+            rg_s2_addr  <= inner.addr;
+            rg_s2_instr <= truncate (inner.cword);
+            rg_s2_exc   <= inner.exc;
+            rg_s2_code  <= inner.exc_code;
+         end
+         if (cap_s3) begin
+            rg_s3_addr  <= inner.addr;
+            rg_s3_instr <= truncate (inner.cword);
+            rg_s3_exc   <= inner.exc;
+            rg_s3_code  <= inner.exc_code;
+         end
+
+         // shown'/pres' (re-show arm wins over the launch death).  The
+         // arm copies the COVERING word: the matching slot first, else
+         // the live/fresh inner word.  A pending re-show (an asked word
+         // not yet consumed) survives launches -- stock's re-drive only
+         // dies at the next req, and the next req cannot fire while the
+         // word is still being consumed; letting the speculative chain's
+         // launches kill it wedges a stalled consumer.
+         if (arm) begin
+            rg_shown <= True;
+            if (s0_head) begin
+               rg_pres_exc   <= rg_s0_exc;
+               rg_pres_code  <= rg_s0_code;
+               rg_pres_addr  <= rg_s0_addr;
+               rg_pres_instr <= rg_s0_instr;
+            end
+            else if (s1_head) begin
+               rg_pres_exc   <= rg_s1_exc;
+               rg_pres_code  <= rg_s1_code;
+               rg_pres_addr  <= rg_s1_addr;
+               rg_pres_instr <= rg_s1_instr;
+            end
+            else if (s2_head) begin
+               rg_pres_exc   <= rg_s2_exc;
+               rg_pres_code  <= rg_s2_code;
+               rg_pres_addr  <= rg_s2_addr;
+               rg_pres_instr <= rg_s2_instr;
+            end
+            else if (s3_head) begin
+               rg_pres_exc   <= rg_s3_exc;
+               rg_pres_code  <= rg_s3_code;
+               rg_pres_addr  <= rg_s3_addr;
+               rg_pres_instr <= rg_s3_instr;
+            end
+            else begin
+               rg_pres_exc   <= inner.exc;
+               rg_pres_code  <= inner.exc_code;
+               rg_pres_addr  <= inner.addr;
+               rg_pres_instr <= truncate (inner.cword);
+            end
+         end
+         else if (any_launch && (! rg_reshow_pend)) begin
+            rg_shown <= False;
+         end
+
+         // Await tracking (exc presentation guard): set whenever a head
+         // pops whose word is not yet available (launched or inflight/
+         // plus4 covered) -- the wrapper is waiting for that response;
+         // cleared when it arrives, when a launch clobbers it, or flush.
+         if (fresh || any_launch) begin
+            rg_await_valid <= False;
+         end
+         else if (arrival && head_valid && (! head_cov_avail)) begin
+            rg_await_valid <= True;
+            rg_await_addr  <= head.addr;
+         end
+
+         // Presented-word bookkeeping for next cycle's freeing.
+         rg_w_valid <= show_now;
+         rg_w_addr  <= pres_sel ? rg_pres_addr : inner.addr;
+
+         // Re-show ownership: set on a re-show arm, cleared when the
+         // armed word is presented-then-consumed.
+         if (arm_reshow)
+            rg_reshow_pend <= True;
+         else if (arrival && rg_w_valid && (rg_w_addr == rg_pres_addr))
+            rg_reshow_pend <= False;
+
+         // Fresh-detection sample.
+         rg_prev_inner_valid <= inner.valid;
+         rg_prev_inner_addr  <= inner.addr;
+`ifdef SHIM_DEBUG
+         $display ("%0d: SHIM obs arrival=%b show=%b pres_sel=%b inner_sel=%b w_v=%b w=%h wait=%h shown=%b pres=%h inner_v=%b inner_a=%h | slots %h %h %h %h v=%b%b%b%b s_head=%b%b%b%b arm_rs=%b cap_go=%b", cur_cycle, arrival, show_now, pres_sel, inner_sel, rg_w_valid, rg_w_addr, wait_addr, rg_shown, rg_pres_addr, inner.valid, inner.addr, rg_s3_addr, rg_s2_addr, rg_s1_addr, rg_s0_addr, rg_s3_valid, rg_s2_valid, rg_s1_valid, rg_s0_valid, s3_head, s2_head, s1_head, s0_head, arm_reshow, cap_go);
+`endif
+
+         // Launches and pops.  Every head pops (covered asks are served,
+         // uncovered asks launch -- the reqq-wedge class fix); the popped
+         // ask becomes the wait-selector address.  The pure-enqueue req
+         // method makes idle-pipe first fetches land here as an uncovered
+         // head one cycle after the deposit (+1, cycle-locked).
+         // A third entry with the queue still two deep means a deposit
+         // was not popped -- the wrapper's rate-1 contract is broken.
+         if (arrival && ((rg_q_wr - rg_q_rd) >= 3))
+            $display ("%0d: ASSERT FAIL Imem_Decoup: ask queue overflow", cur_cycle);
+
+
+         if (launch_demand) begin
+`ifdef SHIM_DEBUG
+            $display ("%0d: SHIM demand-launch head=%h fresh=%b cap_ok=%b slots=%b%b%b%b infl_v=%b w_v=%b w=%h arm=%b", cur_cycle, head.addr, fresh, cap_ok, rg_s3_valid, rg_s2_valid, rg_s1_valid, rg_s0_valid, rg_inflight_valid, rg_w_valid, rg_w_addr, arm);
+`endif
+            inner.req (CACHE_LD, head.f3,
+`ifdef ISA_A
+                       ?,
+`endif
+                       head.addr, 0,
+                       head.priv, head.sstatus_SUM, head.mstatus_MXR, head.satp);
+            rg_inflight_valid <= True;
+            rg_inflight_addr  <= head.addr;
+            rg_cur_f3          <= head.f3;
+            rg_cur_priv        <= head.priv;
+            rg_cur_sstatus_SUM <= head.sstatus_SUM;
+            rg_cur_mstatus_MXR <= head.mstatus_MXR;
+            rg_cur_satp        <= head.satp;
+            rg_q_rd            <= rg_q_rd + 1;
+            rg_last_valid      <= True;
+            rg_last_addr       <= head.addr;
+         end
+         else begin
+            if (head_valid) begin
+               rg_q_rd       <= rg_q_rd + 1;
+               rg_last_valid <= True;
+               rg_last_addr  <= head.addr;
+            end
+         end
+      end
+   endrule
+
+   // ----------------------------------------------------------------
+   // INTERFACE
+
+   interface IMem_IFC imem;
+      // CPU side: IMem request.  PURE ENQUEUE: no submodule calls, no
+      // reads of rule-written state -- a 0-cycle inline launch here is
+      // unschedulable (the rule's launch calls and the method's call to
+      // inner.req cannot be proven exclusive, and the tb's descending
+      // urgency then starves this module's rule on every consume cycle).
+      // Idle-pipe first fetches therefore pay one cycle (launched by the
+      // rule at the ask's arrival); mid-stream timing is stock-exact.
+      method Action req (Bit #(3) f3,
+                         WordXL addr,
+                         Priv_Mode  priv,
+                         Bit #(1)   sstatus_SUM,
+                         Bit #(1)   mstatus_MXR,
+                         WordXL     satp);
+         if (rg_q_wr [0] == 1'b0)
+            rg_q0 <= Imem_Ask { f3: f3, addr: addr, priv: priv,
+                                sstatus_SUM: sstatus_SUM, mstatus_MXR: mstatus_MXR, satp: satp };
+         else
+            rg_q1 <= Imem_Ask { f3: f3, addr: addr, priv: priv,
+                                sstatus_SUM: sstatus_SUM, mstatus_MXR: mstatus_MXR, satp: satp };
+         rg_q_wr <= rg_q_wr + 1;
+      endmethod
+
+      // CPU side: IMem response (wire-driven presentation: the port
+      // shows exactly the word the wrapper's outstanding ask waits for;
+      // the arrival kill matches stock's req-kills-at-+1).
+      method Bool valid = dw_valid;
+      method Bool is_i32_not_i16 = True;
+      method WordXL pc    = dw_pc;
+      method Instr  instr = dw_instr;
+      method Bool   exc   = dw_exc;
+      method Exc_Code exc_code = dw_code;
+      method WordXL tval  = dw_tval;
+   endinterface
+
+   method Action ma_clear;
+      rg_flush_tog <= ! rg_flush_tog;
+   endmethod
+
+endmodule: mkNear_Mem_Imem_Decoup
 
 // ================================================================
 // The module
@@ -85,6 +581,20 @@ module mkNear_Mem (Near_Mem_IFC);
 
    AXI4_Lite_MMU_Cache_Adapter_IFC dmem_slave_adapter <- mkAXI4_Lite_MMU_Cache_Adapter(dcache_arbiter.v_from_masters [1]);
 `endif
+
+   // STEP 5 shim-lean: I-side fetch decoupling queue between the CPU and
+   // the I-side MMU_Cache (Near_Mem_IFC side untouched: the fabric master
+   // still comes straight from icache).
+   Imem_Decoup_IFC idec <- mkNear_Mem_Imem_Decoup (icache);
+
+   // Flush notify: fence.i / sfence / reset tell the shim to drain its
+   // queue and drop held state.  The PulseWire decouples the server puts
+   // from the shim registers (step-4 G0004 lesson).
+   PulseWire pw_idec_flush <- mkPulseWire;
+
+   rule rl_idec_flush;
+      if (pw_idec_flush) idec.ma_clear;
+   endrule
 
    // ----------------------------------------------------------------
    // BEHAVIOR
@@ -124,6 +634,7 @@ module mkNear_Mem (Near_Mem_IFC);
       let tok <- pop (f_sfence_vma_reqs);
       icache.tlb_flush;
       dcache.tlb_flush;
+      pw_idec_flush.send;
       f_sfence_vma_rsps.enq (tok);
    endrule
 `endif
@@ -136,6 +647,7 @@ module mkNear_Mem (Near_Mem_IFC);
       interface Put request;
 	 method Action put (Token t) if (rg_state == STATE_READY);
 	    rg_state <= STATE_RESET;
+	    pw_idec_flush.send;
 	 endmethod
       endinterface
 
@@ -160,23 +672,17 @@ module mkNear_Mem (Near_Mem_IFC);
 			  Bit #(1)   sstatus_SUM,
 			  Bit #(1)   mstatus_MXR,
 			  WordXL     satp);    // { VM_Mode, ASID, PPN_for_page_table }
-	 Bit #(7)  amo_funct7  = ?;
-	 Bit #(64) store_value = ?;
-	 icache.req (CACHE_LD, f3,
-`ifdef ISA_A
-		     amo_funct7,
-`endif
-		     addr, store_value, priv, sstatus_SUM, mstatus_MXR, satp);
+	 idec.imem.req (f3, addr, priv, sstatus_SUM, mstatus_MXR, satp);
       endmethod
 
       // CPU side: IMem response
-      method Bool     valid          = icache.valid;
-      method Bool     is_i32_not_i16 = True;
-      method WordXL   pc             = icache.addr;
-      method Instr    instr          = truncate (icache.cword);
-      method Bool     exc            = icache.exc;
-      method Exc_Code exc_code       = icache.exc_code;
-      method WordXL   tval           = icache.addr;
+      method Bool     valid          = idec.imem.valid;
+      method Bool     is_i32_not_i16 = idec.imem.is_i32_not_i16;
+      method WordXL   pc             = idec.imem.pc;
+      method Instr    instr          = idec.imem.instr;
+      method Bool     exc            = idec.imem.exc;
+      method Exc_Code exc_code       = idec.imem.exc_code;
+      method WordXL   tval           = idec.imem.tval;
    endinterface
 
    // Fabric side
@@ -232,6 +738,7 @@ module mkNear_Mem (Near_Mem_IFC);
 	 method Action put (Token t);
 	    icache.server_flush.request.put (?);
 	    dcache.server_flush.request.put (?);
+	    pw_idec_flush.send;
 	 endmethod
       endinterface
       interface Get response;
@@ -296,6 +803,15 @@ module mkNear_Mem (Near_Mem_IFC);
    // Misc. status; 0 = running, no error
    method Bit #(8) mv_status;
       return dcache.mv_status;
+   endmethod
+
+   // Performance-monitoring taps (see interface comment)
+   method Bool mv_perf_imiss;
+      return icache.mv_perf_miss;
+   endmethod
+
+   method Bool mv_perf_dmiss;
+      return dcache.mv_perf_miss;
    endmethod
 
 endmodule

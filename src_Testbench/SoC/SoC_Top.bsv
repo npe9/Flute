@@ -61,8 +61,8 @@ import Camera_Model   :: *;
 `endif
 
 `ifdef INCLUDE_ACCEL0
-import AXI4_Accel_IFC :: *;
-import AXI4_Accel     :: *;
+import AXI4_GPIO      :: *;
+import SoC_Info       :: *;
 `endif
 
 `ifdef INCLUDE_TANDEM_VERIF
@@ -98,6 +98,12 @@ interface SoC_Top_IFC;
    // Catch-all status; return-value can identify the origin (0 = none)
    (* always_ready *)
    method Bit #(8) status;
+
+`ifdef INCLUDE_ACCEL0
+   // GPIO (Accel0 slot repurposed for ULX3S LEDs/buttons)
+   (* always_ready *) method Bit #(8) gpio_leds;
+   (* always_enabled *) method Action gpio_btn1 (Bit #(1) v);
+`endif
 
    // ----------------------------------------------------------------
    // Misc. control and status
@@ -139,10 +145,11 @@ deriving (Bits, Eq, FShow);
 // The module
 
 (* synthesize *)
-module mkSoC_Top (SoC_Top_IFC);
+module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
    Integer verbosity = 0;    // Normally 0; non-zero for debugging
 
    Reg #(SoC_State) rg_state <- mkReg (SOC_START);
+   Reg #(Bool)      rg_intr_prev <- mkReg (False);    // perf: irq edge detect
 
    // SoC address map specifying base and limit for memories, IPs, etc.
    SoC_Map_IFC soc_map <- mkSoC_Map;
@@ -175,7 +182,10 @@ module mkSoC_Top (SoC_Top_IFC);
 
 `ifdef INCLUDE_ACCEL0
    // Accel0 master to fabric
-   AXI4_Accel_IFC  accel0 <- mkAXI4_Accel;
+   AXI4_GPIO_IFC  accel0 <- mkAXI4_GPIO;
+
+   // SoC self-description block (device manifest + id registers)
+   SoC_Info_IFC  soc_info <- mkSoC_Info (clk_hz);
 `endif
 
    // ----------------
@@ -216,6 +226,34 @@ module mkSoC_Top (SoC_Top_IFC);
 `ifdef INCLUDE_ACCEL0
    // Fabric to accel0
    mkConnection (fabric.v_to_slaves [accel0_slave_num], accel0.slave);
+
+   // Fabric to soc_info
+   mkConnection (fabric.v_to_slaves [soc_info_slave_num], soc_info.slave);
+
+   // Bus-error monitor: drain fabric decode-error events into SoC_Info
+   rule rl_bus_err_capture;
+      let e <- fabric.err_events.get;
+      soc_info.note_err (e);
+   endrule
+
+   // Performance-monitoring taps: core retire/redirect/cache-miss pulses,
+   // plus interrupt edges observable at this level.  Each fires its
+   // one-cycle pulse into SoC_Info's programmable counters.
+   rule rl_perf_taps_core;
+      if (core.mv_perf_retire)   soc_info.note_retire;
+      if (core.mv_perf_redirect) soc_info.note_redirect;
+      if (core.mv_perf_imiss)    soc_info.note_imiss;
+      if (core.mv_perf_dmiss)    soc_info.note_dmiss;
+   endrule
+
+   rule rl_perf_taps_irq;
+      let intr = uart0.intr;
+      if (intr && ! rg_intr_prev) begin
+	 soc_info.note_uart_irq;
+	 soc_info.note_ext_irq;
+      end
+      rg_intr_prev <= intr;
+   endrule
 `endif
 
 `ifdef HTIF_MEMORY
@@ -305,6 +343,9 @@ module mkSoC_Top (SoC_Top_IFC);
 		      soc_map.m_accel0_addr_base,
 		      soc_map.m_accel0_addr_lim);
 `endif
+	 soc_info.init (fabric_default_id,
+			soc_map.m_soc_info_addr_base,
+			soc_map.m_soc_info_addr_lim);
 
 	 if (verbosity != 0) begin
 	    $display ("  SoC address map:");
@@ -402,8 +443,8 @@ module mkSoC_Top (SoC_Top_IFC);
    rule rl_handle_external_req_write (req.op == external_control_req_op_write_control_fabric);
       f_external_control_reqs.deq;
       core.dm_dmi.write (truncate (req.arg1), truncate (req.arg2));
-      // let rsp = Control_Rsp {status: external_control_rsp_status_ok, result: 0};
-      // f_external_control_rsps.enq (rsp);
+      let rsp = Control_Rsp {status: external_control_rsp_status_ok, result: 0};
+      f_external_control_rsps.enq (rsp);
       if (verbosity != 0) begin
          $display ("%0d:%m.rl_handle_external_req_write", cur_cycle);
          $display ("    ", fshow (req));
@@ -443,6 +484,14 @@ module mkSoC_Top (SoC_Top_IFC);
 
    // Catch-all status; return-value can identify the origin (0 = none)
    method Bit #(8) status = 0;
+
+`ifdef INCLUDE_ACCEL0
+   // GPIO (Accel0 slot repurposed for ULX3S LEDs/buttons)
+   method Bit #(8) gpio_leds = accel0.leds;
+   method Action gpio_btn1 (Bit #(1) v);
+      accel0.btn1 (v);
+   endmethod
+`endif
 
    // ----------------------------------------------------------------
    // Misc. control and status

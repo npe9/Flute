@@ -189,6 +189,21 @@ endfunction
 
 // ================================================================
 
+// STEP 12 (50 MHz campaign): deferred training record.  bp_train
+// only enqueues; rl_bp_train applies a cycle later, cutting the
+// ~20 ns rl_pipe-feed -> FSM/BTB-write cone (a step-4-flagged class,
+// so fully gated).  Trains are hints: a lost or deferred train only
+// degrades prediction quality, never correctness (redirects recover).
+typedef struct {
+   WordXL  pc;
+   Bool    is_i32_not_i16;
+   Instr   instr;
+   CF_Info cf_info;
+} BP_Train
+deriving (Bits, FShow);
+
+// ================================================================
+
 (* synthesize *)
 module mkBranch_Predictor (Branch_Predictor_IFC);
 
@@ -208,6 +223,8 @@ module mkBranch_Predictor (Branch_Predictor_IFC);
    // This is a regfile separate from btb_bramcore2 to allow combinational lookup,
    // to enable read-modify-write in a cycle.
    RegFile #(BTB_Index, Bit #(2)) rf_btb_fsms <- mkRegFileFull;
+
+   FIFOF #(BP_Train) f_train <- mkSizedFIFOF (2);
 
    // Return Address Stack (RAS). Top of stack is always at [0]. Push/pop by shifting.
    Reg #(Vector #(RAS_Capacity, WordXL)) rg_ras  <- mkReg (replicate (bogus_PC));
@@ -231,6 +248,7 @@ module mkBranch_Predictor (Branch_Predictor_IFC);
       Bool op_write_not_read = True;
       btb_bramcore2.b.put (op_write_not_read, rg_index, btb_entry);
       rf_btb_fsms.upd (rg_index, 2'b00);    // strong not-taken
+      f_train.clear;                        // STEP 12: drop deferred trains
 
       if (rg_index == '1) begin
 	 rg_resetting <= False;
@@ -238,6 +256,67 @@ module mkBranch_Predictor (Branch_Predictor_IFC);
 	    $display ("%0d: %m.rl_reset: reset complete", cur_cycle);
       end
       rg_index <= rg_index + 1;
+   endrule
+
+   // STEP 12: deferred training application (single writer of rg_ras,
+   // rf_btb_fsms and the BTB B port alongside rl_reset, with which it
+   // is provably exclusive on rg_resetting).
+   rule rl_bp_train (! rg_resetting);
+      let t = f_train.first;
+      f_train.deq;
+      if (verbosity > 2)
+	 $display ("%0d: %m.rl_bp_train: pc %0x  is_i32 %0d  instr %0x ",
+		   cur_cycle, t.pc, t.is_i32_not_i16, t.instr, fshow (t.cf_info));
+
+      // ----------------
+      // RAS training using (pc, is_i32_not_i16, instr)
+      // Top-of-stack is at ras [0]
+
+      match { .do_pop, .do_push, .ret_pc } = fn_ras_actions (t.pc, t.is_i32_not_i16, t.instr);
+      let ras_val  = rg_ras;
+      if (do_pop)  ras_val = shiftInAtN (ras_val, bogus_PC);
+      if (do_push) ras_val = shiftInAt0 (ras_val, ret_pc);
+      rg_ras       <= ras_val;
+
+      // ----------------
+      // BTB training using cf_info which is feedback from downpipe
+      // exec stage (several instructions earlier)
+
+      WordXL    pred_PC = bogus_PC;
+      BTB_Index index_b = fn_pc_to_index (t.cf_info.from_PC);
+      Bit #(2)  fsm_val = rf_btb_fsms.sub (index_b);
+
+      if (t.cf_info.cf_op == CF_BR) begin
+	 if (t.cf_info.taken)
+	    case (fsm_val)
+	       2'b00: begin fsm_val = 2'b01; pred_PC  = t.cf_info.fallthru_PC; end
+	       2'b01: begin fsm_val = 2'b10; pred_PC  = t.cf_info.taken_PC;    end
+	       2'b10: begin fsm_val = 2'b11; pred_PC  = t.cf_info.taken_PC;    end
+	       2'b11: begin fsm_val = 2'b11; pred_PC  = t.cf_info.taken_PC;    end
+	    endcase
+	 else
+	    case (fsm_val)
+	       2'b00: begin fsm_val = 2'b00; pred_PC  = t.cf_info.fallthru_PC; end
+	       2'b01: begin fsm_val = 2'b00; pred_PC  = t.cf_info.fallthru_PC; end
+	       2'b10: begin fsm_val = 2'b01; pred_PC  = t.cf_info.fallthru_PC; end
+	       2'b11: begin fsm_val = 2'b10; pred_PC  = t.cf_info.taken_PC;    end
+	    endcase
+      end
+      else if ((t.cf_info.cf_op == CF_JAL) || (t.cf_info.cf_op == CF_JALR)) begin
+	 fsm_val = 2'b11;    // strong taken
+	 pred_PC = t.cf_info.taken_PC;
+      end
+      if (pred_PC != bogus_PC) begin
+	 rf_btb_fsms.upd (index_b, fsm_val);
+	 let btb_entry = BTB_Entry {valid:        True,
+				    pc_tag:       fn_pc_to_tag (t.cf_info.from_PC),
+				    predicted_pc: fn_pc_to_word_addr (pred_PC) };
+	 Bool op_write_not_read = True;
+	 btb_bramcore2.b.put (op_write_not_read, index_b, btb_entry);
+	 if (verbosity > 2)
+	    $display ("    insert prediction [0x%0h] <= (%0h -> %0h)",
+		      index_b, t.cf_info.from_PC, pred_PC);
+      end
    endrule
 
    // ----------------------------------------------------------------
@@ -295,63 +374,22 @@ module mkBranch_Predictor (Branch_Predictor_IFC);
    // First 3 args are from current fetch, to train RAS.
    // cf_info arg is from Exec stage (downpipe), from an earlier (older) instruction.
 
+   // ----------------
+   // Train BTB and RAS (STEP 12: enqueue only; rl_bp_train applies a
+   // cycle later, cutting the rl_pipe-feed -> FSM/BTB-write cone).
+   // First 3 args are from current fetch, to train RAS.
+   // cf_info arg is from Exec stage (downpipe), from an earlier (older) instruction.
+
    method Action bp_train (WordXL   pc,
 			   Bool     is_i32_not_i16,
 			   Instr    instr,
 			   CF_Info  cf_info);
-      if (verbosity > 2)
-	 $display ("%0d: %m.bp_train: pc %0x  is_i32 %0d  instr %0x ",
-		   cur_cycle, pc, is_i32_not_i16, instr, fshow (cf_info));
-
-      // ----------------
-      // RAS training using (pc, is_i32_not_i16, instr) which are from currently fetched instr
-      // Top-of-stack is at ras [0]
-
-      match { .do_pop, .do_push, .ret_pc } = fn_ras_actions (pc, is_i32_not_i16, instr);
-      let ras_val  = rg_ras;
-      if (do_pop)  ras_val = shiftInAtN (ras_val, bogus_PC);
-      if (do_push) ras_val = shiftInAt0 (ras_val, ret_pc);
-      rg_ras       <= ras_val;
-
-      // ----------------
-      // BTB training using cf_info which is feedback from downpipe
-      // exec stage (several instructions earlier)
-
-      WordXL    pred_PC = bogus_PC;
-      BTB_Index index_b = fn_pc_to_index (cf_info.from_PC);
-      Bit #(2)  fsm_val = rf_btb_fsms.sub (index_b);
-
-      if (cf_info.cf_op == CF_BR) begin
-	 if (cf_info.taken)
-	    case (fsm_val)
-	       2'b00: begin fsm_val = 2'b01; pred_PC  = cf_info.fallthru_PC; end
-	       2'b01: begin fsm_val = 2'b10; pred_PC  = cf_info.taken_PC;    end
-	       2'b10: begin fsm_val = 2'b11; pred_PC  = cf_info.taken_PC;    end
-	       2'b11: begin fsm_val = 2'b11; pred_PC  = cf_info.taken_PC;    end
-	    endcase
-	 else
-	    case (fsm_val)
-	       2'b00: begin fsm_val = 2'b00; pred_PC  = cf_info.fallthru_PC; end
-	       2'b01: begin fsm_val = 2'b00; pred_PC  = cf_info.fallthru_PC; end
-	       2'b10: begin fsm_val = 2'b01; pred_PC  = cf_info.fallthru_PC; end
-	       2'b11: begin fsm_val = 2'b10; pred_PC  = cf_info.taken_PC;    end
-	    endcase
-      end
-      else if ((cf_info.cf_op == CF_JAL) || (cf_info.cf_op == CF_JALR)) begin
-	 fsm_val = 2'b11;    // strong taken
-	 pred_PC = cf_info.taken_PC;
-      end
-      if (pred_PC != bogus_PC) begin
-	 rf_btb_fsms.upd (index_b, fsm_val);
-	 let btb_entry = BTB_Entry {valid:        True,
-				    pc_tag:       fn_pc_to_tag (cf_info.from_PC),
-				    predicted_pc: fn_pc_to_word_addr (pred_PC) };
-	 Bool op_write_not_read = True;
-	 btb_bramcore2.b.put (op_write_not_read, index_b, btb_entry);
-	 if (verbosity > 2)
-	    $display ("    insert prediction [0x%0h] <= (%0h -> %0h)",
-		      index_b, cf_info.from_PC, pred_PC);
-      end
+      if (f_train.notFull)
+	 f_train.enq (BP_Train {pc: pc, is_i32_not_i16: is_i32_not_i16,
+				instr: instr, cf_info: cf_info});
+      else if (verbosity > 0)
+	 $display ("%0d: %m.bp_train: train FIFO full, dropping train (hint only)",
+		   cur_cycle);
    endmethod
 
 endmodule

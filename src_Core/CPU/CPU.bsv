@@ -391,7 +391,6 @@ module mkCPU (CPU_IFC);
 	 stage3.set_full (False);
 	 stage2.set_full (False);
 	 stage1.set_full (False);
-	 stage1.ma_clear;
 	 stageD.set_full (False);
 
 	 fa_stageF_redirect (resume_pc);
@@ -707,7 +706,6 @@ module mkCPU (CPU_IFC);
 	    if (stage1.out.control == CONTROL_DISCARD) begin
 	       stage2_full = False;
 	       stage1_full = False;
-	       stage1.deq;    // STEP 11: pop the elastic output FIFO
 	       if (cur_verbosity > 1)
 		  $display ("    rl_pipe: Discarding stage1 due to redirection");
 	    end
@@ -725,10 +723,7 @@ module mkCPU (CPU_IFC);
 	  
       // ----------------
       // Move instruction from StageD to Stage1
-      // STEP 11: gate on the elastic stage's INPUT capacity (not the
-      // output occupancy) so this refill is not chained to the
-      // stage1->stage2 move one cycle earlier.
-      if (   stage1.mv_can_enq
+      if (   (! stage1_full)
 	  && (stageD.out.ostatus == OSTATUS_PIPE))
 	 begin
 	    stage1.enq (stageD.out.data_to_stage1);  stage1_full = True;
@@ -867,7 +862,6 @@ module mkCPU (CPU_IFC);
 
       stageD.set_full (False);
       stage1.set_full (False);    fa_step_check;
-      stage1.ma_clear;
       stage2.set_full (False);
 
       // Accounting    TODO: should traps be counted as retired insrs?
@@ -1157,7 +1151,6 @@ module mkCPU (CPU_IFC);
 
       stageD.set_full (False);
       stage1.set_full (False);    fa_step_check;
-      stage1.ma_clear;
       fa_stageF_redirect (rg_next_pc);
    endrule
 
@@ -1192,7 +1185,6 @@ module mkCPU (CPU_IFC);
 
       stageD.set_full (False);
       stage1.set_full (False);    fa_step_check;
-      stage1.ma_clear;
 
       // Accounting
       csr_regfile.csr_minstret_incr;
@@ -1251,7 +1243,6 @@ module mkCPU (CPU_IFC);
       // Resume pipe
       stageD.set_full (False);
       stage1.set_full (False);    fa_step_check;
-      stage1.ma_clear;
       fa_stageF_redirect (rg_next_pc);
    endrule: rl_finish_FENCE_I
 
@@ -1296,7 +1287,6 @@ module mkCPU (CPU_IFC);
       // Resume pipe
       stageD.set_full (False);
       stage1.set_full (False);    fa_step_check;
-      stage1.ma_clear;
       fa_stageF_redirect (rg_next_pc);
    endrule: rl_finish_FENCE
 
@@ -1350,7 +1340,6 @@ module mkCPU (CPU_IFC);
       // Resume pipe
       stageD.set_full (False);
       stage1.set_full (False);    fa_step_check;
-      stage1.ma_clear;
       fa_stageF_redirect (rg_next_pc);
    endrule: rl_finish_SFENCE_VMA
 `endif
@@ -1374,7 +1363,6 @@ module mkCPU (CPU_IFC);
 
       stageD.set_full (False);
       stage1.set_full (False);    fa_step_check;
-      stage1.ma_clear;
 
       // Accounting
       csr_regfile.csr_minstret_incr;

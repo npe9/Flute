@@ -236,22 +236,36 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
       soc_info.note_err (e);
    endrule
 
-   // Performance-monitoring taps: core retire/redirect/cache-miss pulses,
-   // plus interrupt edges observable at this level.  Each fires its
-   // one-cycle pulse into SoC_Info's programmable counters.
+   // Performance-monitoring taps, STEP 10: the note pulses are delayed
+   // one cycle through single-writer flags so the core's comb
+   // retire/redirect/miss cone no longer shares a cycle with the
+   // counter-increment logic (a ~31 ns wall in the variant-B report:
+   // stage1 -> note_retire -> rg_perf_count D).  Counters observe
+   // events one cycle late (statistics-visible only).
+   Reg #(Bool) rg_note_retire   <- mkReg (False);
+   Reg #(Bool) rg_note_redirect <- mkReg (False);
+   Reg #(Bool) rg_note_imiss    <- mkReg (False);
+   Reg #(Bool) rg_note_dmiss    <- mkReg (False);
+   Reg #(Bool) rg_note_uirq     <- mkReg (False);
+   Reg #(Bool) rg_note_eirq     <- mkReg (False);
+
    rule rl_perf_taps_core;
-      if (core.mv_perf_retire)   soc_info.note_retire;
-      if (core.mv_perf_redirect) soc_info.note_redirect;
-      if (core.mv_perf_imiss)    soc_info.note_imiss;
-      if (core.mv_perf_dmiss)    soc_info.note_dmiss;
+      if (rg_note_retire)   soc_info.note_retire;
+      if (rg_note_redirect) soc_info.note_redirect;
+      if (rg_note_imiss)    soc_info.note_imiss;
+      if (rg_note_dmiss)    soc_info.note_dmiss;
+      rg_note_retire   <= core.mv_perf_retire;
+      rg_note_redirect <= core.mv_perf_redirect;
+      rg_note_imiss    <= core.mv_perf_imiss;
+      rg_note_dmiss    <= core.mv_perf_dmiss;
    endrule
 
    rule rl_perf_taps_irq;
       let intr = uart0.intr;
-      if (intr && ! rg_intr_prev) begin
-	 soc_info.note_uart_irq;
-	 soc_info.note_ext_irq;
-      end
+      if (rg_note_uirq) soc_info.note_uart_irq;
+      if (rg_note_eirq) soc_info.note_ext_irq;
+      rg_note_uirq <= (intr && ! rg_intr_prev);
+      rg_note_eirq <= (intr && ! rg_intr_prev);
       rg_intr_prev <= intr;
    endrule
 `endif

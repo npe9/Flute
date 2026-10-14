@@ -194,25 +194,6 @@ Bool bram_cmd_write = True;
 typedef enum {REQUESTOR_RESET_IFC, REQUESTOR_FLUSH_IFC} Requestor
 deriving (Bits, Eq, FShow);
 
-// ----------------------------------------------------------------
-// A CPU request queued by 'req' and launched one cycle later by
-// rl_req_launch (see comment at rl_req_launch for why).
-
-typedef struct {
-   CacheOp    op;
-   Bit #(3)   f3;
-`ifdef ISA_A
-   Bit #(7)   amo_funct7;
-`endif
-   WordXL     addr;
-   CWord      st_value;
-   Priv_Mode  priv;
-   Bit #(1)   sstatus_SUM;
-   Bit #(1)   mstatus_MXR;
-   WordXL     satp;
-} Cache_Req
-deriving (Bits);
-
 Bit #(Wd_User) dummy_user = ?;    // For AXI4 'user' field (here unused)
 
 `ifndef ISA_PRIV_S
@@ -462,34 +443,6 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    FIFOF #(Requestor) f_reset_reqs <- mkFIFOF;
    FIFOF #(Requestor) f_reset_rsps <- mkFIFOF;
 
-   // Queued CPU requests, launched one cycle later by rl_req_launch.
-   //
-   // Circular buffer, depth 16, with *always-ready* enqueue: CPU rules call
-   // 'req' in the same cycle as they read the response (imem_pc etc.), so a
-   // blocking enqueue (e.g. mkFIFOF, whose RDY feeds those rules' condition
-   // splits) introduces scheduling conflicts (G0004) at the CPU level.
-   // Depth 16 (was 4): the boot code posts long back-to-back store bursts
-   // (stack/trap-record fill, ~1 store per 4-5 cycles) that outpace the
-   // ~4-cycle per-store FSM pipeline (launch->settle->probe->ST_AMO_rsp);
-   // depth 4 overflowed at cycle ~5529.  Overflow is still impossible by
-   // construction for demand-paced (CPU-stalled) traffic — the CPU can only
-   // enqueue when consuming a response — but posted stores need the slack.
-   //
-   // Single-writer counters (enq count written only by 'req', deq count only
-   // by the launcher) avoid the two-writers starvation trap; occupancy is
-   // (enq - deq) mod 32.
-
-   Integer req_q_depth = 16;
-
-   Reg #(Vector #(16, Cache_Req))  v_req_q     <- mkRegU;
-   Reg #(Bit #(4))                rg_q_wr     <- mkReg (0);
-   Reg #(Bit #(4))                rg_q_rd     <- mkReg (0);
-   Reg #(Bit #(5))                rg_q_enqcnt <- mkReg (0);
-   Reg #(Bit #(5))                rg_q_deqcnt <- mkReg (0);
-
-   Bit #(5) rg_q_occupancy = rg_q_enqcnt - rg_q_deqcnt;
-   Bool     req_q_empty    = (rg_q_occupancy == 0);
-
    // Fabric request/response
    AXI4_Master_Xactor_IFC #(Wd_Id, Wd_Addr, Wd_Data, Wd_User) master_xactor <- mkAXI4_Master_Xactor;
 
@@ -716,103 +669,19 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    let cword_set           = rg_data_ram_q;
 
    // One wait cycle after a RAM B-port read is launched.  The launch
-   // (rl_req_launch or rl_rereq) toggles rg_req_seq; rl_age_ram_rsp copies the
-   // new level into rg_age_seen one cycle later, when the capture registers
-   // above have sampled the raw BRAM outputs.  The probe rule fires only when
-   // the two levels match (and no request is queued), so the hit test and all
-   // RAM-data consumers see the registered (captured) values.  Two disjoint
-   // registers (no write conflict with rl_req_launch, which must remain
-   // callable while the cache is in MODULE_RUNNING).
+   // One wait cycle after a RAM B-port read is launched.  'req' (and
+   // rl_rereq) toggle rg_req_seq; rl_age_ram_rsp copies the new level into
+   // rg_age_seen one cycle later, when the capture registers above have
+   // sampled the raw BRAM outputs.  The probe rule fires only when the two
+   // levels match, so the hit test and all RAM-data consumers see the
+   // registered (captured) values.  Two disjoint registers (no write
+   // conflict with the req method, which must remain callable while the
+   // cache is in MODULE_RUNNING).
    Reg #(Bool) rg_req_seq   <- mkReg (False);
    Reg #(Bool) rg_age_seen  <- mkReg (False);
 
-   rule rl_age_ram_rsp (((rg_state == MODULE_RUNNING) || (rg_state == MODULE_READY))
-			&& (rg_age_seen != rg_req_seq));
+   rule rl_age_ram_rsp ((rg_state == MODULE_RUNNING) && (rg_age_seen != rg_req_seq));
       rg_age_seen <= rg_req_seq;
-   endrule
-
-   // ----------------------------------------------------------------
-   // Request launcher.  'req' only enqueues the request args; this rule
-   // fires one cycle later and drives the RAM B-port read.
-   //
-   // Why: the CPU-side request address (fetch: predicted PC from the
-   // branch-predictor cone; load/store: stage2 operand path) must not
-   // combinationally reach the BRAM address pin.  Before this change,
-   // 'req' launched the read in the same cycle, and synthesis merged the
-   // entire fetch/predict/decode cone into the tag-RAM address path
-   // (icache.rg_addr -> predictor rsp -> ADDRB -> DOB_R), the ~36 ns
-   // critical path that capped Fmax at ~28 MHz.  Launching from this
-   // FIFO's output register cuts that cone at a register boundary.
-   //
-   // The +1 cycle of request latency is absorbed by the CPU's existing
-   // OSTATUS_BUSY handling (misses already cost ~30 cycles).  The probe
-   // rule is guarded with req_q_empty so it cannot re-fire with
-   // stale data while a launch is pending; rl_rereq keeps launching
-   // directly (its address, rg_addr, is already a registered value on a
-   // short path).
-   //
-   // This rule also performs the misaligned-access check (raising the
-   // exception response instead of launching) and re-enters MODULE_RUNNING,
-   // so that 'req' itself is a pure queue enqueue with no other register
-   // writes.
-   //
-   // State discipline (the 2026-10-09 wedge root cause, proven by both
-   // strict engines 2026-10-13): the launcher must fire ONLY when the
-   // cache can accept a request -- MODULE_READY (reset/TLB-flush done, no
-   // port-A traffic) or MODULE_RUNNING with the previous response settled
-   // (rg_age_seen == rg_req_seq, so no B-port read is pending and the
-   // probe is not holding rg_* state).  The original reqq guard was bare
-   // (! req_q_empty): it fired during MODULE_RESETTING/refill/snapshot/
-   // store, issuing port-B reads that collided cross-port same-address
-   // with the reset/refill port-A writes (dcache tag RAM, set 0x3a, at
-   // boot) -- undefined on ECP5 DP16KD, invisible to stock Bluesim.
-   //
-   // Urgency: the launcher drains the request queue ahead of any FSM
-   // activity that a queued request will supersede (a queued redirect means
-   // any in-flight refill/PTW/IO work is stale).  (Attribute is attached to
-   // rl_rereq, the last-named rule in the file, because bsc requires named
-   // rules to be defined before reference.)
-
-   rule rl_req_launch (! req_q_empty
-		       && (rg_age_seen == rg_req_seq)
-		       && ((rg_state == MODULE_READY) || (rg_state == MODULE_RUNNING)));
-      let r = v_req_q [rg_q_rd];
-      rg_q_rd     <= rg_q_rd + 1;
-      rg_q_deqcnt <= rg_q_deqcnt + 1;
-
-      rg_op          <= r.op;
-      rg_f3          <= r.f3;
-`ifdef ISA_A
-      rg_amo_funct7  <= r.amo_funct7;
-`endif
-      rg_addr        <= r.addr;
-      rg_st_amo_val  <= r.st_value;
-      rg_priv        <= r.priv;
-      rg_sstatus_SUM <= r.sstatus_SUM;
-      rg_mstatus_MXR <= r.mstatus_MXR;
-      rg_satp        <= r.satp;
-
-      if (! fn_is_aligned (r.f3, r.addr)) begin
-	 // Misaligned access: trap instead of accessing the RAMs
-	 rg_state    <= MODULE_EXCEPTION_RSP;
-	 rg_exc_code <= ((r.op == CACHE_LD) ? exc_code_LOAD_ADDR_MISALIGNED : exc_code_STORE_AMO_ADDR_MISALIGNED);
-      end
-      else begin
-	 rg_state <= MODULE_RUNNING;
-
-	 // Initial default PA assumes no VM translation
-	 rg_pa        <= fn_WordXL_to_PA (r.addr);
-	 rg_req_seq   <= ! rg_req_seq;
-	 fa_req_ram_B (r.addr);
-      end
-
-      if (cfg_verbosity > 1)
-	 $display ("%0d: %s.rl_req_launch: addr 0x%0h op ",
-		   cur_cycle, d_or_i, r.addr, fshow (r.op));
-`ifdef SIM_TRACE
-      $displayb ("%0d: %s.LAUNCH addr 0x%0h op %0d f3 %0d qoccup %0d",
-		 cur_cycle, d_or_i, r.addr, r.op, r.f3, rg_q_occupancy);
-`endif
    endrule
 
    // Test cache hit or miss; if hit, return which 'way', and the word64 data
@@ -873,10 +742,6 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	 if (cfg_verbosity > 1)
 	    $display ("%0d: %s.drive_mem_rsp: addr 0x%0h ld_val 0x%0h st_amo_val 0x%0h",
 		      cur_cycle, d_or_i, addr, ld_val, st_amo_val);
-`ifdef SIM_TRACE
-	 $displayb ("%0d: %s.DRIVE_MEM_RSP addr 0x%0h ld_val 0x%0h seq %b",
-		    cur_cycle, d_or_i, addr, ld_val, rg_req_seq);
-`endif
       endaction
    endfunction
 
@@ -1031,8 +896,6 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       rg_state             <= MODULE_RESETTING;
       rg_cset_in_cache     <= 0;
       rg_lower_word32_full <= False;
-      rg_q_enqcnt          <= 0;
-      rg_q_deqcnt          <= 0;
 
       // Flush the TLB
 `ifdef ISA_PRIV_S
@@ -1095,8 +958,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 `endif
 
    rule rl_probe_and_immed_rsp (rg_ddr4_ready && (rg_state == MODULE_RUNNING)
-				&& (rg_age_seen == rg_req_seq)
-				&& req_q_empty);
+				&& (rg_age_seen == rg_req_seq));
 
       // Print some initial information for debugging
       if (cfg_verbosity > 1) begin
@@ -1178,10 +1040,6 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	    // Compute cache hit/miss. If hit, also compute Way_in_CSet and Word64
 	    let pa_ctag = fn_PA_to_CTag (vm_xlate_result.pa);
 	    match { .hit, .way_hit, .word64 } <- fn_test_cache_hit_or_miss (pa_ctag);
-`ifdef SIM_TRACE
-	    $displayb ("%0d: %s.PROBE op %0d addr 0x%0h hit %b word64 0x%0h",
-		       cur_cycle, d_or_i, rg_op, rg_addr, hit, word64);
-`endif
 
 	    // ----------------
 	    // Memory LD and AMO_LR
@@ -1882,7 +1740,6 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // After tlb and cache refills, redo the missing request,
    // i.e., probe the TLB and cache (BRAM port B) again
 
-   (* descending_urgency = "rl_start_reset, rl_probe_and_immed_rsp, rl_cache_refill_rsps_loop, rl_rereq, rl_req_launch, req" *)
    rule rl_rereq (rg_state == CACHE_REREQ);
       rg_state <= MODULE_RUNNING;
       rg_req_seq <= ! rg_req_seq;
@@ -1897,13 +1754,6 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       dw_valid             <= True;
       dw_output_ld_val     <= zeroExtend (rg_ld_val);        // Irrelevant for ST; relevant for SC, AMO
       dw_output_st_amo_val <= zeroExtend (rg_st_amo_val);
-
-      // With the request queue, 'req' no longer exits this state (stock
-      // relied on the next req to move on).  Enter MODULE_READY
-      // ("response given, awaiting next request"); the guarded
-      // rl_req_launch fires from READY, and leaving ST_AMO_RSP here also
-      // prevents this rule re-driving dw_valid on subsequent cycles.
-      rg_state <= MODULE_READY;
 
 `ifdef WATCH_TOHOST
       // ----------------
@@ -1964,17 +1814,10 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       let ld_val = fn_extract_and_extend_bytes(rg_f3, rg_addr, zeroExtend (rd_data.rdata));
       rg_ld_val <= ld_val;
 
-      // Successful read.  Drive the response this cycle and exit to
-      // MODULE_READY for the queued-request launcher: an in-order
-      // pipeline's stalled load-stage consumes a DWire response the cycle
-      // it is driven, so the multi-cycle hold (stock's IO_READ_RSP,
-      // "stays until CPU's next request") is both unnecessary and
-      // unimplementable with the queue (queue non-empty does not imply
-      // this response was consumed -- a posted store can be queued ahead
-      // of the consuming request).
+      // Successful read
       if (rd_data.rresp == axi4_resp_okay) begin
 	 fa_drive_IO_read_rsp (rg_f3, rg_addr, ld_val);
-	 rg_state <= MODULE_READY;
+	 rg_state <= IO_READ_RSP;
       end
 
       // Bus error
@@ -1987,14 +1830,13 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       end
    endrule
 
-   // NOTE: stock had a "maintain" rule here holding the I/O-read response
-   // in IO_READ_RSP until the CPU's next request.  With the request
-   // queue that hold is unimplementable (a posted store can sit in the
-   // queue without the pending response being consumed), and unnecessary
-   // (an in-order pipeline's stalled load-stage consumes the DWire
-   // response the cycle it is driven).  Both producers now drive the
-   // response and exit straight to MODULE_READY; the launcher picks up
-   // the next queued request from READY.
+   // ----------------
+   // Maintain I/O-read response
+   // Stays in this state until CPU's next request puts it back into RUNNING state
+
+   rule rl_maintain_io_read_rsp (rg_state == IO_READ_RSP);
+      fa_drive_IO_read_rsp (rg_f3, rg_addr, rg_ld_val);
+   endrule
 
    // ----------------------------------------------------------------
    // Memory-mapped I/O write requests (ST)
@@ -2096,7 +1938,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
 	 fa_drive_IO_read_rsp (rg_f3, rg_addr, new_ld_val);
 	 rg_ld_val <= new_ld_val;
-	 rg_state  <= MODULE_READY;
+	 rg_state  <= IO_READ_RSP;
 
 	 if (cfg_verbosity > 1)
 	    $display ("    => rl_ST_AMO_response");
@@ -2140,11 +1982,6 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       dw_valid    <= True;
       dw_exc      <= True;
       dw_exc_code <= rg_exc_code;
-
-      // See rl_ST_AMO_response: exit to MODULE_READY so the queued-request
-      // launcher (READY|RUNNING guard) can serve the next request, and to
-      // avoid re-driving the exception response on later cycles.
-      rg_state <= MODULE_READY;
    endrule
 
    // ================================================================
@@ -2170,10 +2007,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
    // CPU interface: request
    // NOTE: this has no flow control: CPU should only invoke it when consuming prev output.
-   // Always_ready (declared on the interface): only writes the request queue
-   // (see request-queue comment above).  rl_req_launch starts the actual work
-   // one cycle later (misaligned check, MODULE_RUNNING, RAM access -- see
-   // comment there).
+   // As soon as this method is called, the module starts working on this new request.
    method Action  req (CacheOp op,
 		       Bit #(3) f3,
 `ifdef ISA_A
@@ -2198,25 +2032,32 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 `endif
       end
 
-      // Overflow cannot happen (retire >= arrival, depth 4); guard anyway.
-      if (rg_q_occupancy == fromInteger (req_q_depth)) begin
-	 $display ("%0d: %m.req: ERROR: request queue overflow", cur_cycle);
-	 $finish (1);
-      end
-
-      v_req_q     <= update (v_req_q, rg_q_wr, Cache_Req {op:          op,
-							  f3:          f3,
+      rg_op          <= op;
+      rg_f3          <= f3;
 `ifdef ISA_A
-							  amo_funct7:  amo_funct7,
+      rg_amo_funct7  <= amo_funct7;
 `endif
-							  addr:        addr,
-							  st_value:    st_value,
-							  priv:        priv,
-							  sstatus_SUM: sstatus_SUM,
-							  mstatus_MXR: mstatus_MXR,
-							  satp:        satp});
-      rg_q_wr     <= rg_q_wr + 1;
-      rg_q_enqcnt <= rg_q_enqcnt + 1;
+      rg_addr        <= addr;
+      rg_st_amo_val  <= st_value;
+      rg_req_seq     <= ! rg_req_seq;
+
+      rg_priv        <= priv;
+      rg_sstatus_SUM <= sstatus_SUM;
+      rg_mstatus_MXR <= mstatus_MXR;
+      rg_satp        <= satp;
+
+      // Initial default PA assumes no VM translation
+      rg_pa <= fn_WordXL_to_PA (addr);
+
+      if (! fn_is_aligned (f3, addr)) begin
+	 // We detect misaligned accesses and trap on them
+	 rg_state    <= MODULE_EXCEPTION_RSP;
+	 rg_exc_code <= ((op == CACHE_LD) ? exc_code_LOAD_ADDR_MISALIGNED : exc_code_STORE_AMO_ADDR_MISALIGNED);
+      end
+      else begin
+	 rg_state <= MODULE_RUNNING;
+	 fa_req_ram_B (addr);
+      end
    endmethod
 
    method Bool  valid;

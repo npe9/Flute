@@ -202,14 +202,28 @@ module mkNear_Mem_Imem_Decoup #(MMU_Cache_IFC inner) (Imem_Decoup_IFC);
    Reg #(Bool)     rg_reshow_pend <- mkReg (False);
 
 
-   // CPU-visible presentation: DWires driven by the shim rule from
-   // committed state + the live inner response (the same discipline as
-   // the stock FSM's dw_valid/dw_output_ld_val).  The consuming rules
-   // read wires, not registers, so Bluesim's cross-rule visibility
-   // orders this rule BEFORE them -- the same direction its enqueue
-   // reads require -- instead of inhibiting (deferring) it on every
-   // consume cycle.  In synthesis the wires are plain combinational
-   // logic from registers + inner, identical to the stock adapter.
+   // CPU-visible presentation, STEP 9: registered output stage.  The
+   // dw_* DWire discipline is retired -- rl_shim_step writes rg_out_*
+   // each cycle from committed state + the live inner response, and the
+   // imem interface reads the registers directly.  This cuts the
+   // inner-response -> presentation combinational cone (icache.rg_addr
+   // -> dw_*, ~9.4 ns of the 35.7 ns fetch loop) at the cost of +1
+   // presentation latency.  Nothing in the shim reads rg_out_* same-
+   // tick, so no Bluesim cross-rule-visibility deferral (the step-5
+   // 7a trap does not apply).
+   Reg #(Bool)     rg_out_valid <- mkReg (False);
+   Reg #(Bool)     rg_out_exc   <- mkReg (False);
+   Reg #(Exc_Code) rg_out_code  <- mkRegU;
+   Reg #(WordXL)   rg_out_pc    <- mkRegU;
+   Reg #(Instr)    rg_out_instr <- mkRegU;
+   Reg #(WordXL)   rg_out_tval  <- mkRegU;
+
+   // CPU-visible presentation wires: comb copies of the registered
+   // output stage.  Kept as DWires (not direct register reads in the
+   // interface) because CPU rules call imem value-methods and imem.req
+   // in the same rule -- the wire discipline is what lets BSC schedule
+   // them (the step-5 lesson; the G0004 method-conflict appears if the
+   // interface reads registers directly).
    Reg #(Bool)     dw_valid  <- mkDWire (False);
    Reg #(Bool)     dw_exc    <- mkDWire (False);
    Reg #(Exc_Code) dw_code   <- mkDWire (?);
@@ -318,14 +332,24 @@ module mkNear_Mem_Imem_Decoup #(MMU_Cache_IFC inner) (Imem_Decoup_IFC);
    rule rl_shim_step;
       rg_q_wr_d <= rg_q_wr;
 
-      // Drive the CPU-visible presentation (committed state + live
-      // inner response; pure function of this tick's inputs).
-      dw_valid <= show_now;
-      dw_pc    <= pres_sel ? rg_pres_addr : inner.addr;
-      dw_instr <= pres_sel ? rg_pres_instr : truncate (inner.cword);
-      dw_exc   <= pres_sel ? rg_pres_exc : (inner_sel && inner.exc);
-      dw_code  <= pres_sel ? rg_pres_code : inner.exc_code;
-      dw_tval  <= pres_sel ? rg_pres_addr : inner.addr;
+      // Drive the CPU-visible presentation from the registered output
+      // stage (STEP 9); committed state + live inner response sampled
+      // this tick, visible to the CPU next tick.
+      rg_out_valid <= (! flush) && show_now;
+      rg_out_pc    <= pres_sel ? rg_pres_addr : inner.addr;
+      rg_out_instr <= pres_sel ? rg_pres_instr : truncate (inner.cword);
+      rg_out_exc   <= pres_sel ? rg_pres_exc : (inner_sel && inner.exc);
+      rg_out_code  <= pres_sel ? rg_pres_code : inner.exc_code;
+      rg_out_tval  <= pres_sel ? rg_pres_addr : inner.addr;
+
+      // CPU-visible wires mirror the registered output stage (last
+      // cycle's committed word).
+      dw_valid <= rg_out_valid;
+      dw_exc   <= rg_out_exc;
+      dw_code  <= rg_out_code;
+      dw_pc    <= rg_out_pc;
+      dw_instr <= rg_out_instr;
+      dw_tval  <= rg_out_tval;
 
       if (flush) begin
 `ifdef SHIM_DEBUG
@@ -535,9 +559,10 @@ module mkNear_Mem_Imem_Decoup #(MMU_Cache_IFC inner) (Imem_Decoup_IFC);
          rg_q_wr <= rg_q_wr + 1;
       endmethod
 
-      // CPU side: IMem response (wire-driven presentation: the port
-      // shows exactly the word the wrapper's outstanding ask waits for;
-      // the arrival kill matches stock's req-kills-at-+1).
+      // CPU side: IMem response: the dw wires mirror the STEP-9
+      // registered output stage (rg_out_*), so the port shows exactly
+      // the word the wrapper's outstanding ask waits for, one cycle
+      // after the shim commits it.
       method Bool valid = dw_valid;
       method Bool is_i32_not_i16 = True;
       method WordXL pc    = dw_pc;

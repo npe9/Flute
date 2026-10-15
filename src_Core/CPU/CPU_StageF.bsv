@@ -55,7 +55,8 @@ interface CPU_StageF_IFC;
 		      Bit #(1)         mstatus_MXR,
 		      WordXL           satp);
 
-   (* always_ready *)
+   // RLD-1': no longer always_ready: enqueue into the internal
+   // training FIFO (drained by rl_bp_train_drain in the implementation).
    method Action bp_train (WordXL   pc,
 			   Bool     is_i32_not_i16,
 			   Instr    instr,
@@ -82,6 +83,22 @@ module mkCPU_StageF #(Bit #(4)  verbosity,
    Reg #(Priv_Mode)  rg_priv  <- mkRegU;
 
    Branch_Predictor_IFC branch_predictor <- mkBranch_Predictor;
+
+   // RLD-1': stage branch-predictor training through a small FIFO and
+   // drain it with a local rule.  This decouples the BTB write from
+   // the CPU's rl_pipe comb cone: stock called bp_train directly from
+   // rl_pipe, putting stage1's cf_info computation (ALU + regfile
+   // read for JALR targets) and the rl_pipe move-guard chain into the
+   // same cloud as the BTB RAM write pin (the 33.06 ns binding path
+   // on the RLD-0 netlist).  Enq here ends that cone at a FIFO data
+   // pin; the drain-side cone (FIFO Q -> BTB) is short.
+   FIFOF #(Tuple4 #(WordXL, Bool, Instr, CF_Info)) f_bp_train <- mkFIFOF;
+
+   rule rl_bp_train_drain;
+      match { .pc, .is_i32, .instr, .cf_info } = f_bp_train.first;
+      f_bp_train.deq;
+      branch_predictor.bp_train (pc, is_i32, instr, cf_info);
+   endrule
 
    // ----------------------------------------------------------------
    // BEHAVIOR
@@ -156,8 +173,8 @@ module mkCPU_StageF #(Bit #(4)  verbosity,
    method Action bp_train (WordXL   pc,
 			   Bool     is_i32_not_i16,
 			   Instr    instr,
-			   CF_Info  cf_info);
-      branch_predictor.bp_train (pc, is_i32_not_i16, instr, cf_info);
+			   CF_Info  cf_info) if (f_bp_train.notFull);
+      f_bp_train.enq (tuple4 (pc, is_i32_not_i16, instr, cf_info));
    endmethod
 
    method Action set_full (Bool full);

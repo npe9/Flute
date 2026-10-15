@@ -248,6 +248,32 @@ module mkCPU (CPU_IFC);
    PulseWire pw_perf_redirect <- mkPulseWire;
 
    // ----------------
+   // RLD-1'': registered performance-tap bridges.
+   //
+   // Stock fed SoC_Info's counters directly from pw_perf_retire /
+   // pw_perf_redirect PulseWires.  A PulseWire read carries the
+   // sender's WILL_FIRE cone, and rl_pipe's CAN_FIRE contains stage1's
+   // output function (via the pipe_is_empty / stage1_halted / halting
+   // guards), so the event-to-counter path was a ~30 ns cross-module
+   // cone (stage1 reg -> pw -> SoC_Top -> SoC_Info -> counter D) and
+   // became the binding path once the bp_train cone was cut (RLD-1').
+   //
+   // Retire: minstret increments exactly on the mv_23 event, so a
+   // delayed-copy delta detects retires with a register compare only,
+   // no rl_pipe cone at all.
+   //
+   // Redirect: no architectural proxy; stage through a 1-cycle tick
+   // register inside the CPU so the cone ends at a local FF.
+   Reg  #(Bit #(64)) rg_minstret_d1        <- mkReg (0);
+   Reg  #(Bool)      rg_perf_redirect_tick <- mkReg (False);
+
+   (* no_implicit_conditions, fire_when_enabled *)
+   rule rl_perf_tap_bridge;
+      rg_minstret_d1        <= minstret;
+      rg_perf_redirect_tick <= pw_perf_redirect;
+   endrule
+
+   // ----------------
    // Communication to/from External debug module
 
 `ifdef INCLUDE_GDB_CONTROL
@@ -1904,11 +1930,11 @@ module mkCPU (CPU_IFC);
 
    // Performance-monitoring taps (see interface comment)
    method Bool mv_perf_retire;
-      return pw_perf_retire;
+      return (minstret != rg_minstret_d1);
    endmethod
 
    method Bool mv_perf_redirect;
-      return pw_perf_redirect;
+      return rg_perf_redirect_tick;
    endmethod
 
    method Bool mv_perf_imiss;

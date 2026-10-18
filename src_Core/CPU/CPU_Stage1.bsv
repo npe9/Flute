@@ -173,6 +173,24 @@ module mkCPU_Stage1 #(Bit #(4)         verbosity,
 
    let alu_outputs = fv_ALU (alu_inputs);
 
+   // E2: control classification (PIPE/NONPIPE/trap, which nonpipe op) is a
+   // function of the decoded instruction and CSR state only -- never of the
+   // operand VALUES (the only value-dependent control output is
+   // BRANCH-vs-STRAIGHT, and both are PIPE).  Evaluate the ALU a second
+   // time with the operands tied to zero and take control/exc_code from
+   // that copy: synthesis prunes the regfile/bypass/compare cones out of
+   // `ostatus`, which is read by rl_pipe's guard and hence by every stage
+   // enable.  The real alu_outputs feed only data_to_stage2 (register
+   // D-pins).
+   let ctl_inputs = alu_inputs;
+   ctl_inputs.rs1_val = 0;
+   ctl_inputs.rs2_val = 0;
+   let ctl_outputs = fv_ALU (ctl_inputs);
+   let fall_through_pc = rg_stage_input.pc + (rg_stage_input.is_i32_not_i16 ? 4 : 2);
+   let resolved_next_pc = ((alu_outputs.control == CONTROL_BRANCH)
+			   ? alu_outputs.addr
+			   : fall_through_pc);
+
    let data_to_stage2 = Data_Stage1_to_Stage2 {pc            : rg_stage_input.pc,
 					       instr         : rg_stage_input.instr,
 					       op_stage2     : alu_outputs.op_stage2,
@@ -180,6 +198,15 @@ module mkCPU_Stage1 #(Bit #(4)         verbosity,
 					       addr          : alu_outputs.addr,
 					       val1          : alu_outputs.val1,
 					       val2          : alu_outputs.val2,
+					       redirect      : (resolved_next_pc != rg_stage_input.pred_pc),
+					       next_pc       : resolved_next_pc,
+					       cf_info       : alu_outputs.cf_info,
+`ifdef RVFI
+					       is_i32_not_i16 : rg_stage_input.is_i32_not_i16,
+					       instr_C        : rg_stage_input.instr_C,
+					       rs1_val        : rs1_val_bypassed,
+					       rs2_val        : rs2_val_bypassed,
+`endif
 `ifdef ISA_F
 					       fval1         : alu_outputs.fval1,
 					       fval2         : alu_outputs.fval2,
@@ -218,6 +245,15 @@ module mkCPU_Stage1 #(Bit #(4)         verbosity,
 						     addr:      ?,
 						     val1:      ?,
 						     val2:      ?,
+						     redirect:  False,
+						     next_pc:   ?,
+						     cf_info:   cf_info_none,
+`ifdef RVFI
+						     is_i32_not_i16: ?,
+						     instr_C:   ?,
+						     rs1_val:   ?,
+						     rs2_val:   ?,
+`endif
 `ifdef ISA_F
 						     fval1           : ?,
 						     fval2           : ?,
@@ -261,14 +297,14 @@ module mkCPU_Stage1 #(Bit #(4)         verbosity,
       // ALU outputs: pipe (straight/branch)
       // and non-pipe (CSRR_W, CSRR_S_or_C, FENCE.I, FENCE, SFENCE_VMA, xRET, WFI, TRAP)
       else begin
-	 let ostatus = (  (   (alu_outputs.control == CONTROL_STRAIGHT)
-			   || (alu_outputs.control == CONTROL_BRANCH))
+	 let ostatus = (  (   (ctl_outputs.control == CONTROL_STRAIGHT)
+			   || (ctl_outputs.control == CONTROL_BRANCH))
 			? OSTATUS_PIPE
 			: OSTATUS_NONPIPE);
 
 	 // Compute MTVAL in case of traps
 	 let tval = 0;
-	 if (alu_outputs.exc_code == exc_code_ILLEGAL_INSTRUCTION) begin
+	 if (ctl_outputs.exc_code == exc_code_ILLEGAL_INSTRUCTION) begin
 	    // The instruction
 `ifdef ISA_C
 	    tval = (rg_stage_input.is_i32_not_i16
@@ -278,27 +314,25 @@ module mkCPU_Stage1 #(Bit #(4)         verbosity,
 	    tval = zeroExtend (rg_stage_input.instr);
 `endif
 	 end
-	 else if (alu_outputs.exc_code == exc_code_INSTR_ADDR_MISALIGNED)
-	    tval = alu_outputs.addr;                           // The branch target pc
-	 else if (alu_outputs.exc_code == exc_code_BREAKPOINT)
+	 else if (ctl_outputs.exc_code == exc_code_INSTR_ADDR_MISALIGNED)
+	    tval = ctl_outputs.addr;                           // The branch target pc
+	 else if (ctl_outputs.exc_code == exc_code_BREAKPOINT)
 	    tval = rg_stage_input.pc;                          // The faulting virtual address
 
 	 let trap_info = Trap_Info {epc:      rg_stage_input.pc,
-				    exc_code: alu_outputs.exc_code,
+				    exc_code: ctl_outputs.exc_code,
 				    tval:     tval};
 
-	 let fall_through_pc = rg_stage_input.pc + (rg_stage_input.is_i32_not_i16 ? 4 : 2);
-	 let next_pc = ((alu_outputs.control == CONTROL_BRANCH)
-			? alu_outputs.addr
-			: fall_through_pc);
-	 let redirect = (next_pc != rg_stage_input.pred_pc);
-
+	 // E2: redirect/next_pc/cf_info travel to stage2 as data (see
+	 // data_to_stage2); the stage1 feedback fields are decode-only.
+	 // next_pc here is the fall-through, which is what the nonpipe
+	 // rules (CSRRx/FENCE/WFI/xRET restart) need.
 	 output_stage1.ostatus        = ostatus;
-	 output_stage1.control        = alu_outputs.control;
+	 output_stage1.control        = ctl_outputs.control;
 	 output_stage1.trap_info      = trap_info;
-	 output_stage1.redirect       = redirect;
-	 output_stage1.next_pc        = next_pc;
-	 output_stage1.cf_info        = alu_outputs.cf_info;
+	 output_stage1.redirect       = False;
+	 output_stage1.next_pc        = fall_through_pc;
+	 output_stage1.cf_info        = cf_info_none;
 	 output_stage1.data_to_stage2 = data_to_stage2;
       end
 

@@ -294,7 +294,22 @@ module mkNear_Mem_Imem_Decoup #(MMU_Cache_IFC inner) (Imem_Decoup_IFC);
    // launch would lose the ask -- the reqq-wedge class).  The I3
    // timing contract is re-based to the measured spec-off milestones
    // (documented re-base, see step5/STATUS.md).
-   Bool launch_demand = head_valid && ! covered;
+   // E8: never launch an inner request while the inner cache has a fabric
+   // transaction outstanding (a flush clears rg_inflight_valid, but the
+   // icache's AXI burst is still in flight; launching then abandons it and
+   // the next refill consumes the stale burst -- the E5 cache-test wedge,
+   // see build/timing-exp/50mhz-SURVEY.md "ROOT CAUSE").  Stock StageF had
+   // this gate implicitly (BUSY until imem.valid).
+   // E8c: a head that cannot launch because the inner cache is busy is HELD,
+   // not popped (E8a/E8b popped it -- "every head pops" -- and the ask was
+   // lost: fetch hung after the first wrong-path-miss-then-redirect; cache
+   // test T-then-hang in sim and on the board).  A held head goes stale when
+   // a newer ask arrives behind it (the CPU redirected again): it then pops
+   // without launching, so the queue never holds more than the held head
+   // plus the arrival (the >= 3 assertion below stays valid).
+   Bool stale_head    = arrival && ((rg_q_wr - rg_q_rd) >= 2);
+   Bool launch_demand = head_valid && (! covered) && (! inner.mv_busy) && (! stale_head);
+   Bool hold_head     = head_valid && (! covered) && inner.mv_busy && (! stale_head);
    Bool any_launch    = launch_demand;
 
    // ----------------------------------------------------------------
@@ -524,7 +539,7 @@ module mkNear_Mem_Imem_Decoup #(MMU_Cache_IFC inner) (Imem_Decoup_IFC);
             rg_last_addr       <= head.addr;
          end
          else begin
-            if (head_valid) begin
+            if (head_valid && (! hold_head)) begin    // E8c: hold while busy
                rg_q_rd       <= rg_q_rd + 1;
                rg_last_valid <= True;
                rg_last_addr  <= head.addr;
@@ -746,6 +761,8 @@ module mkNear_Mem (Near_Mem_IFC);
 `endif
       method Bool       exc        = dcache.exc;
       method Exc_Code   exc_code   = dcache.exc_code;
+      method Action     ma_kill_echo = dcache.ma_kill_echo;
+      method Bool mv_busy = dcache.mv_busy;    // E8
    endinterface
 
    // Fabric side

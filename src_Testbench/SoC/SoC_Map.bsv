@@ -307,10 +307,16 @@ module mkSoC_Map (SoC_Map_IFC);
    // (Caches need this information to cache these addresses.)
 
    function Bool fn_is_mem_addr (Fabric_Addr addr);
+`ifdef RVFI
+      // riscv-formal build: every address is cacheable memory (the formal AXI
+      // slave answers everything), so symbolic addresses never fault.
+      return True;
+`else
       return (   fn_is_boot_rom_addr (addr)
 	      || fn_is_mem0_controller_addr (addr)
 	      || fn_is_tcm_addr (addr)
 	      );
+`endif
    endfunction
 
    // ----------------------------------------------------------------
@@ -319,6 +325,9 @@ module mkSoC_Map (SoC_Map_IFC);
    // (Caches need this information to avoid cacheing these addresses.)
 
    function Bool fn_is_IO_addr (Fabric_Addr addr);
+`ifdef RVFI
+      return False;
+`else
       return (   fn_is_near_mem_io_addr (addr)
 	      || fn_is_plic_addr (addr)
 	      || fn_is_uart0_addr  (addr)
@@ -326,6 +335,7 @@ module mkSoC_Map (SoC_Map_IFC);
 	      || fn_is_accel0_addr  (addr)
 `endif
 	      );
+`endif
    endfunction
 
    // ----------------------------------------------------------------

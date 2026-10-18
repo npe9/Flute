@@ -26,6 +26,7 @@ import GetPut       :: *;
 import ClientServer :: *;
 import Connectable  :: *;
 import ConfigReg    :: *;
+import DReg         :: *;
 
 // ----------------
 // BSV additional libs
@@ -196,6 +197,94 @@ module mkCPU (CPU_IFC);
    Reg #(WordXL) rg_csr_pc   <- mkRegU;
    Reg #(WordXL) rg_csr_val1 <- mkRegU;
 
+`ifdef RVFI
+   // ================================================================
+   // RVFI (riscv-formal) retirement record.  One channel; written at every
+   // retirement site (the same sites that emit Trace_Data for tandem
+   // verification).  rg_rvfi_valid is a DReg: a one-cycle pulse per retired
+   // instruction.  Production builds (RVFI undefined) are unaffected.
+   Reg #(Bool)      rg_rvfi_valid     <- mkDReg (False);
+   Reg #(Bit #(64)) rg_rvfi_order     <- mkReg (0);
+   Reg #(Bit #(32)) rg_rvfi_insn      <- mkRegU;
+   Reg #(Bool)      rg_rvfi_trap      <- mkRegU;
+   Reg #(Bool)      rg_rvfi_intr      <- mkRegU;
+   Reg #(Bit #(2))  rg_rvfi_mode      <- mkRegU;
+   Reg #(Bit #(5))  rg_rvfi_rs1_addr  <- mkRegU;
+   Reg #(Bit #(5))  rg_rvfi_rs2_addr  <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_rs1_rdata <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_rs2_rdata <- mkRegU;
+   Reg #(Bit #(5))  rg_rvfi_rd_addr   <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_rd_wdata  <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_pc_rdata  <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_pc_wdata  <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_mem_addr  <- mkRegU;
+   Reg #(Bit #(4))  rg_rvfi_mem_rmask <- mkRegU;
+   Reg #(Bit #(4))  rg_rvfi_mem_wmask <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_mem_rdata <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_mem_wdata <- mkRegU;
+   // the next retirement is the first instruction of a trap/interrupt handler
+   Reg #(Bool)      rg_rvfi_intr_pending <- mkReg (False);
+   // size / compressed word of the instruction parked in rg_trap_instr
+   Reg #(Bool)      rg_rvfi_trap_is_i32  <- mkRegU;
+   Reg #(WordXL) rg_rvfi_trap_rs1_val <- mkRegU;   // rs values of a trapping op (riscv-formal judges misaligned-address traps from rs1)
+   Reg #(WordXL) rg_rvfi_trap_rs2_val <- mkRegU;
+   Reg #(Instr_C)   rg_rvfi_trap_instr_C <- mkRegU;
+
+   // Which source registers an (expanded) instruction actually reads, so the
+   // riscv-formal reg check does not compare immediate bits as rs fields.
+   function Tuple2 #(Bit #(5), Bit #(5)) fn_rvfi_rs_addrs (Instr instr);
+      let op = instr_opcode (instr);
+      Bool uses_rs1 = (   (op == op_JALR) || (op == op_LOAD)  || (op == op_OP_IMM)
+		       || (op == op_BRANCH) || (op == op_STORE) || (op == op_OP)
+		       || (op == op_AMO)
+		       || ((op == op_SYSTEM) && (instr_funct3 (instr) != 0) && (instr [14] == 1'b0)));
+      Bool uses_rs2 = ((op == op_BRANCH) || (op == op_STORE) || (op == op_OP) || (op == op_AMO));
+      return tuple2 ((uses_rs1 ? instr_rs1 (instr) : 0), (uses_rs2 ? instr_rs2 (instr) : 0));
+   endfunction
+
+   function Action fa_rvfi (Bool trap, Bool set_intr_pending,
+			    Bool is_i32, Instr instr, Instr_C instr_C,
+			    Bit #(5) rs1, Bit #(5) rs2, WordXL rs1_val, WordXL rs2_val,
+			    Bit #(5) rd, WordXL rd_val,
+			    WordXL pc, WordXL next_pc,
+			    WordXL mem_addr, Bit #(4) rmask, Bit #(4) wmask, WordXL mem_rdata, WordXL mem_wdata);
+      action
+	 rg_rvfi_valid     <= True;
+	 rg_rvfi_order     <= rg_rvfi_order + 1;
+	 rg_rvfi_insn      <= (is_i32 ? instr : zeroExtend (instr_C));
+	 rg_rvfi_trap      <= trap;
+	 rg_rvfi_intr      <= rg_rvfi_intr_pending;
+	 rg_rvfi_intr_pending <= set_intr_pending;
+	 rg_rvfi_mode      <= rg_cur_priv;
+	 rg_rvfi_rs1_addr  <= rs1;
+	 rg_rvfi_rs2_addr  <= rs2;
+	 rg_rvfi_rs1_rdata <= ((rs1 == 0) ? 0 : rs1_val);
+	 rg_rvfi_rs2_rdata <= ((rs2 == 0) ? 0 : rs2_val);
+	 rg_rvfi_rd_addr   <= rd;
+	 rg_rvfi_rd_wdata  <= ((rd == 0) ? 0 : rd_val);
+	 rg_rvfi_pc_rdata  <= pc;
+	 rg_rvfi_pc_wdata  <= next_pc;
+	 rg_rvfi_mem_addr  <= mem_addr;
+	 rg_rvfi_mem_rmask <= rmask;
+	 rg_rvfi_mem_wmask <= wmask;
+	 rg_rvfi_mem_rdata <= mem_rdata;
+	 rg_rvfi_mem_wdata <= mem_wdata;
+      endaction
+   endfunction
+
+   // pipe-op retirement (the 2->3 move in rl_pipe)
+   function Action fa_rvfi_pipe (Data_Stage2_to_Stage3 d3);
+      action
+	 match { .rs1, .rs2 } = fn_rvfi_rs_addrs (d3.instr);
+	 fa_rvfi (False, False, d3.rvfi_is_i32, d3.instr, d3.rvfi_instr_C,
+		  rs1, rs2, d3.rvfi_rs1_val, d3.rvfi_rs2_val,
+		  (d3.rd_valid ? d3.rd : 0), d3.rd_val,
+		  d3.pc, d3.rvfi_next_pc,
+		  d3.rvfi_mem_addr, d3.rvfi_mem_rmask, d3.rvfi_mem_wmask, d3.rvfi_mem_rdata, d3.rvfi_mem_wdata);
+      endaction
+   endfunction
+`endif
+
    // Save sstatus_SUM and mstatus_MXR to initiate fetches on an external
    // interrupt
    Reg #(Bit #(1)) rg_sstatus_SUM <- mkRegU;
@@ -233,8 +322,30 @@ module mkCPU (CPU_IFC);
    // ----------------
    // Interrupt pending based on current priv, mstatus.ie, mie and mip registers
 
-   Bool interrupt_pending = (   isValid (csr_regfile.interrupt_pending (rg_cur_priv))
-			     || csr_regfile.nmi_pending);
+   // E1 (2026-10-16): registered interrupt-pending bridge.
+   // csr_regfile.interrupt_pending is a priority encoder over
+   // mip/mie/mstatus/misa; read combinationally it sits inside `halting`,
+   // i.e. inside rl_pipe's CAN_FIRE and therefore on every stage-register
+   // enable.  Register it (and the cause) once per cycle; rl_stage1_interrupt
+   // uses the registered cause so a source that clears in the one-cycle
+   // window cannot yield exc_code 0.  Cost: +1 cycle interrupt latency.
+   // Priv changes (trap / xRET / CSRRx restart) pass through >= 1
+   // non-RUNNING cycle before rl_stage1_interrupt can fire again, so a
+   // value computed with the old priv is never consumed.
+   Reg #(Maybe #(Exc_Code)) rg_int_pending <- mkConfigReg (tagged Invalid);   // ConfigReg: readers (incl. rl_stage1_xRET via halting) must not be ordered against the bridge
+   Reg #(Bool)              rg_nmi_pending <- mkConfigReg (False);
+   // E3: same bridge for the WFI wake condition ((mip & mie) != 0), which
+   // otherwise sits comb in rl_WFI_resume's guard -> rg_state chain.
+   Reg #(Bool)              rg_wfi_resume  <- mkConfigReg (False);
+
+   (* no_implicit_conditions, fire_when_enabled *)
+   rule rl_int_pending_bridge;
+      rg_int_pending <= csr_regfile.interrupt_pending (rg_cur_priv);
+      rg_nmi_pending <= csr_regfile.nmi_pending;
+      rg_wfi_resume  <= csr_regfile.wfi_resume;
+   endrule
+
+   Bool interrupt_pending = (isValid (rg_int_pending) || rg_nmi_pending);
 
    // ----------------
    // Reset requests and responses
@@ -691,6 +802,11 @@ module mkCPU (CPU_IFC);
       Bool stageD_full = (stageD.out.ostatus != OSTATUS_EMPTY);
       Bool stageF_full = (stageF.out.ostatus != OSTATUS_EMPTY);
       Bool redirect    = False;
+      // E5: BTB training is decoupled from the fetch-feed block.  cf_train is
+      // the resolved cf_info of the op leaving stage2 THIS cycle (one shot);
+      // train_ras marks that the feed block ran (RAS uses the fetched instr).
+      CF_Info cf_train  = cf_info_none;
+      Bool    train_ras = False;
 
       // ----------------
       // Stage3 sink (does regfile writebacks)
@@ -717,6 +833,33 @@ module mkCPU (CPU_IFC);
 	 // CSRRx is done off-pipe
 	 csr_regfile.csr_minstret_incr;
 	 pw_perf_retire.send;
+`ifdef RVFI
+	 fa_rvfi_pipe (stage2.out.data_to_stage3);
+`endif
+
+	 // E2: branch resolution is applied here, when the op leaves
+	 // stage2, from REGISTERED fields (was: from stage1's combinational
+	 // output at the 1->2 move).  +1 cycle mispredict penalty; the
+	 // wrong-path instruction in stage1 is held out of stage2 below and
+	 // discarded by the epoch bump in rl_trap_fetch.
+	 if (stage2.out.redirect) begin
+	    rg_next_pc <= stage2.out.next_pc;
+	    redirect    = True;
+	    pw_perf_redirect.send;
+	    // Drop the wrong-path instruction in stage1 now (it would be
+	    // discarded by the epoch bump anyway).  Holding it instead keeps
+	    // the D/F chain full, which skips the feed block in exactly this
+	    // cycle and starves bp_train of the mispredicted branch's cf_info
+	    // (predictor never learns first-seen taken branches).
+	    stage1_full = False;
+	 end
+	 // E5: train the BTB from the op leaving stage2, whether or not the
+	 // feed block runs this cycle.  (E4 consumed stage2.out.cf_info only
+	 // inside the feed block; with a 2-cycle fetch the feed block runs
+	 // every other cycle, so a fixed loop's branch was dropped every
+	 // iteration and the BTB never learned it: 2.0M redirects vs 395 on
+	 // rld4 in the J1 run, loader repair window 40 vs 26 cycles/iter.)
+	 cf_train = stage2.out.cf_info;
 	 fa_emit_instr_trace (minstret, stage2.out.data_to_stage3.pc, stage2.out.data_to_stage3.instr, rg_cur_priv);
       end
 
@@ -735,15 +878,11 @@ module mkCPU (CPU_IFC);
 	       if (cur_verbosity > 1)
 		  $display ("    rl_pipe: Discarding stage1 due to redirection");
 	    end
-	    else if ((! stage1.out.redirect) || (stageF.out.ostatus != OSTATUS_BUSY)) begin
+	    // E2: never let the instruction behind a redirecting op enter
+	    // stage2 (it is wrong-path by definition; stage2 has side effects).
+	    else if (! stage2.out.redirect) begin
 	       stage2.enq (stage1.out.data_to_stage2);  stage2_full = True;
 	       stage1.deq;                              stage1_full = False;
-
-	       if (stage1.out.redirect) begin
-		  rg_next_pc <= stage1.out.next_pc;
-		  redirect    = True;
-		  pw_perf_redirect.send;
-	       end
 	    end
 	 end
 	  
@@ -770,14 +909,7 @@ module mkCPU (CPU_IFC);
       if (   (! stageF_full)
 	  && (stageF.out.ostatus == OSTATUS_PIPE))
 	 begin
-	    CF_Info cf_info = cf_info_none;
-	    if (   (stage1.out.ostatus == OSTATUS_PIPE)
-		&& (stage1.out.control != CONTROL_DISCARD))
-	       cf_info = stage1.out.cf_info;
-
-	    if (redirect)
-	       rg_state <= CPU_START_TRAP_HANDLER;
-	    else begin
+	    if (! redirect) begin
 	       stageF.enq (stageF.out.data_to_stageD.epoch,
 			   stageF.out.data_to_stageD.pred_pc,
 			   rg_cur_priv,
@@ -787,12 +919,23 @@ module mkCPU (CPU_IFC);
 	       stageF_full = True;
 	    end
 
-	    // Train branch predictor
-	    stageF.bp_train (stageF.out.data_to_stageD.pc,
-			     stageF.out.data_to_stageD.is_i32_not_i16,
-			     stageF.out.data_to_stageD.instr,
-			     cf_info);
+	    train_ras = True;
 	 end
+
+      // E5: single bp_train call site.  RAS part (pc/is_i32/instr) comes
+      // from the instruction leaving stageF when the feed block ran, else a
+      // no-op (instr 0 is neither JAL nor JALR); BTB part is cf_train.
+      if (train_ras || (cf_train.cf_op != CF_None))
+	 stageF.bp_train ((train_ras ? stageF.out.data_to_stageD.pc : 0),
+			  (train_ras ? stageF.out.data_to_stageD.is_i32_not_i16 : True),
+			  (train_ras ? stageF.out.data_to_stageD.instr : 0),
+			  cf_train);
+
+      // E2: the redirect state change must not depend on the feed block
+      // running this cycle (the held-back stage1 instruction can keep the
+      // D/F chain full).
+      if (redirect)
+	 rg_state <= CPU_START_TRAP_HANDLER;
 
       stage3.set_full (stage3_full);
       stage2.set_full (stage2_full);
@@ -814,6 +957,12 @@ module mkCPU (CPU_IFC);
       rg_trap_info       <= stage2.out.trap_info;
       rg_trap_interrupt  <= False;
       rg_trap_instr      <= stage2.out.data_to_stage3.instr;
+`ifdef RVFI
+      rg_rvfi_trap_is_i32  <= stage2.out.data_to_stage3.rvfi_is_i32;
+      rg_rvfi_trap_rs1_val <= stage2.out.data_to_stage3.rvfi_rs1_val;
+      rg_rvfi_trap_rs2_val <= stage2.out.data_to_stage3.rvfi_rs2_val;
+      rg_rvfi_trap_instr_C <= stage2.out.data_to_stage3.rvfi_instr_C;
+`endif
 `ifdef INCLUDE_TANDEM_VERIF
       rg_trap_trace_data <= stage2.out.data_to_stage3.trace_data;
 `endif
@@ -845,6 +994,12 @@ module mkCPU (CPU_IFC);
       rg_trap_info       <= stage1.out.trap_info;
       rg_trap_interrupt  <= False;
       rg_trap_instr      <= stage1.out.data_to_stage2.instr;
+`ifdef RVFI
+      rg_rvfi_trap_is_i32  <= stage1.out.data_to_stage2.is_i32_not_i16;
+      rg_rvfi_trap_rs1_val <= stage1.out.data_to_stage2.rs1_val;
+      rg_rvfi_trap_rs2_val <= stage1.out.data_to_stage2.rs2_val;
+      rg_rvfi_trap_instr_C <= stage1.out.data_to_stage2.instr_C;
+`endif
 `ifdef INCLUDE_TANDEM_VERIF
       rg_trap_trace_data <= stage1.out.data_to_stage2.trace_data;
 `endif
@@ -889,6 +1044,16 @@ module mkCPU (CPU_IFC);
       stageD.set_full (False);
       stage1.set_full (False);    fa_step_check;
       stage2.set_full (False);
+`ifdef RVFI
+      if (is_interrupt)
+	 rg_rvfi_intr_pending <= True;
+      else
+	 begin
+	    match { .t_rs1, .t_rs2 } = fn_rvfi_rs_addrs (instr);
+	    fa_rvfi (True, True, rg_rvfi_trap_is_i32, instr, rg_rvfi_trap_instr_C,
+		     t_rs1, t_rs2, rg_rvfi_trap_rs1_val, rg_rvfi_trap_rs2_val, 0, 0, epc, next_pc, 0, 0, 0, 0, 0);
+	 end
+`endif
 
       // Accounting    TODO: should traps be counted as retired insrs?
       // csr_regfile.csr_minstret_incr;
@@ -962,6 +1127,12 @@ module mkCPU (CPU_IFC);
                                       tval:     stage1.out.trap_info.tval};
       rg_trap_interrupt <= False;
       rg_trap_instr     <= stage1.out.data_to_stage2.instr;    // Also used in successful CSSRW
+`ifdef RVFI
+      rg_rvfi_trap_is_i32  <= stage1.out.data_to_stage2.is_i32_not_i16;
+      rg_rvfi_trap_rs1_val <= stage1.out.data_to_stage2.rs1_val;
+      rg_rvfi_trap_rs2_val <= stage1.out.data_to_stage2.rs2_val;
+      rg_rvfi_trap_instr_C <= stage1.out.data_to_stage2.instr_C;
+`endif
 `ifdef INCLUDE_TANDEM_VERIF
       rg_trap_trace_data <= stage1.out.data_to_stage2.trace_data;
 `endif
@@ -1021,6 +1192,13 @@ module mkCPU (CPU_IFC);
 
 	 // Restart the pipe
 	 rg_state   <= CPU_CSRRX_RESTART;
+`ifdef RVFI
+	 Bool rvfi_rs1_used = (funct3 [2] == 1'b0);    // register (not immediate) forms
+	 fa_rvfi (False, False, rg_rvfi_trap_is_i32, instr, rg_rvfi_trap_instr_C,
+		  (rvfi_rs1_used ? rs1 : 0), 0, (rvfi_rs1_used ? rg_csr_val1 : 0), 0,
+		  rd, new_rd_val,
+		  rg_csr_pc, rg_csr_pc + (rg_rvfi_trap_is_i32 ? 4 : 2), 0, 0, 0, 0, 0);
+`endif
 
 `ifdef INCLUDE_TANDEM_VERIF
 	 // Trace data
@@ -1076,6 +1254,12 @@ module mkCPU (CPU_IFC);
                                       tval:     stage1.out.trap_info.tval};
       rg_trap_interrupt <= False;
       rg_trap_instr     <= stage1.out.data_to_stage2.instr;    // TODO: this is also used for successful CSRRW
+`ifdef RVFI
+      rg_rvfi_trap_is_i32  <= stage1.out.data_to_stage2.is_i32_not_i16;
+      rg_rvfi_trap_rs1_val <= stage1.out.data_to_stage2.rs1_val;
+      rg_rvfi_trap_rs2_val <= stage1.out.data_to_stage2.rs2_val;
+      rg_rvfi_trap_instr_C <= stage1.out.data_to_stage2.instr_C;
+`endif
 `ifdef INCLUDE_TANDEM_VERIF
       rg_trap_trace_data <= stage1.out.data_to_stage2.trace_data;    // TODO: this is also used for successful CSRRW
 `endif
@@ -1141,6 +1325,13 @@ module mkCPU (CPU_IFC);
 
 	 // Restart the pipe
 	 rg_state   <= CPU_CSRRX_RESTART;
+`ifdef RVFI
+	 Bool rvfi_rs1_used = (funct3 [2] == 1'b0);    // register (not immediate) forms
+	 fa_rvfi (False, False, rg_rvfi_trap_is_i32, instr, rg_rvfi_trap_instr_C,
+		  (rvfi_rs1_used ? rs1 : 0), 0, (rvfi_rs1_used ? rg_csr_val1 : 0), 0,
+		  rd, new_rd_val,
+		  rg_csr_pc, rg_csr_pc + (rg_rvfi_trap_is_i32 ? 4 : 2), 0, 0, 0, 0, 0);
+`endif
 
 `ifdef INCLUDE_TANDEM_VERIF
 	 // Trace data
@@ -1214,6 +1405,11 @@ module mkCPU (CPU_IFC);
 
       // Accounting
       csr_regfile.csr_minstret_incr;
+`ifdef RVFI
+      let rvfi_d2 = stage1.out.data_to_stage2;
+      fa_rvfi (False, False, rvfi_d2.is_i32_not_i16, rvfi_d2.instr, rvfi_d2.instr_C, 0, 0, 0, 0, 0, 0,
+	       rvfi_d2.pc, next_pc, 0, 0, 0, 0, 0);
+`endif
 
 `ifdef INCLUDE_TANDEM_VERIF
       // Trace data
@@ -1254,6 +1450,11 @@ module mkCPU (CPU_IFC);
 
       // Await mem system FENCE.I completion
       let dummy <- near_mem.server_fence_i.response.get;
+`ifdef RVFI
+      let rvfi_d2 = stage1.out.data_to_stage2;
+      fa_rvfi (False, False, rvfi_d2.is_i32_not_i16, rvfi_d2.instr, rvfi_d2.instr_C, 0, 0, 0, 0, 0, 0,
+	       rvfi_d2.pc, rg_next_pc, 0, 0, 0, 0, 0);
+`endif
 
       // Accounting
       csr_regfile.csr_minstret_incr;
@@ -1297,6 +1498,11 @@ module mkCPU (CPU_IFC);
 
       // Await mem system FENCE completion
       let dummy <- near_mem.server_fence.response.get;
+`ifdef RVFI
+      let rvfi_d2 = stage1.out.data_to_stage2;
+      fa_rvfi (False, False, rvfi_d2.is_i32_not_i16, rvfi_d2.instr, rvfi_d2.instr_C, 0, 0, 0, 0, 0, 0,
+	       rvfi_d2.pc, rg_next_pc, 0, 0, 0, 0, 0);
+`endif
 
       // Accounting
       csr_regfile.csr_minstret_incr;
@@ -1350,6 +1556,11 @@ module mkCPU (CPU_IFC);
 
       // Await SFENCE.VMA completion
       let dummy <- near_mem.sfence_vma_server.response.get;
+`ifdef RVFI
+      let rvfi_d2 = stage1.out.data_to_stage2;
+      fa_rvfi (False, False, rvfi_d2.is_i32_not_i16, rvfi_d2.instr, rvfi_d2.instr_C, 0, 0, 0, 0, 0, 0,
+	       rvfi_d2.pc, rg_next_pc, 0, 0, 0, 0, 0);
+`endif
 
       // Accounting
       csr_regfile.csr_minstret_incr;
@@ -1386,6 +1597,11 @@ module mkCPU (CPU_IFC);
       rg_next_pc     <= stage1.out.next_pc;
       rg_state       <= CPU_WFI_PAUSED;
       rg_wfi_counter <= 1;
+`ifdef RVFI
+      let rvfi_d2 = stage1.out.data_to_stage2;
+      fa_rvfi (False, False, rvfi_d2.is_i32_not_i16, rvfi_d2.instr, rvfi_d2.instr_C, 0, 0, 0, 0, 0, 0,
+	       rvfi_d2.pc, stage1.out.next_pc, 0, 0, 0, 0, 0);
+`endif
 
       stageD.set_full (False);
       stage1.set_full (False);    fa_step_check;
@@ -1426,7 +1642,7 @@ module mkCPU (CPU_IFC);
 
    (* descending_urgency = "rl_WFI_resume, rl_WFI_count" *)
    rule rl_WFI_resume (   (rg_state == CPU_WFI_PAUSED)
-		       && (   csr_regfile.wfi_resume
+		       && (   rg_wfi_resume
 			   || stop_step_req)
 		       && (stageF.out.ostatus != OSTATUS_BUSY));
       if (cur_verbosity > 1)
@@ -1534,8 +1750,8 @@ module mkCPU (CPU_IFC);
 
       // Just save relevant info and handle in next clock
       Exc_Code exc_code = 0;    // "Unknown cause" for NMI
-      if (csr_regfile.interrupt_pending (rg_cur_priv) matches tagged Valid .ec
-	  &&& (! csr_regfile.nmi_pending))
+      if (rg_int_pending matches tagged Valid .ec
+	  &&& (! rg_nmi_pending))
 	 exc_code = ec;
 
       rg_trap_info       <= Trap_Info {epc:      stage1.out.data_to_stage2.pc,
@@ -1543,6 +1759,12 @@ module mkCPU (CPU_IFC);
 				       tval:     0};
       rg_trap_interrupt  <= True;
       rg_trap_instr      <= stage1.out.data_to_stage2.instr;
+`ifdef RVFI
+      rg_rvfi_trap_is_i32  <= stage1.out.data_to_stage2.is_i32_not_i16;
+      rg_rvfi_trap_rs1_val <= stage1.out.data_to_stage2.rs1_val;
+      rg_rvfi_trap_rs2_val <= stage1.out.data_to_stage2.rs2_val;
+      rg_rvfi_trap_instr_C <= stage1.out.data_to_stage2.instr_C;
+`endif
 
 `ifdef INCLUDE_TANDEM_VERIF
       // rg_trap_trace_data <= ?;    // Will be filled in in rl_trap
@@ -1929,6 +2151,29 @@ module mkCPU (CPU_IFC);
    endmethod
 
    // Performance-monitoring taps (see interface comment)
+`ifdef RVFI
+   method Bool        mv_rvfi_valid     = rg_rvfi_valid;
+   method Bit #(64)   mv_rvfi_order     = rg_rvfi_order;
+   method Bit #(32)   mv_rvfi_insn      = rg_rvfi_insn;
+   method Bool        mv_rvfi_trap      = rg_rvfi_trap;
+   method Bool        mv_rvfi_halt      = False;
+   method Bool        mv_rvfi_intr      = rg_rvfi_intr;
+   method Bit #(2)    mv_rvfi_mode      = rg_rvfi_mode;
+   method Bit #(2)    mv_rvfi_ixl       = 1;
+   method Bit #(5)    mv_rvfi_rs1_addr  = rg_rvfi_rs1_addr;
+   method Bit #(5)    mv_rvfi_rs2_addr  = rg_rvfi_rs2_addr;
+   method WordXL      mv_rvfi_rs1_rdata = rg_rvfi_rs1_rdata;
+   method WordXL      mv_rvfi_rs2_rdata = rg_rvfi_rs2_rdata;
+   method Bit #(5)    mv_rvfi_rd_addr   = rg_rvfi_rd_addr;
+   method WordXL      mv_rvfi_rd_wdata  = rg_rvfi_rd_wdata;
+   method WordXL      mv_rvfi_pc_rdata  = rg_rvfi_pc_rdata;
+   method WordXL      mv_rvfi_pc_wdata  = rg_rvfi_pc_wdata;
+   method WordXL      mv_rvfi_mem_addr  = rg_rvfi_mem_addr;
+   method Bit #(4)    mv_rvfi_mem_rmask = rg_rvfi_mem_rmask;
+   method Bit #(4)    mv_rvfi_mem_wmask = rg_rvfi_mem_wmask;
+   method WordXL      mv_rvfi_mem_rdata = rg_rvfi_mem_rdata;
+   method WordXL      mv_rvfi_mem_wdata = rg_rvfi_mem_wdata;
+`endif
    method Bool mv_perf_retire;
       return (minstret != rg_minstret_d1);
    endmethod

@@ -155,6 +155,30 @@ interface CPU_IFC;
 
    // An instruction retired (Stage2 -> Stage3)
    (* always_ready *)
+`ifdef RVFI
+   // riscv-formal RVFI (one retirement channel); see formal/README.md
+   method Bool        mv_rvfi_valid;
+   method Bit #(64)   mv_rvfi_order;
+   method Bit #(32)   mv_rvfi_insn;
+   method Bool        mv_rvfi_trap;
+   method Bool        mv_rvfi_halt;
+   method Bool        mv_rvfi_intr;
+   method Bit #(2)    mv_rvfi_mode;
+   method Bit #(2)    mv_rvfi_ixl;
+   method Bit #(5)    mv_rvfi_rs1_addr;
+   method Bit #(5)    mv_rvfi_rs2_addr;
+   method WordXL      mv_rvfi_rs1_rdata;
+   method WordXL      mv_rvfi_rs2_rdata;
+   method Bit #(5)    mv_rvfi_rd_addr;
+   method WordXL      mv_rvfi_rd_wdata;
+   method WordXL      mv_rvfi_pc_rdata;
+   method WordXL      mv_rvfi_pc_wdata;
+   method WordXL      mv_rvfi_mem_addr;
+   method Bit #(4)    mv_rvfi_mem_rmask;
+   method Bit #(4)    mv_rvfi_mem_wmask;
+   method WordXL      mv_rvfi_mem_rdata;
+   method WordXL      mv_rvfi_mem_wdata;
+`endif
    method Bool mv_perf_retire;
 
    // A branch redirect was taken (pipeline flush + refetch)

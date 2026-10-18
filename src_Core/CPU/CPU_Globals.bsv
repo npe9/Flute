@@ -430,6 +430,18 @@ typedef struct {
 
    WordXL     val2;              // OP_Stage2_ST: store-val;
                                  // OP_Stage2_M and OP_Stage2_FD: arg2
+   // E2 (2026-10-16): branch resolution carried as registered data into
+   // stage2; the redirect is applied when the op leaves stage2 (rl_pipe
+   // 2->3 move) instead of from stage1's combinational output.
+   Bool       redirect;          // next_pc != pred_pc
+   WordXL     next_pc;           // resolved next pc (branch target or fall-through)
+   CF_Info    cf_info;           // for branch-predictor training
+`ifdef RVFI
+   Bool       is_i32_not_i16;    // RVFI: instruction size (the compressed word is instr_C)
+   Instr_C    instr_C;
+   WordXL     rs1_val;           // RVFI: operand values after bypass
+   WordXL     rs2_val;
+`endif
 
 `ifdef ISA_F
    // Floating point fields
@@ -476,6 +488,11 @@ typedef struct {
    FBypass                fbypass;
 `endif
 
+   // feedback (E2): resolved branch of the op in stage2
+   Bool                   redirect;
+   WordXL                 next_pc;
+   CF_Info                cf_info;
+
    // feedforward data
    Data_Stage2_to_Stage3  data_to_stage3;
    } Output_Stage2
@@ -509,6 +526,18 @@ typedef struct {
    Bool      rd_valid;
    RegName   rd;
    WordXL    rd_val;
+`ifdef RVFI
+   Bool      rvfi_is_i32;
+   Instr_C   rvfi_instr_C;
+   WordXL    rvfi_rs1_val;
+   WordXL    rvfi_rs2_val;
+   WordXL    rvfi_next_pc;
+   WordXL    rvfi_mem_addr;     // aligned-mem convention (RISCV_FORMAL_ALIGNED_MEM)
+   Bit #(4)  rvfi_mem_rmask;
+   Bit #(4)  rvfi_mem_wmask;
+   WordXL    rvfi_mem_rdata;
+   WordXL    rvfi_mem_wdata;
+`endif
 
 `ifdef ISA_F
    Bool      upd_flags;

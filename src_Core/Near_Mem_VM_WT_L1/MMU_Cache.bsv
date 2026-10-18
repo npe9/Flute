@@ -109,6 +109,28 @@ interface MMU_Cache_IFC;
    (* always_ready *)  method Bool       exc;
    (* always_ready *)  method Exc_Code   exc_code;
 
+   // CPU interface: response-echo kill (RLD-4).  The CPU (CPU_Stage2.fa_enq)
+   // sets this on every Stage2 enqueue; the next dmem req (this module's
+   // 'req' method) clears it.  While set -- i.e. for exactly the one cycle
+   // between an op entering Stage2 and its deferred request launch -- the
+   // response drivers (rl_probe_and_immed_rsp and the three lingering-valid
+   // states) are silenced and the linger states exit to MODULE_READY.
+   //
+   // Why: stock near-mem safety rests on the next dmem req arriving at
+   // Stage2-enqueue time, clobbering any stale response echo (probe
+   // re-drive or linger state) no later than the cycle the next op becomes
+   // visible in Stage2.  The RLD-4 deferred launch makes the clobber one
+   // cycle late; without this kill, a newly fed op would sample the
+   // previous op's response.  Register-write + register-read only: no
+   // same-cycle observation channel, so no Enable->ReturnValue cycle
+   // (G0033 class) can form.
+   //
+   // Safe on every enqueue (incl. non-dmem ops): a live response's
+   // consumer is by construction the op in Stage2, and Stage2 is empty
+   // at enqueue; any echo still present is stale.
+   (* always_ready *)
+   method Action  ma_kill_echo;
+
    // Cache flush request/response
    interface Server #(Token, Token) server_flush;
 
@@ -139,6 +161,13 @@ interface MMU_Cache_IFC;
    // Performance-monitoring tap: pulses for one cycle when a cache-line
    // refill starts (i.e., a cache miss commits to refilling).
    (* always_ready *)
+   // E8 (2026-10-17): True while a fabric transaction may be outstanding
+   // (refill, IO, PTW, ST/AMO response, reset).  'req' has no flow control
+   // (see its NOTE): a caller that issues req during a refill abandons the
+   // AXI read burst in flight, and the NEXT refill then consumes that burst
+   // as its own data (the E5 cache-test wedge).  Callers must gate on this.
+   method Bool       mv_busy;
+
    method Bool mv_perf_miss;
 
 endinterface
@@ -535,6 +564,33 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    Reg #(Bit #(64)) rg_ld_val            <- mkRegU;         // Load-value for LOAD/LR/AMO, success/fail for SC
    Reg #(Bit #(64)) dw_output_ld_val     <- mkDWire (?);
    Reg #(Bit #(64)) dw_output_st_amo_val <- mkDWire (?);    // stored value for ST, SC, AMO (for verification only)
+
+   // RLD-4: response-echo kill (see interface comment).  Set by the CPU on
+   // every Stage2 enqueue (ma_kill_echo); cleared by the next req.  One
+   // cycle of kill covers exactly the window between an op entering
+   // Stage2 and its deferred request launch.
+   Reg #(Bool)      rg_kill_echo         <- mkReg (False);
+
+   // E8: one-cycle-stale mirror of "a fabric transaction may be outstanding",
+   // read by mv_busy.  A ConfigReg so that external rules can read it in the
+   // same rule as req/valid/exc without a scheduling conflict (a direct read
+   // of rg_state is G0004 against req).  The one-cycle lag is safe: a req
+   // arriving in the lag cycle conflicts with rl_start_cache_refill on
+   // rg_state and the method wins, so the AR is never sent.
+   Reg #(Bool) rg_busy_mirror <- mkConfigReg (False);
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_busy_mirror;
+      rg_busy_mirror <= (   (rg_state != MODULE_READY)
+			 && (rg_state != MODULE_RUNNING)
+			 && (rg_state != MODULE_EXCEPTION_RSP)
+			 // E8b: the two hold-the-response states park until the
+			 // CPU's NEXT req (see rl_ST_AMO_response /
+			 // rl_maintain_io_read_rsp); nothing is outstanding on
+			 // the fabric there.  Counting them as busy deadlocks the
+			 // pipeline after the first store (E8a: 'T' then hang).
+			 && (rg_state != CACHE_ST_AMO_RSP)
+			 && (rg_state != IO_READ_RSP));
+   endrule
 
    // This reg is used during PTWs
    Reg #(PA) rg_pte_pa <- mkRegU;
@@ -958,7 +1014,8 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 `endif
 
    rule rl_probe_and_immed_rsp (rg_ddr4_ready && (rg_state == MODULE_RUNNING)
-				&& (rg_age_seen == rg_req_seq));
+				&& (rg_age_seen == rg_req_seq)
+				&& (! rg_kill_echo));    // RLD-4: see interface comment
 
       // Print some initial information for debugging
       if (cfg_verbosity > 1) begin
@@ -1751,9 +1808,18 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // Stays in this state until CPU's next request puts it back into RUNNING state
 
    rule rl_ST_AMO_response (rg_state == CACHE_ST_AMO_RSP);
-      dw_valid             <= True;
-      dw_output_ld_val     <= zeroExtend (rg_ld_val);        // Irrelevant for ST; relevant for SC, AMO
-      dw_output_st_amo_val <= zeroExtend (rg_st_amo_val);
+      if (rg_kill_echo) begin
+	 // RLD-4: a new op just entered Stage2 (its deferred req launches
+	 // this same cycle and supersedes this stale response); the req
+	 // method's write of MODULE_RUNNING wins this cycle's write-mux if
+	 // both fire.
+	 rg_state <= MODULE_READY;
+      end
+      else begin
+	 dw_valid             <= True;
+	 dw_output_ld_val     <= zeroExtend (rg_ld_val);        // Irrelevant for ST; relevant for SC, AMO
+	 dw_output_st_amo_val <= zeroExtend (rg_st_amo_val);
+      end
 
 `ifdef WATCH_TOHOST
       // ----------------
@@ -1835,7 +1901,12 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // Stays in this state until CPU's next request puts it back into RUNNING state
 
    rule rl_maintain_io_read_rsp (rg_state == IO_READ_RSP);
-      fa_drive_IO_read_rsp (rg_f3, rg_addr, rg_ld_val);
+      if (rg_kill_echo) begin
+	 // RLD-4: stale response; exit (see rl_ST_AMO_response).
+	 rg_state <= MODULE_READY;
+      end
+      else
+	 fa_drive_IO_read_rsp (rg_f3, rg_addr, rg_ld_val);
    endrule
 
    // ----------------------------------------------------------------
@@ -1979,9 +2050,15 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // into MODULE_RUNNING state by the next request.
 
    rule rl_drive_exception_rsp (rg_state == MODULE_EXCEPTION_RSP);
-      dw_valid    <= True;
-      dw_exc      <= True;
-      dw_exc_code <= rg_exc_code;
+      if (rg_kill_echo) begin
+	 // RLD-4: stale response; exit (see rl_ST_AMO_response).
+	 rg_state <= MODULE_READY;
+      end
+      else begin
+	 dw_valid    <= True;
+	 dw_exc      <= True;
+	 dw_exc_code <= rg_exc_code;
+      end
    endrule
 
    // ================================================================
@@ -2040,6 +2117,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       rg_addr        <= addr;
       rg_st_amo_val  <= st_value;
       rg_req_seq     <= ! rg_req_seq;
+      rg_kill_echo   <= False;    // RLD-4: this req supersedes any stale echo
 
       rg_priv        <= priv;
       rg_sstatus_SUM <= sstatus_SUM;
@@ -2058,6 +2136,10 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	 rg_state <= MODULE_RUNNING;
 	 fa_req_ram_B (addr);
       end
+   endmethod
+
+   method Action  ma_kill_echo;
+      rg_kill_echo <= True;
    endmethod
 
    method Bool  valid;
@@ -2146,6 +2228,8 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    endmethod
 
    // Performance-monitoring tap (see interface comment)
+   method Bool mv_busy = rg_busy_mirror;
+
    method Bool mv_perf_miss;
       return pw_perf_miss;
    endmethod

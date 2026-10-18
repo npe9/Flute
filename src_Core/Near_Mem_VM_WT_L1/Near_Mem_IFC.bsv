@@ -197,6 +197,14 @@ interface DMem_IFC;
    (* always_ready *)  method Bit #(64)  st_amo_val;  // Final store-value for ST, SC, AMO
    (* always_ready *)  method Bool       exc;
    (* always_ready *)  method Exc_Code   exc_code;
+
+   // CPU side: response-echo kill (RLD-4).  Set by the CPU on every Stage2
+   // enqueue; silences stale response echoes for the one cycle between an
+   // op entering Stage2 and its deferred request launch (see
+   // MMU_Cache.ma_kill_echo for the full contract).
+   (* always_ready *)  method Action     ma_kill_echo;
+   // E8: fabric transaction may be outstanding; do not issue req (see MMU_Cache.mv_busy)
+   method Bool  mv_busy;
 endinterface
 
 // ================================================================

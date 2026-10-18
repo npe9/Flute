@@ -10,7 +10,11 @@ package Cache_Decls;
 // ================================================================
 
 `ifdef RV32
-`ifdef SV32
+`ifdef RVFI
+// riscv-formal build: tiny geometry so the cache reset loops fit in a BMC bound
+import Cache_Decls_RV32_1KB_1way :: *;
+export Cache_Decls_RV32_1KB_1way :: *;
+`elsif SV32
 import Cache_Decls_RV32_Sv32_8KB_2way :: *;
 export Cache_Decls_RV32_Sv32_8KB_2way :: *;
 `else

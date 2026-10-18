@@ -88,7 +88,9 @@ interface CPU_Stage2_IFC;
    method Action deq;
 
    // ---- Input
-   (* always_ready *)
+   // RLD-4: not always_ready -- a dmem op enqueues a pending-request
+   // sample into f_dreq_pending (guarded by its notFull).  The FIFO is
+   // depth 2 with occupancy <= 1 in practice, so this never blocks.
    method Action enq (Data_Stage1_to_Stage2 x);
 
    (* always_ready *)
@@ -96,7 +98,35 @@ interface CPU_Stage2_IFC;
 endinterface
 
 // ================================================================
+
+// RLD-4: sample of the CSR/VM context a dmem request was enqueued with.
+// The dcache request launch is deferred one cycle behind stage2 enqueue
+// (cuts the stage1-output/regfile -> dcache tag-RAM address cone); these
+// values are sampled at enqueue so the launch uses exactly the context
+// stock Flute would have used.
+
+typedef struct {
+   Priv_Mode  mem_priv;
+   Bit #(1)   sstatus_SUM;
+   Bit #(1)   mstatus_MXR;
+   WordXL     satp;
+} DReq_Sample
+deriving (Bits);
+
+// ================================================================
 // Implementation module
+
+`ifdef RVFI
+// RVFI aligned-mem helpers: byte mask and raw word lanes at the aligned address
+function Bit #(4) fn_rvfi_mask (Bit #(3) funct3, Bit #(2) offset);
+   Bit #(4) m = case (funct3 [1:0]) 2'b00: 4'b0001; 2'b01: 4'b0011; default: 4'b1111; endcase;
+   return (m << offset);
+endfunction
+function WordXL fn_rvfi_lanes (Bit #(3) funct3, Bit #(2) offset, WordXL v);
+   WordXL vm = case (funct3 [1:0]) 2'b00: (v & 'hFF); 2'b01: (v & 'hFFFF); default: v; endcase;
+   return (vm << {offset, 3'b000});
+endfunction
+`endif
 
 module mkCPU_Stage2 #(Bit #(4)         verbosity,
 		      CSR_RegFile_IFC  csr_regfile,    // for SATP and SSTATUS: TODO carry in Data_Stage1_to_Stage2
@@ -105,6 +135,15 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 
    FIFOF #(Token) f_reset_reqs <- mkFIFOF;
    FIFOF #(Token) f_reset_rsps <- mkFIFOF;
+
+   // RLD-4: deferred dcache request launches.  A dmem op enqueues its
+   // DReq_Sample here instead of calling dcache.req in fa_enq; one cycle
+   // later rl_launch_dmem_req issues dcache.req from the registered
+   // stage2 contents.  Depth 2 for scheduling headroom; occupancy is at
+   // most 1 in practice because a dmem op holds stage2 BUSY until the
+   // dcache response, so no second dmem op can enqueue while one is
+   // pending.  See rl_launch_dmem_req for the orphan (kill) handling.
+   FIFOF #(DReq_Sample) f_dreq_pending <- mkSizedFIFOF (2);
 
    Reg #(Bool)                  rg_resetting  <- mkReg (False);
    Reg #(Bool)                  rg_full       <- mkReg (False);
@@ -152,6 +191,18 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 						    rd_valid:   False,
 						    rd:         rg_stage2.rd,
 						    rd_val:     rg_stage2.val1
+`ifdef RVFI
+						    , rvfi_is_i32:    rg_stage2.is_i32_not_i16,
+						    rvfi_instr_C:   rg_stage2.instr_C,
+						    rvfi_rs1_val:   rg_stage2.rs1_val,
+						    rvfi_rs2_val:   rg_stage2.rs2_val,
+						    rvfi_next_pc:   rg_stage2.next_pc,
+						    rvfi_mem_addr:  0,
+						    rvfi_mem_rmask: 0,
+						    rvfi_mem_wmask: 0,
+						    rvfi_mem_rdata: 0,
+						    rvfi_mem_wdata: 0
+`endif
 `ifdef ISA_F
 						    , rd_in_fpr:  False,
 						    upd_flags:  False,
@@ -181,6 +232,7 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
       f_reset_reqs.deq;
       rg_full <= False;
       rg_resetting <= True;
+      f_dreq_pending.clear;
 `ifdef ISA_F
       fbox.server_reset.request.put (?);
 `endif
@@ -281,6 +333,18 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 `endif
             // GPR loads
 	    data_to_stage3.rd_val = result;
+`ifdef RVFI
+	    data_to_stage3.rvfi_mem_addr  = (rg_stage2.addr & (~ 3));
+	    data_to_stage3.rvfi_mem_rmask = fn_rvfi_mask  (funct3, rg_stage2.addr [1:0]);
+	    data_to_stage3.rvfi_mem_rdata = fn_rvfi_lanes (funct3, rg_stage2.addr [1:0], result);
+`ifdef ISA_A
+	    if (rg_stage2.op_stage2 == OP_Stage2_AMO) begin
+	       // approximation: rs2 value, not the AMO result (no riscv-formal AMO checks)
+	       data_to_stage3.rvfi_mem_wmask = fn_rvfi_mask  (funct3, rg_stage2.addr [1:0]);
+	       data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (funct3, rg_stage2.addr [1:0], rg_stage2.val2);
+	    end
+`endif
+`endif
 
             // Update the bypass channel, if not trapping (NONPIPE)
 	    let bypass = bypass_base;
@@ -352,6 +416,12 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 	 let data_to_stage3 = data_to_stage3_base;
 	 data_to_stage3.rd_valid = (ostatus == OSTATUS_PIPE);
 	 data_to_stage3.rd       = 0;
+`ifdef RVFI
+	 let st_funct3 = instr_funct3 (rg_stage2.instr);
+	 data_to_stage3.rvfi_mem_addr  = (rg_stage2.addr & (~ 3));
+	 data_to_stage3.rvfi_mem_wmask = fn_rvfi_mask  (st_funct3, rg_stage2.addr [1:0]);
+	 data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (st_funct3, rg_stage2.addr [1:0], rg_stage2.val2);
+`endif
 
 	 output_stage2 = Output_Stage2 {ostatus         : ostatus,
 					trap_info       : trap_info_dmem,
@@ -519,6 +589,10 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
       end
 `endif
 
+      // E2: resolved-branch feedback of the op in stage2 (registered data)
+      output_stage2.redirect = (rg_full && rg_stage2.redirect);
+      output_stage2.next_pc  = rg_stage2.next_pc;
+      output_stage2.cf_info  = (rg_full ? rg_stage2.cf_info : cf_info_none);
       return output_stage2;
    endfunction
 
@@ -528,6 +602,15 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
    function Action fa_enq (Data_Stage1_to_Stage2 x);
       action
 	 rg_stage2  <= x;
+
+	 // RLD-4: kill any stale near-mem response echo (lingering ST/IO/exception
+	 // response or MODULE_RUNNING hit-response probe re-drive) for the one
+	 // cycle between this op landing in Stage2 and its deferred request
+	 // launch.  Stock relied on the next req's clobber, which the deferred
+	 // launch (rl_launch_dmem_req) makes one cycle late.  Safe on every
+	 // enqueue: a live response's consumer is by construction the op in
+	 // Stage2, and Stage2 is empty at enqueue.
+	 dcache.ma_kill_echo;
 
 	 let funct3 = instr_funct3 (x.instr);
 
@@ -555,42 +638,14 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 	       // $display ("    S2.fa_enq: mem_priv %0d => %0d (mstatus.MPP) due to mstatus.MPRV", x.priv, mem_priv);
 	    end
 
-	    CacheOp cache_op = ?;
-	    if      (x.op_stage2 == OP_Stage2_LD)  cache_op = CACHE_LD;
-	    else if (x.op_stage2 == OP_Stage2_ST)  cache_op = CACHE_ST;
-`ifdef ISA_A
-	    else if (x.op_stage2 == OP_Stage2_AMO) cache_op = CACHE_AMO;
-`endif
-
-            // Prepare the store value
-`ifdef RV64
-            Bit# (64) wdata_from_gpr = x.val2;
-`else
-            Bit# (64) wdata_from_gpr = zeroExtend (x.val2);
-`endif
-
-`ifdef ISA_F
-`ifdef ISA_D
-            Bit# (64) wdata_from_fpr = x.fval2;
-`else
-            Bit# (64) wdata_from_fpr = zeroExtend (x.fval2);
-`endif
-`endif
-	    dcache.req (cache_op,
-			instr_funct3 (x.instr),
-`ifdef ISA_A
-			amo_funct7,
-`endif
-			x.addr,
-`ifdef ISA_F
-			(x.rs_frm_fpr ? wdata_from_fpr : wdata_from_gpr),
-`else
-			wdata_from_gpr,
-`endif
-			mem_priv,
-			sstatus_SUM,
-			mstatus_MXR,
-			csr_regfile.read_satp);
+	    // RLD-4: sample the CSR/VM context; rl_launch_dmem_req issues the
+	    // actual dcache.req one cycle later from the registered stage2
+	    // contents (cuts the stage1 output/regfile -> dcache tag-RAM
+	    // address cone, the rld1pp-era 29 ns path0).
+	    f_dreq_pending.enq (DReq_Sample {mem_priv:    mem_priv,
+					  sstatus_SUM: sstatus_SUM,
+					  mstatus_MXR: mstatus_MXR,
+					  satp:        csr_regfile.read_satp});
 	 end
 
 `ifdef SHIFT_SERIAL
@@ -629,6 +684,72 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 `endif
       endaction
    endfunction
+
+   // ----------------------------------------------------------------
+   // RLD-4: deferred dcache request launch.  Fires the cycle after a dmem
+   // op enters stage2 (FIFO token), issuing dcache.req from the registered
+   // stage2 contents -- this cuts the stage1-comb -> tag-RAM address cone.
+   //
+   // The req is issued only if stage2 still holds a dmem op (guard below):
+   // a kill (trap redirect / debug) that cleared stage2 between enqueue and
+   // launch leaves a dead token, which we drop without launching (the op is
+   // gone; no orphan request is injected into the FSM).  Stock's orphan
+   // exposure -- req in flight when its op is killed -- is unchanged: the
+   // response then has no consumer and is cleared by the next op's
+   // fa_enq rsp_consumed pulse, exactly like stock's next-req clobber.
+
+   // E8: same contract as the icache shim -- never issue dcache.req while the
+   // dcache has a fabric transaction outstanding (abandoned refill -> stale burst).
+   rule rl_launch_dmem_req (f_dreq_pending.notEmpty && (! dcache.mv_busy));
+      f_dreq_pending.deq;
+
+      if (   (rg_stage2.op_stage2 == OP_Stage2_LD)
+	  || (rg_stage2.op_stage2 == OP_Stage2_ST)
+`ifdef ISA_A
+	  || (rg_stage2.op_stage2 == OP_Stage2_AMO)
+`endif
+	  ) begin
+	 let s = f_dreq_pending.first;
+	 let x = rg_stage2;
+
+	 CacheOp cache_op = ?;
+	 if      (x.op_stage2 == OP_Stage2_LD)  cache_op = CACHE_LD;
+	 else if (x.op_stage2 == OP_Stage2_ST)  cache_op = CACHE_ST;
+`ifdef ISA_A
+	 else if (x.op_stage2 == OP_Stage2_AMO) cache_op = CACHE_AMO;
+`endif
+
+	 // Prepare the store value
+`ifdef RV64
+	 Bit# (64) wdata_from_gpr = x.val2;
+`else
+	 Bit# (64) wdata_from_gpr = zeroExtend (x.val2);
+`endif
+
+`ifdef ISA_F
+`ifdef ISA_D
+	 Bit# (64) wdata_from_fpr = x.fval2;
+`else
+	 Bit# (64) wdata_from_fpr = zeroExtend (x.fval2);
+`endif
+`endif
+	 dcache.req (cache_op,
+		     instr_funct3 (x.instr),
+`ifdef ISA_A
+		     x.val1 [6:0],    // amo_funct7
+`endif
+		     x.addr,
+`ifdef ISA_F
+		     (x.rs_frm_fpr ? wdata_from_fpr : wdata_from_gpr),
+`else
+		     wdata_from_gpr,
+`endif
+		     s.mem_priv,
+		     s.sstatus_SUM,
+		     s.mstatus_MXR,
+		     s.satp);
+      end
+   endrule
 
    // ----------------------------------------------------------------
    // INTERFACE

@@ -67,7 +67,11 @@ endinterface
 // BTB parameters and functions.
 // Ignore PCs[0] since PCs are at least 2-byte aligned (word-aligned).
 
+`ifdef RVFI
+typedef   16  BTB_Num_Sets;    // riscv-formal build: short reset loop
+`else
 typedef  512  BTB_Num_Sets;
+`endif
 Integer  btb_num_sets = valueOf (BTB_Num_Sets);
 
 // Split a PC into a btb index and a btb tag
@@ -196,7 +200,12 @@ module mkBranch_Predictor (Branch_Predictor_IFC);
    WordXL  bogus_PC  = '1;
 
    // Branch Target Table (BTB)
-   Bool bram_has_output_reg = False;
+   // E7: registered BTB read.  predict_req is issued at stageF.enq; the step9
+   // shim presents imem.valid no earlier than 2 cycles after imem.req, and
+   // stageF.out (predict_rsp) is only consumed when imem.valid, so the extra
+   // read latency is hidden.  Cuts the BRAM-output mux -> tag compare ->
+   // pred_pc -> imem_req_addr cone (e5 census 23.6 levels) at the BRAM.
+   Bool bram_has_output_reg = False;   // E7 (registered BTB read) measured no gain: reverted 2026-10-17
    BRAM_DUAL_PORT #(BTB_Index, BTB_Entry) btb_bramcore2 <- mkBRAMCore2 (btb_num_sets,
 									bram_has_output_reg);
 

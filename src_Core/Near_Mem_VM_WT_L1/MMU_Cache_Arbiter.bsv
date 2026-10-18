@@ -322,6 +322,15 @@ module mkMMU_Cache_Arbiter #(MMU_Cache_IFC cache)
 	    return rg_master [i] ? cache.exc_code : v_rsp_exc_code [i];
 	 endmethod
 
+	 // RLD-4 response-echo kill pass-through.  Only the active master
+	 // may legitimately set this (it applies to the shared FSM's current
+	 // response); in this build only the CPU is a dmem master
+	 // (INCLUDE_DMEM_SLAVE undefined), so an unguarded pass-through
+	 // is safe.
+	 method Action ma_kill_echo;
+	    cache.ma_kill_echo;
+	 endmethod
+
 	 interface Server server_flush;
 	    interface Put request;
 	       method Action put (Token t) if (fn_master_can_acquire (i) && (! rg_flushing));

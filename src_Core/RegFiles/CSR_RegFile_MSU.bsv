@@ -671,7 +671,7 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 	    csr_addr_mcounteren: m_csr_value = tagged Valid (mcounteren_to_word (rg_mcounteren));
 
 	    csr_addr_mscratch:   m_csr_value = tagged Valid rg_mscratch;
-	    csr_addr_mepc:       m_csr_value = tagged Valid ((misa.c == 1'b1) ? rg_mepc : (rg_mepc & (~ 2)));
+	    csr_addr_mepc:       m_csr_value = tagged Valid ((misa.c == 1'b1) ? (rg_mepc & (~ 1)) : (rg_mepc & (~ 3)));    // mepc[0] reads zero even before the first write (rg_mepc is not reset; riscv-formal insn_c_beqz)
 	    csr_addr_mcause:     m_csr_value = tagged Valid (mcause_to_word (rg_mcause));
 	    csr_addr_mtval:      m_csr_value = tagged Valid rg_mtval;
 	    csr_addr_mip:        m_csr_value = tagged Valid (csr_mip.mv_read);
@@ -1283,6 +1283,9 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
       if (from_priv != m_Priv_Mode)
 	 next_pc = rg_sepc;
 `endif
+      // xepc[0] is always zero (WARL); rg_mepc is not reset, so mask on use too
+      // (riscv-formal insn_c_beqz: MRET before any mepc write returned to an odd PC).
+      next_pc = next_pc & (~ 1);
       if (misa.c == 1'b0)
 	 next_pc = next_pc & (~ 2);
       return tuple3 (next_pc, to_priv, new_mstatus);

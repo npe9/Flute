@@ -108,6 +108,7 @@ typedef struct {
    Bool       valid;
    BTB_Tag    pc_tag;
    Word_Addr  predicted_pc;
+   Bool       is_ret;      // E11: entry is a RAS-popping JALR (predict from the RAS top)
    } BTB_Entry
 deriving (Bits, FShow);
 
@@ -280,17 +281,16 @@ module mkBranch_Predictor (Branch_Predictor_IFC);
       WordXL pred_pc   = bogus_PC;    // default: no prediction, invalid PC
       let    btb_entry = btb_bramcore2.a.read;
 
-      // Check if prediction is from RAS pop (JALR returns)
-      match { .do_pop, .*, .* } = fn_ras_actions (bogus_PC, is_i32_not_i16, instr);
-      if (do_pop)
+      // E11: returns are recognised from the BTB entry (is_ret, learned when the JALR
+      // resolved), not by decoding the fetched instruction: that decode sat after the
+      // Fetch_C 16/32 alignment mux, in series, and was the whole ISA_C timing cost
+      // (census: fetch endpoints 22.9 -> 18 LUT levels without it).  RAS push/pop
+      // bookkeeping in bp_train is unchanged.
+      Bool btb_hit = (btb_entry.valid) && (btb_entry.pc_tag == fn_pc_to_tag (rg_pc));
+      if (btb_hit && btb_entry.is_ret && (rg_ras [0] != bogus_PC))
 	 pred_pc = rg_ras [0];    // Top of RAS (will be popped in bp_train())
-
-      // Look for BTB hit if no result from RAS
-      if (   (pred_pc == bogus_PC)
-	  && (btb_entry.valid)
-	  && (btb_entry.pc_tag == fn_pc_to_tag (rg_pc))) begin
+      else if (btb_hit)
 	 pred_pc = { btb_entry.predicted_pc, 1'b0 };
-      end
 
       // Default prediction: fallthrough
       if (pred_pc == bogus_PC)
@@ -354,7 +354,8 @@ module mkBranch_Predictor (Branch_Predictor_IFC);
 	 rf_btb_fsms.upd (index_b, fsm_val);
 	 let btb_entry = BTB_Entry {valid:        True,
 				    pc_tag:       fn_pc_to_tag (cf_info.from_PC),
-				    predicted_pc: fn_pc_to_word_addr (pred_PC) };
+				    predicted_pc: fn_pc_to_word_addr (pred_PC),
+				    is_ret:       (cf_info.cf_op == CF_JALR) && cf_info.is_ret };
 	 Bool op_write_not_read = True;
 	 btb_bramcore2.b.put (op_write_not_read, index_b, btb_entry);
 	 if (verbosity > 2)

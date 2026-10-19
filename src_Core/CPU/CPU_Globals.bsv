@@ -70,6 +70,7 @@ typedef struct {
    Bool    taken;            // Relevant for BR
    WordXL  fallthru_PC;      // for BR; return-PC for JAL/JALR
    WordXL  taken_PC;         // target PC for taken BR and for JAL/JALR
+   Bool    is_ret;           // E11: JALR that pops the RAS (rs1 link, rd not the same link); stored in the BTB
    } CF_Info
 deriving (Bits);
 
@@ -77,7 +78,8 @@ CF_Info cf_info_none = CF_Info{cf_op:       CF_None,
 			       from_PC:     ?,
 			       taken:       ?,
 			       fallthru_PC: ?,
-			       taken_PC:    ?};
+			       taken_PC:    ?,
+			       is_ret:      False};
 
 instance FShow #(CF_Info);
    function Fmt fshow (CF_Info x);

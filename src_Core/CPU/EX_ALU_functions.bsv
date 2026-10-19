@@ -117,7 +117,8 @@ CF_Info cf_info_base = CF_Info {cf_op       : CF_None,
 				from_PC     : ?,
 				taken       : ?,
 				fallthru_PC : ?,
-				taken_PC    : ?};
+				taken_PC    : ?,
+				is_ret      : False};
 
 ALU_Outputs alu_outputs_base
 = ALU_Outputs {control     : CONTROL_STRAIGHT,
@@ -260,7 +261,8 @@ function ALU_Outputs fv_BRANCH (ALU_Inputs inputs);
 			    from_PC     : inputs.pc,
 			    taken       : branch_taken,
 			    fallthru_PC : fall_through_pc (inputs),
-			    taken_PC    : branch_target };
+			    taken_PC    : branch_target ,
+			    is_ret      : False};
 
    let alu_outputs = alu_outputs_base;
    let next_pc     = (branch_taken ? branch_target : fall_through_pc (inputs));
@@ -298,7 +300,8 @@ function ALU_Outputs fv_JAL (ALU_Inputs inputs);
 			    from_PC     : inputs.pc,
 			    taken       : True,
 			    fallthru_PC : ret_pc,
-			    taken_PC    : next_pc };
+			    taken_PC    : next_pc ,
+			    is_ret      : False};
 
    let alu_outputs = alu_outputs_base;
    alu_outputs.control   = (misaligned_target ? CONTROL_TRAP : CONTROL_BRANCH);
@@ -344,11 +347,20 @@ function ALU_Outputs fv_JALR (ALU_Inputs inputs);
    misaligned_target = False;
 `endif
 
+   // E11: RAS-pop classification (same rule as fn_ras_actions in Branch_Predictor;
+   // compressed C.JR/C.JALR arrive expanded to JALR).  Stored in the BTB entry so the
+   // predictor can use the RAS without decoding the fetched instruction.
+   RegName jr_rd  = inputs.decoded_instr.rd;
+   RegName jr_rs1 = inputs.decoded_instr.rs1;
+   Bool rd_link   = (jr_rd  == 1) || (jr_rd  == 5);
+   Bool rs1_link  = (jr_rs1 == 1) || (jr_rs1 == 5);
+   Bool is_ret    = rs1_link && ((! rd_link) || (jr_rs1 != jr_rd));
    let cf_info   = CF_Info {cf_op       : CF_JALR,
 			    from_PC     : inputs.pc,
 			    taken       : True,
 			    fallthru_PC : ret_pc,
-			    taken_PC    : next_pc };
+			    taken_PC    : next_pc,
+			    is_ret      : is_ret };
 
    let alu_outputs = alu_outputs_base;
    alu_outputs.control   = ((misaligned_target || funct3_is_not_zero)

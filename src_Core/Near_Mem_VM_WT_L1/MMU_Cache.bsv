@@ -206,6 +206,7 @@ typedef enum {MODULE_PRERESET,              // After power on reset, before soft
               CACHE_SNAPSHOT,               // Snapshot victim line's other-way words (BRAM read-only)
               CACHE_REFILL,                 // Refill
               CACHE_REREQ,                  // After refill, redo request that missed
+              CACHE_AMO_EXEC,               // E12: AMO hit captured at probe; ALU + write here
               CACHE_ST_AMO_RSP,             // Provide ST/SC/AMO response
 
               IO_REQ,                       // For memory-mapped I/O requests
@@ -501,6 +502,12 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    Reg #(Bit #(3))   rg_f3          <- mkRegU;    // rg_f3[1:0] specifies B/H/W/D access size
 `ifdef ISA_A
    Reg #(Bit #(7))   rg_amo_funct7  <- mkRegU;    // specifies which kind of AMO op
+   // E12: an AMO hit is captured at probe and the AMO ALU, cache write and
+   // writeback run one cycle later in rl_amo_exec (the probe-cycle cone
+   // tag-compare -> AMO add/compare -> cword merge was the deepest in the SoC).
+   Reg #(CWord_Set)   rg_amo_cword_set <- mkRegU;
+   Reg #(Way_in_CSet) rg_amo_way       <- mkRegU;
+   Reg #(Bit #(64))   rg_amo_word64    <- mkRegU;
 `endif
    Reg #(WordXL)     rg_addr        <- mkRegU;    // VA or PA
    Reg #(Bit #(64))  rg_st_amo_val  <- mkRegU;    // Store-value for ST, SC, AMO
@@ -1229,25 +1236,13 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 		     $display ("          Cache word64 0x%0h, load-result 0x%0h", word64, word64);
 		  end
 
-		  // Do the AMO op on the loaded value and the store value
-		  match {.new_ld_val,
-			 .new_st_val} = fv_amo_op (rg_f3, rg_amo_funct7, rg_addr, word64, rg_st_amo_val);
-
-		  // Update cache line in cache
-		  let new_cword_set = fn_update_cword_set (cword_set, way_hit, vm_xlate_result.pa, rg_f3, new_st_val);
-		  ram_cword_set.a.put (bram_cmd_write, cset_cword_in_cache, new_cword_set);
-`ifdef BRAM_HAZARD_ASSERT
-		  fa_haz_A_write (False, bram_cmd_write, extend (cset_cword_in_cache));
-`endif
-
-		  if (cfg_verbosity > 1) begin
-		     $display ("          0x%0h  op  0x%0h -> 0x%0h", word64, word64, new_st_val);
-		     $write   ("          New Word64_Set:");
-		     fa_display_cword_set (cset_in_cache, cword_in_cline, new_cword_set);
-		  end
-
-		  // Writeback data to memory (so cache remains clean)
-		  fa_fabric_send_write_req (rg_f3, vm_xlate_result.pa, new_st_val);
+		  // E12: capture the hit; the AMO op, the cache write and the
+		  // writeback run in rl_amo_exec next cycle.  Stage2 never drops
+		  // an outstanding dmem op (every trap/interrupt/halt path needs
+		  // Stage2 EMPTY), so no req can pre-empt CACHE_AMO_EXEC.
+		  rg_amo_cword_set <= cword_set;
+		  rg_amo_way       <= way_hit;
+		  rg_amo_word64    <= word64;
 
 		  // If this is to the LR/SC reserved address, invalidate the reservation
 		  // TODO: should we invalidate even if to a different
@@ -1259,11 +1254,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 			$display ("        AMO_op: cancelling LR/SC reservation for PA", vm_xlate_result.pa);
 		  end
 
-		  // Provide amo response after 1-cycle delay (thus locking the cset for 1 cycle),
-		  // in case the next incoming request tries to read from the same address.
-		  rg_ld_val     <= new_ld_val;
-		  rg_st_amo_val <= new_st_val;
-		  rg_state      <= CACHE_ST_AMO_RSP;
+		  rg_state <= CACHE_AMO_EXEC;
 	       end
 	    end
 `endif
@@ -1802,6 +1793,42 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       rg_req_seq <= ! rg_req_seq;
       fa_req_ram_B (rg_addr);
    endrule
+
+`ifdef ISA_A
+   // ----------------------------------------------------------------
+   // E12: AMO execute (hit captured by rl_probe_and_immed_rsp).
+   // rg_addr/rg_pa/rg_f3/rg_amo_funct7/rg_st_amo_val are unchanged since the
+   // probe (no req can arrive while the AMO is outstanding).
+
+   rule rl_amo_exec (rg_state == CACHE_AMO_EXEC);
+      // Do the AMO op on the loaded value and the store value
+      match {.new_ld_val,
+	     .new_st_val} = fv_amo_op (rg_f3, rg_amo_funct7, rg_addr, rg_amo_word64, rg_st_amo_val);
+
+      // Update cache line in cache
+      let new_cword_set = fn_update_cword_set (rg_amo_cword_set, rg_amo_way, rg_pa, rg_f3, new_st_val);
+      ram_cword_set.a.put (bram_cmd_write, cset_cword_in_cache, new_cword_set);
+`ifdef BRAM_HAZARD_ASSERT
+      fa_haz_A_write (False, bram_cmd_write, extend (cset_cword_in_cache));
+`endif
+
+      if (cfg_verbosity > 1) begin
+	 $display ("%0d: %s.rl_amo_exec: 0x%0h  op  0x%0h -> 0x%0h",
+		   cur_cycle, d_or_i, rg_amo_word64, rg_st_amo_val, new_st_val);
+	 $write   ("          New Word64_Set:");
+	 fa_display_cword_set (cset_in_cache, cword_in_cline, new_cword_set);
+      end
+
+      // Writeback data to memory (so cache remains clean)
+      fa_fabric_send_write_req (rg_f3, rg_pa, new_st_val);
+
+      // Provide amo response after 1-cycle delay (thus locking the cset for 1 cycle),
+      // in case the next incoming request tries to read from the same address.
+      rg_ld_val     <= new_ld_val;
+      rg_st_amo_val <= new_st_val;
+      rg_state      <= CACHE_ST_AMO_RSP;
+   endrule
+`endif
 
    // ----------------------------------------------------------------
    // Provide write-response (ST op)

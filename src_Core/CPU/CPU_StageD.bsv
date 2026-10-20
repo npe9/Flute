@@ -55,8 +55,13 @@ interface CPU_StageD_IFC;
    (* always_ready *)
    method Action enq (Data_StageF_to_StageD  data_stageF_to_stageD);
 
+   // E14: set_full (False) flushes; set_full (True) is a no-op (occupancy is
+   // the FIFO's).  can_enq is registered (the FIFO's notFull).
    (* always_ready *)
    method Action set_full (Bool full);
+
+   (* always_ready *)
+   method Bool can_enq;
 endinterface
 
 // ================================================================
@@ -68,8 +73,15 @@ module mkCPU_StageD #(Bit #(4)  verbosity, MISA misa)
    FIFOF #(Token)  f_reset_reqs <- mkFIFOF;
    FIFOF #(Token)  f_reset_rsps <- mkFIFOF;
 
-   Reg #(Bool)                   rg_full <- mkReg (False);
-   Reg #(Data_StageF_to_StageD)  rg_data <- mkRegU;
+   // E14: two-entry FIFO instead of a single full/data register pair.  The
+   // F->D move (and so the next fetch request) is decided from can_enq, a
+   // register, not from whether stage1 drains this cycle -- which rippled
+   // the dcache hit (stage2 status) through stage1/D/F into the imem request
+   // and BTB address (the 22 ns E13 path).  enq -> first latency is still
+   // one cycle (mkFIFOF), and two entries keep full throughput.
+   FIFOF #(Data_StageF_to_StageD) f_data <- mkUGFIFOF;
+   Bool                           rg_full = f_data.notEmpty;
+   Data_StageF_to_StageD          rg_data = f_data.first;
 
    Bit #(2) xl = ((xlen == 32) ? misa_mxl_32 : misa_mxl_64);
 
@@ -85,7 +97,7 @@ module mkCPU_StageD #(Bit #(4)  verbosity, MISA misa)
 
    rule rl_reset;
       f_reset_reqs.deq;
-      rg_full <= False;
+      f_data.clear;
       f_reset_rsps.enq (?);
    endrule
 
@@ -133,19 +145,21 @@ module mkCPU_StageD #(Bit #(4)  verbosity, MISA misa)
    endmethod
 
    method Action deq ();
-      noAction;
+      f_data.deq;
    endmethod
 
    // ---- Input
    method Action enq (Data_StageF_to_StageD  data);
-      rg_data <= data;
+      f_data.enq (data);
       if (verbosity > 1)
 	 $display ("    CPU_StageD.enq (Data_StageF_to_StageD)");
    endmethod
 
    method Action set_full (Bool full);
-      rg_full <= full;
+      if (! full) f_data.clear;
    endmethod
+
+   method Bool can_enq = f_data.notFull;
 endmodule
 
 // ================================================================

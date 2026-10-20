@@ -375,7 +375,18 @@ function Tuple2 #(Bit #(64),
 					WordXL     addr,      // lsbs indicate which 32b W in 64b D (.W)
 					Bit #(64)  ld_val,    // 64b value loaded from mem
 					Bit #(64)  st_val);   // 64b value from CPU reg Rs2
-   Bit #(64) w1     = fn_extract_and_extend_bytes (funct3, addr, ld_val);
+   return fv_amo_op_x (funct3, funct7, fn_extract_and_extend_bytes (funct3, addr, ld_val), st_val);
+endfunction: fv_amo_op
+
+// E14: the AMO ALU on an already-extracted operand (w1 = the addressed
+// W/D of the loaded word, extended), so the cache path can register the
+// extraction at probe time and keep it out of the rl_amo_exec cone.
+function Tuple2 #(Bit #(64),
+		  Bit #(64)) fv_amo_op_x (Bit #(3)   funct3,
+					  Bit #(7)   funct7,
+					  Bit #(64)  w1_extracted,
+					  Bit #(64)  st_val);
+   Bit #(64) w1     = w1_extracted;
    Bit #(64) w2     = st_val;
    Int #(64) i1     = unpack (w1);    // Signed, for signed ops
    Int #(64) i2     = unpack (w2);    // Signed, for signed ops
@@ -404,7 +415,7 @@ function Tuple2 #(Bit #(64),
       new_st_val = zeroExtend (new_st_val [31:0]);
 
    return tuple2 (truncate (pack (i1)), new_st_val);
-endfunction: fv_amo_op
+endfunction: fv_amo_op_x
 
 // ================================================================
 // Displays, for debugging
@@ -507,7 +518,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // tag-compare -> AMO add/compare -> cword merge was the deepest in the SoC).
    Reg #(CWord_Set)   rg_amo_cword_set <- mkRegU;
    Reg #(Way_in_CSet) rg_amo_way       <- mkRegU;
-   Reg #(Bit #(64))   rg_amo_word64    <- mkRegU;
+   Reg #(Bit #(64))   rg_amo_w1        <- mkRegU;    // E14: extracted AMO operand
 `endif
    Reg #(WordXL)     rg_addr        <- mkRegU;    // VA or PA
    Reg #(Bit #(64))  rg_st_amo_val  <- mkRegU;    // Store-value for ST, SC, AMO
@@ -1242,7 +1253,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 		  // Stage2 EMPTY), so no req can pre-empt CACHE_AMO_EXEC.
 		  rg_amo_cword_set <= cword_set;
 		  rg_amo_way       <= way_hit;
-		  rg_amo_word64    <= word64;
+		  rg_amo_w1        <= fn_extract_and_extend_bytes (rg_f3, rg_addr, word64);
 
 		  // If this is to the LR/SC reserved address, invalidate the reservation
 		  // TODO: should we invalidate even if to a different
@@ -1803,7 +1814,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    rule rl_amo_exec (rg_state == CACHE_AMO_EXEC);
       // Do the AMO op on the loaded value and the store value
       match {.new_ld_val,
-	     .new_st_val} = fv_amo_op (rg_f3, rg_amo_funct7, rg_addr, rg_amo_word64, rg_st_amo_val);
+	     .new_st_val} = fv_amo_op_x (rg_f3, rg_amo_funct7, rg_amo_w1, rg_st_amo_val);
 
       // Update cache line in cache
       let new_cword_set = fn_update_cword_set (rg_amo_cword_set, rg_amo_way, rg_pa, rg_f3, new_st_val);
@@ -1814,7 +1825,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
       if (cfg_verbosity > 1) begin
 	 $display ("%0d: %s.rl_amo_exec: 0x%0h  op  0x%0h -> 0x%0h",
-		   cur_cycle, d_or_i, rg_amo_word64, rg_st_amo_val, new_st_val);
+		   cur_cycle, d_or_i, rg_amo_w1, rg_st_amo_val, new_st_val);
 	 $write   ("          New Word64_Set:");
 	 fa_display_cword_set (cset_in_cache, cword_in_cline, new_cword_set);
       end

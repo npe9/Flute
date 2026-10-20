@@ -15,6 +15,7 @@ mkCPU_StageF;
 // ================================================================
 // BSV library imports
 
+import ConfigReg    :: *;
 import FIFOF        :: *;
 import GetPut       :: *;
 import ClientServer :: *;
@@ -62,6 +63,10 @@ interface CPU_StageF_IFC;
 			   Instr    instr,
 			   CF_Info  cf_info);
 
+   // E14: RAS training from the fetch side (CPU.rl_front)
+   (* always_ready *)
+   method Action bp_train_ras (WordXL pc, Bool is_i32_not_i16, Instr instr);
+
    (* always_ready *)
    method Action set_full (Bool full);
 endinterface
@@ -78,7 +83,9 @@ module mkCPU_StageF #(Bit #(4)  verbosity,
 
    Wire #(Bool)      dw_redirecting <- mkDWire (False);
 
-   Reg #(Bool)       rg_full  <- mkReg (False);
+   // E14: ConfigReg so CPU.rl_pipe (pipe_is_empty reads out.ostatus) can be
+   // scheduled after CPU.rl_front (which writes this); hardware unchanged.
+   Reg #(Bool)       rg_full  <- mkConfigReg (False);
    Reg #(Epoch)      rg_epoch <- mkReg (0);               // Toggles on redirections
    Reg #(Priv_Mode)  rg_priv  <- mkRegU;
 
@@ -92,11 +99,34 @@ module mkCPU_StageF #(Bit #(4)  verbosity,
    // same cloud as the BTB RAM write pin (the 33.06 ns binding path
    // on the RLD-0 netlist).  Enq here ends that cone at a FIFO data
    // pin; the drain-side cone (FIFO Q -> BTB) is short.
-   FIFOF #(Tuple4 #(WordXL, Bool, Instr, CF_Info)) f_bp_train <- mkFIFOF;
+   // E14: unguarded.  The method's old guard (if f_bp_train.notFull),
+   // predicated on "something to train", put the stage2 move decision (dcache
+   // hit) into WILL_FIRE_rl_pipe and so into every rl_pipe action, including
+   // the fetch request.  The drain rule runs every cycle, so the 2-entry
+   // FIFO is never full in practice; if it were, the hint is dropped.
+   FIFOF #(Tuple4 #(WordXL, Bool, Instr, CF_Info)) f_bp_train <- mkUGFIFOF;
 
-   rule rl_bp_train_drain;
-      match { .pc, .is_i32, .instr, .cf_info } = f_bp_train.first;
-      f_bp_train.deq;
+   // E14: RAS training (fetch side, CPU.rl_front) and BTB training (resolve
+   // side, CPU.rl_pipe) come from different rules, so they queue separately
+   // and the drain merges them into one bp_train call (pc/instr 0 = no RAS
+   // action, cf_info_none = no BTB action).
+   FIFOF #(Tuple3 #(WordXL, Bool, Instr)) f_ras_train <- mkUGFIFOF;
+
+   rule rl_bp_train_drain (f_bp_train.notEmpty || f_ras_train.notEmpty);
+      WordXL  pc      = 0;
+      Bool    is_i32  = True;
+      Instr   instr   = 0;
+      CF_Info cf_info = cf_info_none;
+      if (f_ras_train.notEmpty) begin
+	 match { .p, .i, .x } = f_ras_train.first;
+	 f_ras_train.deq;
+	 pc = p; is_i32 = i; instr = x;
+      end
+      if (f_bp_train.notEmpty) begin
+	 match { .p2, .i2, .x2, .c } = f_bp_train.first;
+	 f_bp_train.deq;
+	 cf_info = c;
+      end
       branch_predictor.bp_train (pc, is_i32, instr, cf_info);
    endrule
 
@@ -173,8 +203,14 @@ module mkCPU_StageF #(Bit #(4)  verbosity,
    method Action bp_train (WordXL   pc,
 			   Bool     is_i32_not_i16,
 			   Instr    instr,
-			   CF_Info  cf_info) if (f_bp_train.notFull);
-      f_bp_train.enq (tuple4 (pc, is_i32_not_i16, instr, cf_info));
+			   CF_Info  cf_info);
+      if (f_bp_train.notFull)
+	 f_bp_train.enq (tuple4 (pc, is_i32_not_i16, instr, cf_info));
+   endmethod
+
+   method Action bp_train_ras (WordXL pc, Bool is_i32_not_i16, Instr instr);
+      if (f_ras_train.notFull)
+	 f_ras_train.enq (tuple3 (pc, is_i32_not_i16, instr));
    endmethod
 
    method Action set_full (Bool full);

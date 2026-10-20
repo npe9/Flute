@@ -146,8 +146,10 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
    FIFOF #(DReq_Sample) f_dreq_pending <- mkSizedFIFOF (2);
 
    Reg #(Bool)                  rg_resetting  <- mkReg (False);
-   Reg #(Bool)                  rg_full       <- mkReg (False);
-   Reg #(Data_Stage1_to_Stage2) rg_stage2     <- mkRegU;    // From Stage 1
+   // E14: ConfigRegs so CPU.rl_front can read out.redirect (registers only)
+   // in the same cycle rl_pipe rewrites them; hardware is unchanged.
+   Reg #(Bool)                  rg_full       <- mkConfigReg (False);
+   Reg #(Data_Stage1_to_Stage2) rg_stage2     <- mkConfigRegU;    // From Stage 1
 
    // ----------------
    // Serial shifter box

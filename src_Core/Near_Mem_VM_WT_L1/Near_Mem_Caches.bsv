@@ -41,6 +41,7 @@ import ISA_Decls        :: *;
 import Near_Mem_IFC     :: *;
 import MMU_Cache_Common :: *;
 import MMU_Cache        :: *;
+import ICache_Pipe      :: *;
 import AXI4_Types       :: *;
 import Fabric_Defs      :: *;
 
@@ -613,7 +614,9 @@ module mkNear_Mem (Near_Mem_IFC);
    // Reset response queue
    FIFOF #(Token) f_reset_rsps <- mkFIFOF;
 
-   MMU_Cache_IFC  icache <- mkMMU_Cache (False);
+   // E20: pipelined I-side (replaces the I-side MMU_Cache, the Imem_Decoup
+   // shim and CPU_Fetch_C; see ICache_Pipe.bsv).
+   ICache_Pipe_IFC  icache <- mkICache_Pipe;
    MMU_Cache_IFC  dcache <- mkMMU_Cache (True);
 `ifdef INCLUDE_DMEM_SLAVE
    MMU_Cache_Arbiter_IFC #(2) dcache_arbiter <- mkMMU_Cache_Arbiter (dcache);
@@ -622,19 +625,6 @@ module mkNear_Mem (Near_Mem_IFC);
    AXI4_Lite_MMU_Cache_Adapter_IFC dmem_slave_adapter <- mkAXI4_Lite_MMU_Cache_Adapter(dcache_arbiter.v_from_masters [1]);
 `endif
 
-   // STEP 5 shim-lean: I-side fetch decoupling queue between the CPU and
-   // the I-side MMU_Cache (Near_Mem_IFC side untouched: the fabric master
-   // still comes straight from icache).
-   Imem_Decoup_IFC idec <- mkNear_Mem_Imem_Decoup (icache);
-
-   // Flush notify: fence.i / sfence / reset tell the shim to drain its
-   // queue and drop held state.  The PulseWire decouples the server puts
-   // from the shim registers (step-4 G0004 lesson).
-   PulseWire pw_idec_flush <- mkPulseWire;
-
-   rule rl_idec_flush;
-      if (pw_idec_flush) idec.ma_clear;
-   endrule
 
    // ----------------------------------------------------------------
    // BEHAVIOR
@@ -674,7 +664,6 @@ module mkNear_Mem (Near_Mem_IFC);
       let tok <- pop (f_sfence_vma_reqs);
       icache.tlb_flush;
       dcache.tlb_flush;
-      pw_idec_flush.send;
       f_sfence_vma_rsps.enq (tok);
    endrule
 `endif
@@ -687,7 +676,6 @@ module mkNear_Mem (Near_Mem_IFC);
       interface Put request;
 	 method Action put (Token t) if (rg_state == STATE_READY);
 	    rg_state <= STATE_RESET;
-	    pw_idec_flush.send;
 	 endmethod
       endinterface
 
@@ -712,17 +700,17 @@ module mkNear_Mem (Near_Mem_IFC);
 			  Bit #(1)   sstatus_SUM,
 			  Bit #(1)   mstatus_MXR,
 			  WordXL     satp);    // { VM_Mode, ASID, PPN_for_page_table }
-	 idec.imem.req (f3, addr, priv, sstatus_SUM, mstatus_MXR, satp);
+	 icache.imem.req (f3, addr, priv, sstatus_SUM, mstatus_MXR, satp);
       endmethod
 
       // CPU side: IMem response
-      method Bool     valid          = idec.imem.valid;
-      method Bool     is_i32_not_i16 = idec.imem.is_i32_not_i16;
-      method WordXL   pc             = idec.imem.pc;
-      method Instr    instr          = idec.imem.instr;
-      method Bool     exc            = idec.imem.exc;
-      method Exc_Code exc_code       = idec.imem.exc_code;
-      method WordXL   tval           = idec.imem.tval;
+      method Bool     valid          = icache.imem.valid;
+      method Bool     is_i32_not_i16 = icache.imem.is_i32_not_i16;
+      method WordXL   pc             = icache.imem.pc;
+      method Instr    instr          = icache.imem.instr;
+      method Bool     exc            = icache.imem.exc;
+      method Exc_Code exc_code       = icache.imem.exc_code;
+      method WordXL   tval           = icache.imem.tval;
    endinterface
 
    // Fabric side
@@ -780,7 +768,6 @@ module mkNear_Mem (Near_Mem_IFC);
 	 method Action put (Token t);
 	    icache.server_flush.request.put (?);
 	    dcache.server_flush.request.put (?);
-	    pw_idec_flush.send;
 	 endmethod
       endinterface
       interface Get response;

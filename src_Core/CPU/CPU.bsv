@@ -158,7 +158,8 @@ module mkCPU (CPU_IFC);
 
    // Take imem as is from near_mem, or use wrapper for 'C' extension
 `ifdef ISA_C
-   IMem_IFC imem <- mkCPU_Fetch_C (near_mem.imem);
+   // E20: the I-side (ICache_Pipe) presents 16/32-bit instructions itself.
+   IMem_IFC imem = near_mem.imem;
 `else
    IMem_IFC imem = near_mem.imem;
 `endif
@@ -641,7 +642,6 @@ module mkCPU (CPU_IFC);
    // imem_rl_fetch_next_32b is in CPU_Fetch_C.bsv, and calls imem32.req (near_mem.imem_req).
    // fa_stageF_redirect calls stageF.enq which also calls imem.req which calls imem32.req.
    // But cond_i32_odd_fetch_next should make these rules mutually exclusive; why doesn't bsc realize this?
-   (* descending_urgency = "imem_rl_fetch_next_32b, rl_reset_complete" *)
 `endif
 
    rule rl_reset_complete (rg_state == CPU_RESET2);
@@ -786,7 +786,6 @@ module mkCPU (CPU_IFC);
    // imem_rl_fetch_next_32b is in CPU_Fetch_C.bsv, and calls imem32.req (near_mem.imem_req).
    // fa_stageF_redirect calls stageF.enq which also calls imem.req which calls imem32.req.
    // But cond_i32_odd_fetch_next should make these rules mutually exclusive; why doesn't bsc realize this?
-   (* descending_urgency = "imem_rl_fetch_next_32b, rl_pipe" *)
 `endif
 
    rule rl_pipe (   (rg_state == CPU_RUNNING)
@@ -895,41 +894,10 @@ module mkCPU (CPU_IFC);
 	    stageD.deq;                              stageD_full = False;
 	 end
 
-      // ----------------
-      // Move instruction from StageF to StageD
-      if (   (! stageD_full)
-	  && (stageF.out.ostatus == OSTATUS_PIPE))
-	 begin
-	    stageD.enq (stageF.out.data_to_stageD);  stageD_full = True;
-	    stageF.deq;                              stageF_full = False;
-	 end
-
-      // ----------------
-      // Feed Stage F
-      if (   (! stageF_full)
-	  && (stageF.out.ostatus == OSTATUS_PIPE))
-	 begin
-	    if (! redirect) begin
-	       stageF.enq (stageF.out.data_to_stageD.epoch,
-			   stageF.out.data_to_stageD.pred_pc,
-			   rg_cur_priv,
-			   sstatus_SUM,
-			   mstatus_MXR,
-			   csr_regfile.read_satp);
-	       stageF_full = True;
-	    end
-
-	    train_ras = True;
-	 end
-
-      // E5: single bp_train call site.  RAS part (pc/is_i32/instr) comes
-      // from the instruction leaving stageF when the feed block ran, else a
-      // no-op (instr 0 is neither JAL nor JALR); BTB part is cf_train.
-      if (train_ras || (cf_train.cf_op != CF_None))
-	 stageF.bp_train ((train_ras ? stageF.out.data_to_stageD.pc : 0),
-			  (train_ras ? stageF.out.data_to_stageD.is_i32_not_i16 : True),
-			  (train_ras ? stageF.out.data_to_stageD.instr : 0),
-			  cf_train);
+      // E14: the StageF->StageD move, the fetch feed and RAS training are in
+      // rl_front (below); only BTB training (cf_train) stays here.
+      if (cf_train.cf_op != CF_None)
+	 stageF.bp_train (0, True, 0, cf_train);
 
       // E2: the redirect state change must not depend on the feed block
       // running this cycle (the held-back stage1 instruction can keep the
@@ -940,9 +908,46 @@ module mkCPU (CPU_IFC);
       stage3.set_full (stage3_full);
       stage2.set_full (stage2_full);
       stage1.set_full (stage1_full);    fa_step_check;
-      stageD.set_full (stageD_full);
-      stageF.set_full (stageF_full);
    endrule: rl_pipe
+
+   // ================================================================
+   // E14: front end in its own rule.  Everything in rl_pipe is gated by
+   // WILL_FIRE_rl_pipe, whose guard (pipe_has_nonpipe, stage statuses) and
+   // move chain depend on the dcache response; with the fetch request inside
+   // rl_pipe that put dcache-hit -> imem request / BTB address on the critical
+   // path (E13 seeds 1 and 3, ~22 ns, 80% routing).  rl_front decides from
+   // registers only: rg_state, StageD.can_enq (2-entry FIFO), StageF/imem
+   // status and stage2.out.redirect (rg_full && rg_stage2.redirect).
+   // Suppressing the feed while a redirecting op sits in stage2 matches the
+   // old in-rl_pipe "! redirect" (a redirecting op in stage2 is never BUSY, so
+   // it leaves stage2, and the redirect refills StageF via rl_trap_fetch).
+   // Fetching while a stage1 NONPIPE op (CSRRx, xRET, FENCE*, WFI, trap) is
+   // being handled is safe: each of those flushes StageD and redirects StageF.
+
+   // Urgency: the stage1 NONPIPE rules (stop, trap, BREAK, FENCE*, xRET, WFI,
+   // interrupt) run only with stage1 stalled, so StageD fills within two
+   // cycles and rl_front stops (no starvation); giving them priority would put
+   // stage1/stage2 status back into WILL_FIRE_rl_front.  The attributes sit
+   // on those rules (bsc wants them after both definitions).
+   rule rl_front (   (rg_state == CPU_RUNNING)
+		  && stageD.can_enq
+		  && (stageF.out.ostatus == OSTATUS_PIPE));
+      let d = stageF.out.data_to_stageD;
+      stageD.enq (d);
+      stageF.deq;
+
+      // Feed Stage F (RAS trained from the instruction leaving StageF)
+      if (! stage2.out.redirect)
+	 stageF.enq (d.epoch,
+		     d.pred_pc,
+		     rg_cur_priv,
+		     sstatus_SUM,
+		     mstatus_MXR,
+		     csr_regfile.read_satp);
+      else
+	 stageF.set_full (False);
+      stageF.bp_train_ras (d.pc, d.is_i32_not_i16, d.instr);
+   endrule: rl_front
 
    // ================================================================
    // Stage2: nonpipe special: all stage2 nonpipe behaviors are traps
@@ -980,6 +985,7 @@ module mkCPU (CPU_IFC);
    Bool break_into_Debug_Mode = False;
 `endif
 
+   (* descending_urgency = "rl_front, rl_stage1_trap" *)
    rule rl_stage1_trap (   (rg_state == CPU_RUNNING)
 			&& (! halting)
 			&& (stage3.out.ostatus == OSTATUS_EMPTY)
@@ -1142,6 +1148,8 @@ module mkCPU (CPU_IFC);
 
    // ----------------
 
+   // E13: Stage3 writeback (only fires with Stage3 full; this rule runs with it empty)
+   (* descending_urgency = "stage3_rl_writeback, rl_stage1_CSRR_W_2" *)
    rule rl_stage1_CSRR_W_2 (rg_state == CPU_CSRRW_2);
       if (cur_verbosity > 1) $display ("%0d: %m.rl_stage1_CSRR_W_2", mcycle);
 
@@ -1269,6 +1277,8 @@ module mkCPU (CPU_IFC);
 
    // ----------------
 
+   // E13: Stage3 writeback (only fires with Stage3 full; this rule runs with it empty)
+   (* descending_urgency = "stage3_rl_writeback, rl_stage1_CSRR_S_or_C_2" *)
    rule rl_stage1_CSRR_S_or_C_2 (rg_state == CPU_CSRR_S_or_C_2);
       if (cur_verbosity > 1) $display ("%0d: %m.rl_stage1_CSRR_S_or_C_2", mcycle);
 
@@ -1374,6 +1384,8 @@ module mkCPU (CPU_IFC);
    // ================================================================
    // Stage1: nonpipe special: MRET/SRET/URET
 
+   // E14: the front end may run alongside; these flush StageD (rl_front only fires with StageD not full)
+   (* descending_urgency = "rl_front, rl_stage1_xRET" *)
    rule rl_stage1_xRET (   (rg_state == CPU_RUNNING)
 			&& (! halting)
 			&& (stage3.out.ostatus == OSTATUS_EMPTY)
@@ -1427,6 +1439,7 @@ module mkCPU (CPU_IFC);
    // ================================================================
    // Stage1: nonpipe special: FENCE.I
 
+   (* descending_urgency = "rl_front, rl_stage1_FENCE_I" *)
    rule rl_stage1_FENCE_I (   (rg_state== CPU_RUNNING)
 			   && (! halting)
 			   && (stage3.out.ostatus == OSTATUS_EMPTY)
@@ -1476,6 +1489,7 @@ module mkCPU (CPU_IFC);
    // ================================================================
    // Stage1: nonpipe special: FENCE
 
+   (* descending_urgency = "rl_front, rl_stage1_FENCE" *)
    rule rl_stage1_FENCE (   (rg_state== CPU_RUNNING)
 			 && (! halting)
 			 && (stage3.out.ostatus == OSTATUS_EMPTY)
@@ -1586,6 +1600,8 @@ module mkCPU (CPU_IFC);
 
    Reg #(Bit #(32)) rg_wfi_counter <- mkReg ('h_FFFF_FFFF);
 
+   // E14: the front end may run alongside; these flush StageD (rl_front only fires with StageD not full)
+   (* descending_urgency = "rl_front, rl_stage1_WFI" *)
    rule rl_stage1_WFI (   (rg_state== CPU_RUNNING)
 		       && (! halting)
 		       && (stage3.out.ostatus == OSTATUS_EMPTY)
@@ -1679,6 +1695,7 @@ module mkCPU (CPU_IFC);
    // TODO: Does the spec say anything about this?
 
 `ifdef INCLUDE_GDB_CONTROL
+   (* descending_urgency = "rl_front, rl_trap_BREAK_to_Debug_Mode" *)
    rule rl_trap_BREAK_to_Debug_Mode (   (rg_state == CPU_RUNNING)
 				     && (! halting)
 				     && (stage3.out.ostatus == OSTATUS_EMPTY)
@@ -1742,6 +1759,8 @@ module mkCPU (CPU_IFC);
    // and Stage2 and Stage3 have drained,
    // encapsulated in condition 'stage1_take_interrupt'
 
+   // E14: rl_front first; during halting StageD fills within two cycles and rl_front stops
+   (* descending_urgency = "rl_front, rl_stage1_interrupt" *)
    rule rl_stage1_interrupt (interrupt_pending
 			     && (rg_state == CPU_RUNNING)
 			     && stage1_take_interrupt
@@ -1779,6 +1798,7 @@ module mkCPU (CPU_IFC);
    // and stage2 and stage3 are empty, and stageF is not BUSY.
 
 `ifdef INCLUDE_GDB_CONTROL
+   (* descending_urgency = "rl_front, rl_stage1_stop" *)
    rule rl_stage1_stop (   (rg_state== CPU_RUNNING)
 			&& stage1_stop
 			&& (stageF.out.ostatus != OSTATUS_BUSY));
@@ -1853,6 +1873,45 @@ module mkCPU (CPU_IFC);
       end
    endrule
 
+   // E19: the debug-reset and debug-halt rules write rg_state / rg_stop_req, so they conflict
+   // with most pipeline-control rules; bsc's arbitrary urgency put them in the MIDDLE (below
+   // stage2_nonpipe / CSRR_W / trap..., above stage1_trap / xRET / stop / CSRR_W_2...), which
+   // chained dcache / stage status through !WILL_FIRE_rl_reset_from_Debug_Module into the
+   // CSR write enables (mav_csr_write) and the stage1 trap rules.  Most urgent instead: the
+   // others see only their CAN_FIRE (f_reset_reqs / f_run_halt_reqs flags, rg_state).
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_BREAK_cache_flush_finish" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_finish_FENCE_I" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_finish_FENCE" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_debug_run" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_pipe" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_reset_complete" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_CSRR_S_or_C_2" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_CSRR_W_2" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_FENCE_I" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_FENCE" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_interrupt" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_stop" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_trap" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_WFI" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_xRET" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_trap_BREAK_to_Debug_Mode" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_reset_from_WFI" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_CSRR_S_or_C" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_CSRR_W" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_restart_after_csrrx" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage2_nonpipe" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_trap_fetch" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_trap" *)
+   (* descending_urgency = "rl_debug_halt, rl_stage1_FENCE_I" *)
+   (* descending_urgency = "rl_debug_halt, rl_stage1_FENCE" *)
+   (* descending_urgency = "rl_debug_halt, rl_stage1_stop" *)
+   (* descending_urgency = "rl_debug_halt, rl_stage1_trap" *)
+   (* descending_urgency = "rl_debug_halt, rl_stage1_WFI" *)
+   (* descending_urgency = "rl_debug_halt, rl_stage1_xRET" *)
+   (* descending_urgency = "rl_debug_halt, rl_trap_BREAK_to_Debug_Mode" *)
+   (* descending_urgency = "rl_debug_halt, rl_stage1_CSRR_S_or_C" *)
+   (* descending_urgency = "rl_debug_halt, rl_stage1_CSRR_W" *)
+   (* descending_urgency = "rl_debug_halt, rl_WFI_resume" *)
    (* descending_urgency = "rl_debug_halt, rl_pipe" *)
    rule rl_debug_halt ((f_run_halt_reqs.first == False) && fn_is_running (rg_state));
       f_run_halt_reqs.deq;
@@ -1898,6 +1957,8 @@ module mkCPU (CPU_IFC);
       end
    endrule
 
+   // E13: Stage3 writeback (only fires with Stage3 full; this rule runs with it empty)
+   (* descending_urgency = "stage3_rl_writeback, rl_debug_write_gpr" *)
    rule rl_debug_write_gpr ((rg_state == CPU_DEBUG_MODE) && f_gpr_reqs.first.write);
       let req <- pop (f_gpr_reqs);
       Bit #(5) regname = req.address;

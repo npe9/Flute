@@ -84,6 +84,20 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
    Vector #(tn_num_slaves,  AXI4_Master_Xactor_IFC #(wd_id, wd_addr, wd_data, wd_user))
        xactors_to_slaves <- replicateM (mkAXI4_Master_Xactor);
 
+   // E18: registered address decode.  Each master's AW/AR head is decoded into
+   // (request, legal, slave_num) by rl_wr_route / rl_rd_route; the routing rules and
+   // their arbitration see only registered route bits (was: address-range compares on
+   // the transactor head, in series with arbitration and the book-keeping FIFO enqs).
+   // +1 cycle per AW/AR hop; full throughput (2-entry FIFOs).
+   Vector #(tn_num_masters,
+	    FIFOF #(Tuple3 #(AXI4_Wr_Addr #(wd_id, wd_addr, wd_user),
+			     Bool,
+			     Bit #(TLog #(tn_num_slaves))))) v_f_wr_route <- replicateM (mkFIFOF);
+   Vector #(tn_num_masters,
+	    FIFOF #(Tuple3 #(AXI4_Rd_Addr #(wd_id, wd_addr, wd_user),
+			     Bool,
+			     Bit #(TLog #(tn_num_slaves))))) v_f_rd_route <- replicateM (mkFIFOF);
+
    // ----------------------------------------------------------------
    // Book-keeping FIFOs and regs
    // - to keep track of which master originated a transaction, in order
@@ -155,6 +169,8 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
       end
       for (Integer mi = 0; mi < num_masters; mi = mi + 1) begin
 	 xactors_from_masters [mi].reset;
+	 v_f_wr_route [mi].clear;
+	 v_f_rd_route [mi].clear;
 
 	 v_f_wr_sjs [mi].clear;
 	 v_f_wd_tasks [mi].clear;
@@ -187,32 +203,43 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
    // Predicates to check if master I has transaction for slave J
 
    function Bool fv_mi_has_wr_for_sj (Integer mi, Integer sj);
-      let addr = xactors_from_masters [mi].o_wr_addr.first.awaddr;
-      match { .legal, .slave_num } = fn_addr_to_slave_num (addr);
+      match { ._, .legal, .slave_num } = v_f_wr_route [mi].first;
       return (legal
 	      && (   (num_slaves == 1)
 		  || (slave_num == fromInteger (sj))));
    endfunction
 
    function Bool fv_mi_has_wr_for_none (Integer mi);
-      let addr = xactors_from_masters [mi].o_wr_addr.first.awaddr;
-      match { .legal, ._ } = fn_addr_to_slave_num (addr);
+      match { ._, .legal, ._ } = v_f_wr_route [mi].first;
       return (! legal);
    endfunction
 
    function Bool fv_mi_has_rd_for_sj (Integer mi, Integer sj);
-      let addr = xactors_from_masters [mi].o_rd_addr.first.araddr;
-      match { .legal, .slave_num } = fn_addr_to_slave_num (addr);
+      match { ._, .legal, .slave_num } = v_f_rd_route [mi].first;
       return (legal
 	      && (   (num_slaves == 1)
 		  || (slave_num == fromInteger (sj))));
    endfunction
 
    function Bool fv_mi_has_rd_for_none (Integer mi);
-      let addr = xactors_from_masters [mi].o_rd_addr.first.araddr;
-      match { .legal, ._ } = fn_addr_to_slave_num (addr);
+      match { ._, .legal, ._ } = v_f_rd_route [mi].first;
       return (! legal);
    endfunction
+
+   // E18: decode stage
+   for (Integer mi = 0; mi < num_masters; mi = mi + 1) begin
+      rule rl_wr_route;
+	 AXI4_Wr_Addr #(wd_id, wd_addr, wd_user) a <- pop_o (xactors_from_masters [mi].o_wr_addr);
+	 match { .legal, .slave_num } = fn_addr_to_slave_num (a.awaddr);
+	 v_f_wr_route [mi].enq (tuple3 (a, legal, slave_num));
+      endrule
+
+      rule rl_rd_route;
+	 AXI4_Rd_Addr #(wd_id, wd_addr, wd_user) a <- pop_o (xactors_from_masters [mi].o_rd_addr);
+	 match { .legal, .slave_num } = fn_addr_to_slave_num (a.araddr);
+	 v_f_rd_route [mi].enq (tuple3 (a, legal, slave_num));
+      endrule
+   end
 
    // ================================================================
    // Wr requests (AW, W and B channels)
@@ -223,7 +250,7 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
 
 	 rule rl_wr_xaction_master_to_slave (fv_mi_has_wr_for_sj (mi, sj));
 	    // Move the AW transaction
-	    AXI4_Wr_Addr #(wd_id, wd_addr, wd_user) a <- pop_o (xactors_from_masters [mi].o_wr_addr);
+	    match { .a, ._, ._ } = v_f_wr_route [mi].first;  v_f_wr_route [mi].deq;
 	    xactors_to_slaves [sj].i_wr_addr.enq (a);
 
 	    // Enqueue a task for the W channel
@@ -243,7 +270,7 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
    // Wr requests to non-existent slave (AW channel)
    for (Integer mi = 0; mi < num_masters; mi = mi + 1)
 	 rule rl_wr_xaction_no_such_slave (fv_mi_has_wr_for_none (mi));
-	    AXI4_Wr_Addr #(wd_id, wd_addr, wd_user) a <- pop_o (xactors_from_masters [mi].o_wr_addr);
+	    match { .a, ._, ._ } = v_f_wr_route [mi].first;  v_f_wr_route [mi].deq;
 
 	    // Special value 'num_slaves' (not a legal sj) means "no such slave"
 	    v_f_wr_sjs        [mi].enq (fromInteger (num_slaves));
@@ -357,7 +384,7 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
       for (Integer sj = 0; sj < num_slaves; sj = sj + 1)
 
 	 rule rl_rd_xaction_master_to_slave (fv_mi_has_rd_for_sj (mi, sj));
-	    AXI4_Rd_Addr #(wd_id, wd_addr, wd_user) a <- pop_o (xactors_from_masters [mi].o_rd_addr);
+	    match { .a, ._, ._ } = v_f_rd_route [mi].first;  v_f_rd_route [mi].deq;
 
 	    xactors_to_slaves [sj].i_rd_addr.enq (a);
 
@@ -375,7 +402,7 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
    // Rd requests to non-existent slave (AR channel)
    for (Integer mi = 0; mi < num_masters; mi = mi + 1)
 	 rule rl_rd_xaction_no_such_slave (fv_mi_has_rd_for_none (mi));
-	    AXI4_Rd_Addr #(wd_id, wd_addr, wd_user) a <- pop_o (xactors_from_masters [mi].o_rd_addr);
+	    match { .a, ._, ._ } = v_f_rd_route [mi].first;  v_f_rd_route [mi].deq;
 
 	    v_f_rd_sjs      [mi].enq (fromInteger (num_slaves));
 	    v_f_rd_err_info [mi].enq (tuple4 (a.arlen, a.arid, a.aruser, a.araddr));

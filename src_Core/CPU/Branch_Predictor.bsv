@@ -350,7 +350,14 @@ module mkBranch_Predictor (Branch_Predictor_IFC);
 	 fsm_val = 2'b11;    // strong taken
 	 pred_PC = cf_info.taken_PC;
       end
-      if (pred_PC != bogus_PC) begin
+      // E15: write enable from cf_op (a FIFO register), not from comparing the
+      // muxed pred_PC against bogus_PC: every BR/JAL/JALR arm above sets a real
+      // (even) PC, so the two are equivalent and the 32-bit compare after the
+      // fsm read and case mux leaves the BTB write-enable path.
+      Bool do_write = (   (cf_info.cf_op == CF_BR)
+		       || (cf_info.cf_op == CF_JAL)
+		       || (cf_info.cf_op == CF_JALR));
+      if (do_write) begin
 	 rf_btb_fsms.upd (index_b, fsm_val);
 	 let btb_entry = BTB_Entry {valid:        True,
 				    pc_tag:       fn_pc_to_tag (cf_info.from_PC),

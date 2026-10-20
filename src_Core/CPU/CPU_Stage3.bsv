@@ -86,8 +86,10 @@ module mkCPU_Stage3 #(Bit #(4)         verbosity,
    FIFOF #(Token) f_reset_reqs <- mkFIFOF;
    FIFOF #(Token) f_reset_rsps <- mkFIFOF;
 
-   Reg #(Bool)                  rg_full   <- mkReg (False);
-   Reg #(Data_Stage2_to_Stage3) rg_stage3 <- mkRegU;    // From Stage 2
+   // E13: ConfigRegs so rl_writeback (which reads them) can be scheduled
+   // after rl_pipe (which reads the GPRs and rewrites these on enq/set_full).
+   Reg #(Bool)                  rg_full   <- mkConfigReg (False);
+   Reg #(Data_Stage2_to_Stage3) rg_stage3 <- mkConfigRegU;    // From Stage 2
 
    // ----------------------------------------------------------------
    // BEHAVIOR
@@ -163,43 +165,56 @@ module mkCPU_Stage3 #(Bit #(4)         verbosity,
    // ----------------
    // Actions on 'deq': writeback Rd and update CSR INSTRET
 
+   // E13: the regfile write is driven only by Stage3's own registers, not by
+   // rl_pipe firing.  Before, write_rd sat in fa_deq, so the GPR LUTRAM write
+   // enables (spread across the die) waited on the whole pipe-advance decision
+   // (dcache hit -> stage2 status -> rl_pipe fire): a 22 ns, 77%-routing path.
+   // Re-writing the same rd/value on a stalled cycle is idempotent, and a Stage3
+   // op is never squashed (every flush path requires Stage3 EMPTY or drained),
+   // so writing while full is equivalent to writing at deq.  Readers see the
+   // value via the Stage3 bypass in either case.
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_writeback (rg_full && rg_stage3.rd_valid);
+`ifdef ISA_F
+         // Write to FPR
+         if (rg_stage3.rd_in_fpr)
+            fpr_regfile.write_rd (rg_stage3.rd, rg_stage3.frd_val);
+
+         else
+            // Write to GPR
+            gpr_regfile.write_rd (rg_stage3.rd, rg_stage3.rd_val);
+`else
+         // Write to GPR in a non-FD system
+         gpr_regfile.write_rd (rg_stage3.rd, rg_stage3.rd_val);
+`endif
+
+      if (verbosity > 1)
+`ifdef ISA_F
+            if (rg_stage3.rd_in_fpr)
+               $display ("    S3.fa_deq: write FRd 0x%0h, rd_val 0x%0h",
+                         rg_stage3.rd, rg_stage3.frd_val);
+            else
+`endif
+               $display ("    S3.fa_deq: write GRd 0x%0h, rd_val 0x%0h",
+                         rg_stage3.rd, rg_stage3.rd_val);
+
+`ifdef ISA_F
+         // Update FCSR.fflags
+         if (rg_stage3.upd_flags)
+            csr_regfile.ma_update_fcsr_fflags (rg_stage3.fpr_flags);
+
+         // Update MSTATUS.FS
+         if (rg_stage3.upd_flags || rg_stage3.rd_in_fpr)
+            csr_regfile.ma_update_mstatus_fs (fs_xs_dirty);
+`endif
+   endrule
+
+   // ----------------
+   // Actions on 'deq' (writeback moved to rl_writeback, E13)
+
    function Action fa_deq;
       action
-	 // Writeback Rd if valid
-	 if (rg_stage3.rd_valid) begin
-`ifdef ISA_F
-            // Write to FPR
-            if (rg_stage3.rd_in_fpr)
-               fpr_regfile.write_rd (rg_stage3.rd, rg_stage3.frd_val);
-
-            else
-               // Write to GPR
-               gpr_regfile.write_rd (rg_stage3.rd, rg_stage3.rd_val);
-`else
-            // Write to GPR in a non-FD system
-            gpr_regfile.write_rd (rg_stage3.rd, rg_stage3.rd_val);
-`endif
-
-	    if (verbosity > 1)
-`ifdef ISA_F
-               if (rg_stage3.rd_in_fpr)
-                  $display ("    S3.fa_deq: write FRd 0x%0h, rd_val 0x%0h",
-                            rg_stage3.rd, rg_stage3.frd_val);
-               else
-`endif
-                  $display ("    S3.fa_deq: write GRd 0x%0h, rd_val 0x%0h",
-                            rg_stage3.rd, rg_stage3.rd_val);
-
-`ifdef ISA_F
-            // Update FCSR.fflags
-            if (rg_stage3.upd_flags)
-               csr_regfile.ma_update_fcsr_fflags (rg_stage3.fpr_flags);
-
-            // Update MSTATUS.FS
-            if (rg_stage3.upd_flags || rg_stage3.rd_in_fpr)
-               csr_regfile.ma_update_mstatus_fs (fs_xs_dirty);
-`endif
-	 end
+	 noAction;
       endaction
    endfunction
 

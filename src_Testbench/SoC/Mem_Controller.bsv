@@ -232,6 +232,12 @@ typedef struct {Req_Op                     req_op;
 		// Write data info
 		Bit #(TDiv #(Wd_Data, 8))  wstrb;
 		Fabric_Data                data;
+
+		// E15: computed when the request is merged (registered in f_reqs),
+		// not from f_reqs.first in every rule guard (addr - base subtract and
+		// the range compares were a 22 ns critical path)
+		Bool                       addr_ok;
+		Raw_Mem_Addr               raw_addr;
    } Req
 deriving (Bits, FShow);
 
@@ -247,8 +253,9 @@ module mkMem_Controller (Mem_Controller_IFC);
    Reg #(Bit #(4)) cfg_verbosity <- mkConfigReg (0);
 
    Reg #(State)       rg_state     <- mkReg (STATE_POWER_ON_RESET);
-   Reg #(Fabric_Addr) rg_addr_base <- mkRegU;
-   Reg #(Fabric_Addr) rg_addr_lim  <- mkRegU;
+   // E15: ConfigRegs: the merge rules read these (set once by set_addr_map at init)
+   Reg #(Fabric_Addr) rg_addr_base <- mkConfigRegU;
+   Reg #(Fabric_Addr) rg_addr_lim  <- mkConfigRegU;
 
    FIFOF #(Bit #(0)) f_reset_reqs <- mkFIFOF;
    FIFOF #(Bit #(0)) f_reset_rsps <- mkFIFOF;
@@ -344,7 +351,9 @@ module mkMem_Controller (Mem_Controller_IFC);
 		     region:     rda.arregion,
 		     user:       rda.aruser,
 		     wstrb:      ?,
-		     data:       ?};
+		     data:       ?,
+		     addr_ok:    fn_addr_is_ok (rg_addr_base, rda.araddr, rg_addr_lim, rda.arsize),
+		     raw_addr:   fn_addr_to_raw_mem_addr (rda.araddr - rg_addr_base)};
       f_reqs.enq (req);
 
       if (cfg_verbosity > 2) begin
@@ -370,7 +379,9 @@ module mkMem_Controller (Mem_Controller_IFC);
 		     region:     wra.awregion,
 		     user:       wra.awuser,
 		     wstrb:      wrd.wstrb,
-		     data:       wrd.wdata};
+		     data:       wrd.wdata,
+		     addr_ok:    fn_addr_is_ok (rg_addr_base, wra.awaddr, rg_addr_lim, wra.awsize),
+		     raw_addr:   fn_addr_to_raw_mem_addr (wra.awaddr - rg_addr_base)};
       f_reqs.enq (req);
 
       if (cfg_verbosity > 2) begin
@@ -383,8 +394,7 @@ module mkMem_Controller (Mem_Controller_IFC);
    // ----------------------------------------------------------------
    // Handle request from fabric
 
-   let req_byte_offset  = f_reqs.first.addr - rg_addr_base;    // within this memory unit
-   let req_raw_mem_addr = fn_addr_to_raw_mem_addr (req_byte_offset);
+   let req_raw_mem_addr = f_reqs.first.raw_addr;    // E15: precomputed at merge
 
    // ----------------
    // This rule fires when there's no fabric req and the cached raw_mem_word is dirty;
@@ -410,7 +420,7 @@ module mkMem_Controller (Mem_Controller_IFC);
    // it writes back the dirty raw_mem_word; the cached raw_mem_word becomes clean
 
    rule rl_writeback_dirty (   (rg_state == STATE_READY)
-			    && fn_addr_is_ok (rg_addr_base, f_reqs.first.addr, rg_addr_lim, f_reqs.first.size)
+			    && f_reqs.first.addr_ok
 			    && (rg_cached_raw_mem_addr != req_raw_mem_addr)
 			    && (! rg_cached_clean));
       let raw_mem_req = MemoryRequest {write:   True,
@@ -430,7 +440,7 @@ module mkMem_Controller (Mem_Controller_IFC);
    // by reloading from memory; the new cached raw_mem_word is clean.
 
    rule rl_miss_clean_req (   (rg_state == STATE_READY)
-			   && fn_addr_is_ok (rg_addr_base, f_reqs.first.addr, rg_addr_lim, f_reqs.first.size)
+			   && f_reqs.first.addr_ok
 			   && (rg_cached_raw_mem_addr != req_raw_mem_addr)
 			   && rg_cached_clean);
       let raw_mem_req = MemoryRequest {write:   False,
@@ -466,7 +476,7 @@ module mkMem_Controller (Mem_Controller_IFC);
    // i.e., we do not extract relevant bytes here, leaving that to the requestor.
 
    rule rl_process_rd_req  (   (rg_state == STATE_READY)
-			    && fn_addr_is_ok (rg_addr_base, f_reqs.first.addr, rg_addr_lim, f_reqs.first.size)
+			    && f_reqs.first.addr_ok
 			    && (rg_cached_raw_mem_addr == req_raw_mem_addr)
 			    && (f_reqs.first.req_op == REQ_OP_RD));
 
@@ -505,7 +515,7 @@ module mkMem_Controller (Mem_Controller_IFC);
    // same addr ('hit'), whether clean or dirty.
 
    rule rl_process_wr_req  (   (rg_state == STATE_READY)
-			    && fn_addr_is_ok (rg_addr_base, f_reqs.first.addr, rg_addr_lim, f_reqs.first.size)
+			    && f_reqs.first.addr_ok
 			    && (rg_cached_raw_mem_addr == req_raw_mem_addr)
 			    && (f_reqs.first.req_op == REQ_OP_WR));
       // Get the old (cached) value of the word64
@@ -596,7 +606,7 @@ module mkMem_Controller (Mem_Controller_IFC);
    // Invalid address
 
    rule rl_invalid_rd_address (   (rg_state == STATE_READY)
-			       && (! fn_addr_is_ok (rg_addr_base, f_reqs.first.addr, rg_addr_lim, f_reqs.first.size))
+			       && (! f_reqs.first.addr_ok)
 			       && (f_reqs.first.req_op == REQ_OP_RD));
       Fabric_Data rdata = zeroExtend (f_reqs.first.addr);
       let rdr = AXI4_Rd_Data {rid:   f_reqs.first.id,
@@ -618,7 +628,7 @@ module mkMem_Controller (Mem_Controller_IFC);
    endrule
 
    rule rl_invalid_wr_address (   (rg_state == STATE_READY)
-			       && (! fn_addr_is_ok (rg_addr_base, f_reqs.first.addr, rg_addr_lim, f_reqs.first.size))
+			       && (! f_reqs.first.addr_ok)
 			       && (f_reqs.first.req_op == REQ_OP_WR));
       let wrr = AXI4_Wr_Resp {bid:   f_reqs.first.id,
 			      bresp: axi4_resp_slverr,

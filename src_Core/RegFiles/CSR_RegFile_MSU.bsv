@@ -372,7 +372,11 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 
    PMP_IFC pmp <- mkPMP;
 `ifdef ISA_ZKR
-   Entropy_Source_IFC entropy <- mkEntropy_Source_Wait;
+`ifdef RVFI
+   Entropy_Source_IFC entropy <- mkEntropy_Source_Wait;   // formal: value unconstrained by the checks; no RO_TRNG.v in verilog_cpu.v
+`else
+   Entropy_Source_IFC entropy <- mkEntropy_Source_RO;
+`endif
 `endif
    // RegFile #(Bit #(2), WordXL)  rf_pmpcfg   <- mkRegFileFull;
    // Vector #(16, Reg #(WordXL))  vrg_pmpaddr <- replicateM (mkRegU);

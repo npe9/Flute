@@ -1238,8 +1238,11 @@ function ALU_Outputs fv_ALU (ALU_Inputs inputs);
 
    else if (   fp_insts_are_legal
 	    && rm_is_legal
+	    // the encoding's funct3, not the DYN-resolved rm: funct3 selects FSGNJ*/FMIN/FMAX/FEQ/FLT/FLE/
+	    // FCLASS/FMV, so e.g. FSGNJ.S with funct3 = 111 is reserved whatever frm holds
+	    // (was: rm, so frm = 0 made it FSGNJ.S; found by riscv-formal-fp legal_ch0)
 	    && fv_is_fp_instr_legal (inputs.decoded_instr.funct7,
-				     rm,
+				     inputs.decoded_instr.funct3,
 				     inputs.decoded_instr.rs2,
 				     inputs.decoded_instr.opcode))
       alu_outputs = fv_FP (inputs, rm);

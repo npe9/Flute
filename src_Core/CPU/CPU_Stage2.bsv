@@ -68,6 +68,10 @@ import Shifter_Box  :: *;
 import RISCV_MBox  :: *;
 `endif
 
+`ifdef ISA_XBOX
+import RISCV_XBox  :: *;
+`endif
+
 `ifdef ISA_F
 import FBox_Top    :: *;
 import FBox_Core   :: *;   // For fv_nanbox function
@@ -163,6 +167,13 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 
 `ifdef ISA_M
    RISCV_MBox_IFC mbox <- mkRISCV_MBox;
+`endif
+
+   // ----------------
+   // Bitmanip / scalar-crypto box
+
+`ifdef ISA_XBOX
+   RISCV_XBox_IFC xbox <- mkRISCV_XBox;
 `endif
 
    // ----------------
@@ -341,9 +352,35 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 	    data_to_stage3.rvfi_mem_rdata = fn_rvfi_lanes (funct3, rg_stage2.addr [1:0], result);
 `ifdef ISA_A
 	    if (rg_stage2.op_stage2 == OP_Stage2_AMO) begin
-	       // approximation: rs2 value, not the AMO result (no riscv-formal AMO checks)
-	       data_to_stage3.rvfi_mem_wmask = fn_rvfi_mask  (funct3, rg_stage2.addr [1:0]);
-	       data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (funct3, rg_stage2.addr [1:0], rg_stage2.val2);
+	       // RVFI per the Sail model (riscv_insts_aext.sail) and the RVFI spec:
+	       // LR reads only; SC writes rs2 iff it succeeds (dcache returns 0) and reads
+	       // nothing; other AMOs read and write the op(old, rs2) result.
+	       Bit #(5) f5 = rg_stage2.instr [31:27];
+	       if (f5 == f5_AMO_SC) begin
+		  data_to_stage3.rvfi_mem_rmask = 0;
+		  data_to_stage3.rvfi_mem_rdata = 0;
+		  if (result == 0) begin
+		     data_to_stage3.rvfi_mem_wmask = fn_rvfi_mask  (funct3, rg_stage2.addr [1:0]);
+		     data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (funct3, rg_stage2.addr [1:0], rg_stage2.val2);
+		  end
+	       end
+	       else if (f5 != f5_AMO_LR) begin
+		  WordXL old = result;
+		  WordXL v2  = rg_stage2.val2;
+		  WordXL amo = case (f5)
+				  f5_AMO_SWAP: v2;
+				  f5_AMO_ADD:  old + v2;
+				  f5_AMO_XOR:  old ^ v2;
+				  f5_AMO_AND:  old & v2;
+				  f5_AMO_OR:   old | v2;
+				  f5_AMO_MIN:  ((signedLT (old, v2)) ? old : v2);
+				  f5_AMO_MAX:  ((signedLT (old, v2)) ? v2 : old);
+				  f5_AMO_MINU: ((old < v2) ? old : v2);
+				  default:     ((old < v2) ? v2 : old);    // MAXU
+			       endcase;
+		  data_to_stage3.rvfi_mem_wmask = fn_rvfi_mask  (funct3, rg_stage2.addr [1:0]);
+		  data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (funct3, rg_stage2.addr [1:0], amo);
+	       end
 	    end
 `endif
 `endif
@@ -493,6 +530,38 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 
 	 // Option 2: shorter critical path: data not bypassed to previous stage
 	 // bypass.bypass_state = BYPASS_RD;
+
+`ifdef INCLUDE_TANDEM_VERIF
+	 let trace_data            = rg_stage2.trace_data;
+	 trace_data.word1          = result;
+	 data_to_stage3.trace_data = trace_data;
+`endif
+
+	 output_stage2 = Output_Stage2 {ostatus         : ostatus,
+					trap_info       : ?,
+					data_to_stage3  : data_to_stage3,
+					bypass          : bypass
+`ifdef ISA_F
+					, fbypass         : no_fbypass
+`endif
+					};
+      end
+`endif
+
+`ifdef ISA_XBOX
+      // ----------------
+      // Path: bitmanip / scalar crypto (same contract as the MBox path)
+      else if (rg_stage2.op_stage2 == OP_Stage2_X) begin
+	 let ostatus = ((! xbox.valid) ? OSTATUS_BUSY : OSTATUS_PIPE);
+	 let result  = xbox.word;
+
+	 let data_to_stage3 = data_to_stage3_base;
+	 data_to_stage3.rd_valid = (ostatus == OSTATUS_PIPE);
+	 data_to_stage3.rd_val   = result;
+
+	 let bypass = bypass_base;
+	 bypass.bypass_state = ((ostatus == OSTATUS_PIPE) ? BYPASS_RD_RDVAL : BYPASS_RD);
+	 bypass.rd_val       = result;
 
 `ifdef INCLUDE_TANDEM_VERIF
 	 let trace_data            = rg_stage2.trace_data;
@@ -663,6 +732,11 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 	    Bool is_OP_not_OP_32 = (x.instr [3] == 1'b0);
             mbox.req (is_OP_not_OP_32, funct3, x.val1, x.val2);
 	 end
+`endif
+
+`ifdef ISA_XBOX
+	 else if (x.op_stage2 == OP_Stage2_X)
+	    xbox.req (x.instr, x.val1, x.val2);
 `endif
 
 `ifdef ISA_F

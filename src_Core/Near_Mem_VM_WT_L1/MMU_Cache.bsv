@@ -64,6 +64,7 @@ import ISA_Decls        :: *;
 import Near_Mem_IFC     :: *;
 import MMU_Cache_Common :: *;
 import Cache_Decls      :: *;
+import PMP              :: *;
 
 `ifdef ISA_PRIV_S
 import TLB :: *;
@@ -170,6 +171,10 @@ interface MMU_Cache_IFC;
 
    method Bool mv_perf_miss;
 
+   // PMP table (registered here; see PMP.bsv for the update latency)
+   (* always_ready, always_enabled *)
+   method Action ma_pmp (PMP_Table t);
+
 endinterface
 
 // ****************************************************************
@@ -210,6 +215,7 @@ typedef enum {MODULE_PRERESET,              // After power on reset, before soft
               CACHE_ST_AMO_RSP,             // Provide ST/SC/AMO response
 
               IO_REQ,                       // For memory-mapped I/O requests
+              IO_AWAITING_WRITE_RSP,        // IO store: complete only after the fabric's B response
               IO_AWAITING_READ_RSP,         // No caching
               IO_READ_RSP,                  // Provide IO-read response
 
@@ -546,6 +552,9 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // Phys addr (initially taken from rg_addr; VM xlation may replace it)
    Reg #(PA)  rg_pa <- mkRegU;
 
+   // PMP: table from the CSR file (checks: probe, PTW)
+   Reg #(PMP_Table) rg_pmp <- mkReg (unpack (0));
+
 `ifdef ISA_PRIV_S
    // Derivations from rg_addr (virtual addr)
    VA      va     = fn_WordXL_to_VA (rg_addr);
@@ -797,6 +806,11 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 `endif
 
    Exc_Code access_exc_code     = fn_access_exc_code     (dmem_not_imem, ((rg_op == CACHE_LD) || is_AMO_LR));
+
+   PMP_Acc pmp_acc = ((! dmem_not_imem)                    ? PMP_X
+		      : (((rg_op == CACHE_LD) || is_AMO_LR) ? PMP_R
+		      : (((rg_op == CACHE_ST) || is_AMO_SC) ? PMP_W
+		      :                                       PMP_RW)));
 
 `ifdef ISA_PRIV_S
    Exc_Code page_fault_exc_code = fn_page_fault_exc_code (dmem_not_imem, ((rg_op == CACHE_LD) || is_AMO_LR));
@@ -1101,8 +1115,24 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	 rg_pa <= vm_xlate_result.pa;
 	 let is_mem_addr = soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (vm_xlate_result.pa));
 
+	 // PMP (Sail pmpCheck on the translated PA): access fault, nothing reaches the fabric
+	 // (and PA[33:32] == 0: the fabric is 32-bit, a higher PPN would alias into SDRAM)
+	 // SC without a matching reservation fails (rd = 1) with no access: Sail checks the
+	 // reservation before the PMP / PMA / bus, so no access fault for it (IO SCs always fail).
+	 if (is_AMO_SC && ((! rg_lrsc_valid) || (rg_lrsc_pa != vm_xlate_result.pa))) begin
+	    rg_lrsc_valid <= False;
+	    fa_drive_mem_rsp (rg_f3, rg_addr, 1, 0);
+	    if (cfg_verbosity > 1)
+	       $display ("        AMO SC: fail (no matching reservation), no access");
+	 end
+
+	 else if (((vm_xlate_result.pa >> 32) != 0) || (! fv_pmp_ok (rg_pmp, fv_pa_page (vm_xlate_result.pa), rg_priv, pmp_acc))) begin
+	    rg_state    <= MODULE_EXCEPTION_RSP;
+	    rg_exc_code <= access_exc_code;
+	 end
+
 	 // Access to non-memory
-	 if (dmem_not_imem && (! is_mem_addr)) begin
+	 else if (dmem_not_imem && (! is_mem_addr)) begin
 	    // IO requests
 	    rg_state <= IO_REQ;
 
@@ -1295,10 +1325,17 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       PA           lev_1_pte_pa        = satp_pa + vpn_1_pa;
       PA           lev_1_pte_pa_w64    = { lev_1_pte_pa [pa_sz - 1 : 3], 3'b0 };    // 64b-aligned addr
       Fabric_Addr  lev_1_pte_pa_w64_fa = fn_PA_to_Fabric_Addr (lev_1_pte_pa_w64);
-      fa_fabric_send_read_req (lev_1_pte_pa_w64_fa, axsize_4);
-
-      rg_pte_pa <= lev_1_pte_pa;
-      rg_state  <= PTW_LEVEL_1;
+      // PMP on the implicit PTE read (Sail: checked as an S-mode read; fault is an
+      // access fault of the original access type)
+      if (((lev_1_pte_pa >> 32) != 0) || (! fv_pmp_ok (rg_pmp, fv_pa_page (lev_1_pte_pa), s_Priv_Mode, PMP_R))) begin
+	 rg_exc_code <= access_exc_code;
+	 rg_state    <= MODULE_EXCEPTION_RSP;
+      end
+      else begin
+	 fa_fabric_send_read_req (lev_1_pte_pa_w64_fa, axsize_4);
+	 rg_pte_pa <= lev_1_pte_pa;
+	 rg_state  <= PTW_LEVEL_1;
+      end
 `elsif SV39    // ifdef RV32
 
       // RV64.Sv39: Page Table top is at Level 2
@@ -1466,10 +1503,15 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 `else
 	 AXI4_Size    axi4_size           = axsize_8;
 `endif
-	 fa_fabric_send_read_req (lev_0_pte_pa_w64_fa, axi4_size);
-
-	 rg_pte_pa <= lev_0_pte_pa;
-	 rg_state  <= PTW_LEVEL_0;
+	 if (((lev_0_pte_pa >> 32) != 0) || (! fv_pmp_ok (rg_pmp, fv_pa_page (lev_0_pte_pa), s_Priv_Mode, PMP_R))) begin
+	    rg_exc_code <= access_exc_code;
+	    rg_state    <= MODULE_EXCEPTION_RSP;
+	 end
+	 else begin
+	    fa_fabric_send_read_req (lev_0_pte_pa_w64_fa, axi4_size);
+	    rg_pte_pa <= lev_0_pte_pa;
+	    rg_state  <= PTW_LEVEL_0;
+	 end
 
       end
 
@@ -1963,10 +2005,21 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
       fa_fabric_send_write_req (rg_f3, rg_pa, rg_st_amo_val);
 
-      rg_state <= CACHE_ST_AMO_RSP;
+      // Non-posted MMIO store: the store completes only when its write response is back, so a
+      // later instruction (a CSR write enabling an interrupt, say) sees the device updated.
+      // OpenSBI's set_timer writes mtimecmp then sets mie.MTIE: with a posted store the old,
+      // expired mtimecmp raises MTIP first and every reprogram re-fires the timer.
+      rg_state <= IO_AWAITING_WRITE_RSP;
 
       if (cfg_verbosity > 1)
-	 $display ("    => rl_ST_AMO_response");
+	 $display ("    => IO_AWAITING_WRITE_RSP");
+   endrule
+
+   // All writes acknowledged (rl_discard_write_rsp counts them down, in order)
+   rule rl_io_write_rsp ((rg_state == IO_AWAITING_WRITE_RSP) && (ctr_wr_rsps_pending.value == 0));
+      rg_state <= CACHE_ST_AMO_RSP;
+      if (cfg_verbosity > 1)
+	 $display ("%0d: %s: rl_io_write_rsp => rl_ST_AMO_response", cur_cycle, d_or_i);
    endrule
 
    // ----------------------------------------------------------------
@@ -2168,7 +2221,10 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       if (! fn_is_aligned (f3, addr)) begin
 	 // We detect misaligned accesses and trap on them
 	 rg_state    <= MODULE_EXCEPTION_RSP;
-	 rg_exc_code <= ((op == CACHE_LD) ? exc_code_LOAD_ADDR_MISALIGNED : exc_code_STORE_AMO_ADDR_MISALIGNED);
+	 // LR is a load: misaligned LR raises LOAD_ADDR_MISALIGNED (Sail, Spike), the same
+	 // load/store split the access- and page-fault codes already use (is_AMO_LR).
+	 Bool is_lr = ((op == CACHE_AMO) && (amo_funct7 [6:2] == f5_AMO_LR));
+	 rg_exc_code <= (((op == CACHE_LD) || is_lr) ? exc_code_LOAD_ADDR_MISALIGNED : exc_code_STORE_AMO_ADDR_MISALIGNED);
       end
       else begin
 	 rg_state <= MODULE_RUNNING;
@@ -2222,8 +2278,10 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // TLB flush
    method Action tlb_flush;
 `ifdef ISA_PRIV_S
+      // Only the TLB: the next req re-initialises rg_state.  Forcing MODULE_READY here
+      // (stock) could cut off an in-flight refill (the RLD-4 abandoned-burst hazard);
+      // Near_Mem's rl_sfence_vma waits for !mv_busy before calling this.
       tlb.flush;
-      rg_state <= MODULE_READY;
       if (cfg_verbosity > 1)
 	 $display ("%0d: %s.tlb_flush", cur_cycle, d_or_i);
 `else
@@ -2270,6 +2328,10 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
    method Bool mv_perf_miss;
       return pw_perf_miss;
+   endmethod
+
+   method Action ma_pmp (PMP_Table t);
+      rg_pmp <= t;
    endmethod
 
 endmodule: mkMMU_Cache

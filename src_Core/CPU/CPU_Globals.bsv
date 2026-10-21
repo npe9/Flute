@@ -412,6 +412,10 @@ typedef enum {  OP_Stage2_ALU         // Pass-through (non mem, M, FD, AMO)
 	      , OP_Stage2_AMO
 `endif
 
+`ifdef ISA_XBOX
+	      , OP_Stage2_X        // bitmanip / scalar crypto (RISCV_XBox, fixed latency)
+`endif
+
 `ifdef ISA_F
 	      , OP_Stage2_FD
 `endif

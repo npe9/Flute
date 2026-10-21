@@ -66,6 +66,19 @@ module mkRISCV_MBox (RISCV_MBox_IFC);
    Reg #(WordXL)    rg_v2              <- mkRegU;
    Reg #(WordXL)    rg_result          <- mkRegU;
 
+`ifdef MULT_SYNTH
+`ifdef RV32
+   // E22: one 33x33 signed multiply for all four MUL ops.  The operands are
+   // sign- or zero-extended in 'req' (from f3) and the hi/lo select is applied
+   // after the product register, so rl_mul is register -> DSPs -> adder ->
+   // register (was f3 decode -> four multipliers -> result mux in one cycle).
+   Reg #(Int #(33))  rg_ma   <- mkRegU;
+   Reg #(Int #(33))  rg_mb   <- mkRegU;
+   Reg #(Bool)       rg_mhi  <- mkRegU;
+   Reg #(Bit #(64))  rg_prod <- mkRegU;
+`endif
+`endif
+
    IntDiv_IFC #(XLEN) intDiv <- mkIntDiv (rg_v1, rg_v2);
 
 `ifdef MULT_SERIAL
@@ -87,6 +100,20 @@ module mkRISCV_MBox (RISCV_MBox_IFC);
    // (DSPs on FPGAa).
 
 `ifdef MULT_SYNTH
+`ifdef RV32
+
+   rule rl_mul (rg_state == STATE_MUL1);
+      Int #(66) p = signExtend (rg_ma) * signExtend (rg_mb);
+      rg_prod  <= truncate (pack (p));
+      rg_state <= STATE_MUL2;
+   endrule
+
+   rule rl_mul2 (rg_state == STATE_MUL2);
+      dw_valid  <= True;
+      dw_result <= (rg_mhi ? rg_prod [63:32] : rg_prod [31:0]);
+   endrule
+
+`else
 
    rule rl_mul (rg_state == STATE_MUL1);
       if (cfg_verbosity > 1)
@@ -118,6 +145,7 @@ module mkRISCV_MBox (RISCV_MBox_IFC);
       dw_result <= result;
    endrule
 
+`endif
 `endif
 
    // ----------------------------------------------------------------
@@ -214,6 +242,18 @@ module mkRISCV_MBox (RISCV_MBox_IFC);
       // MUL, MULH, MULHU, MULHSU
       if (f3 [2] == 1'b0) begin
 	 rg_state <= STATE_MUL1;
+
+`ifdef MULT_SYNTH
+`ifdef RV32
+	 // E22: MUL / MULH: both signed; MULHSU: rs1 signed; MULHU: neither.
+	 // (MUL's low word is the same for any extension.)
+	 Bool sx1 = (f3 == f3_MULH) || (f3 == f3_MULHSU);
+	 Bool sx2 = (f3 == f3_MULH);
+	 rg_ma  <= unpack ({ (sx1 ? v1 [31] : 1'b0), v1 });
+	 rg_mb  <= unpack ({ (sx2 ? v2 [31] : 1'b0), v2 });
+	 rg_mhi <= (f3 != f3_MUL);
+`endif
+`endif
 
 `ifdef MULT_SERIAL
 	 Bool s1, s2;

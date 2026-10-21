@@ -178,6 +178,21 @@ interface CPU_IFC;
    method Bit #(4)    mv_rvfi_mem_wmask;
    method WordXL      mv_rvfi_mem_rdata;
    method WordXL      mv_rvfi_mem_wdata;
+   // CSR side of the retirement (formal/gen_wrapper.py fans these out to riscv-formal's
+   // per-CSR rvfi_csr_<name>_{rmask,wmask,rdata,wdata}).  kind: 0 none, 1 CSRRx, 2 trap, 3 MRET.
+   method Bit #(3)    mv_rvfi_csr_kind;     // 0 none 1 CSRRx 2 trap->M 3 MRET 4 trap->S 5 SRET
+   method Bit #(12)   mv_rvfi_csr_addr;     // CSRRx: the CSR
+   method Bool        mv_rvfi_csr_rd;       // CSRRx: the CSR was read (not CSRRW with rd = x0)
+   method Bool        mv_rvfi_csr_wen;      // CSRRx: the CSR was written
+   method WordXL      mv_rvfi_csr_rdata;    // CSRRx: old value
+   method WordXL      mv_rvfi_csr_wdata;    // CSRRx: value written by the instruction
+   method WordXL      mv_rvfi_mstatus_r;    // trap / MRET: mstatus before
+   method WordXL      mv_rvfi_mstatus_w;    // trap / MRET: mstatus after
+   method WordXL      mv_rvfi_mepc;         // trap: written; MRET: read
+   method WordXL      mv_rvfi_mcause;       // trap: written
+   method WordXL      mv_rvfi_mtval;        // trap: written
+   method WordXL      mv_rvfi_mtvec;        // trap: read
+   method WordXL      mv_rvfi_medeleg;      // trap: read
 `endif
    method Bool mv_perf_retire;
 

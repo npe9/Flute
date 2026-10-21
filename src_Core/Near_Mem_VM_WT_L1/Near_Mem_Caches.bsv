@@ -42,6 +42,7 @@ import Near_Mem_IFC     :: *;
 import MMU_Cache_Common :: *;
 import MMU_Cache        :: *;
 import ICache_Pipe      :: *;
+import PMP              :: *;
 import AXI4_Types       :: *;
 import Fabric_Defs      :: *;
 
@@ -660,10 +661,12 @@ module mkNear_Mem (Near_Mem_IFC);
    FIFOF #(Token) f_sfence_vma_reqs <- mkFIFOF;
    FIFOF #(Token) f_sfence_vma_rsps <- mkFIFOF;
 
-   rule rl_sfence_vma;
+   // Drain the D-side first (no refill or op in flight), then flush its TLB.  The I-side
+   // (ICache_Pipe) has no TLB until I-side Sv32 lands (it then gets a server_sfence).
+   rule rl_sfence_vma (! dcache.mv_busy);
       let tok <- pop (f_sfence_vma_reqs);
-      icache.tlb_flush;
       dcache.tlb_flush;
+      icache.tlb_flush;
       f_sfence_vma_rsps.enq (tok);
    endrule
 `endif
@@ -841,6 +844,11 @@ module mkNear_Mem (Near_Mem_IFC);
 
    method Bool mv_perf_dmiss;
       return dcache.mv_perf_miss;
+   endmethod
+
+   method Action ma_pmp (PMP_Table t);
+      icache.ma_pmp (t);
+      dcache.ma_pmp (t);
    endmethod
 
 endmodule

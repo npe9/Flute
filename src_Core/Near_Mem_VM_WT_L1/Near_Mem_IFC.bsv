@@ -34,6 +34,7 @@ import Cur_Cycle :: *;
 // Project imports
 
 import ISA_Decls :: *;
+import PMP       :: *;
 
 import MMU_Cache_Common :: *;
 import AXI4_Types       :: *;
@@ -139,6 +140,10 @@ interface Near_Mem_IFC;
    method Bool mv_perf_imiss;
    (* always_ready *)
    method Bool mv_perf_dmiss;
+
+   // PMP table from the CSR file (driven every cycle by the CPU)
+   (* always_ready, always_enabled *)
+   method Action ma_pmp (PMP_Table t);
 
 endinterface
    

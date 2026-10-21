@@ -41,6 +41,7 @@ import DM_Common :: *;    // Debug Module defs
 import CSR_MSTATUS :: *;
 import CSR_MIP     :: *;
 import CSR_MIE     :: *;
+import PMP         :: *;
 
 // ================================================================
 // Writing a CSR can update multiple CSRs (e.g., writing
@@ -119,6 +120,10 @@ interface CSR_RegFile_IFC;
    // Read SATP
    (* always_ready *)
    method WordXL read_satp;
+
+   // PMP: normalized range table for the fetch / load-store checkers
+   (* always_ready *)
+   method PMP_Table mv_pmp_table;
 
    // CSR trap actions
    method ActionValue #(Trap_Info)
@@ -261,6 +266,11 @@ function MISA misa_reset_value;
    ms.m = 1'b1;
 `endif
 
+`ifdef ISA_B
+   // Bitmanip (B = Zba + Zbb + Zbs)
+   ms.b = 1'b1;
+`endif
+
 `ifdef ISA_F
    // Single- and Double-precision Floating Point
    ms.f = 1'b1;
@@ -320,7 +330,8 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
    // sip     is a restricted view of mip
 
    Reg #(MTVec)      rg_stvec     <- mkRegU;
-   // scounteren hardwired to 0 for now
+   // scounteren: CY / TM / IR (Linux's vDSO reads time from U-mode)
+   Reg #(MCounteren) rg_scounteren <- mkRegU;
 
    Reg #(Word)       rg_sscratch  <- mkRegU;
    Reg #(Word)       rg_sepc      <- mkRegU;
@@ -356,6 +367,7 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
    Reg #(MCause)     rg_mcause   <- mkRegU;
    Reg #(Word)       rg_mtval    <- mkRegU;
 
+   PMP_IFC pmp <- mkPMP;
    // RegFile #(Bit #(2), WordXL)  rf_pmpcfg   <- mkRegFileFull;
    // Vector #(16, Reg #(WordXL))  vrg_pmpaddr <- replicateM (mkRegU);
 
@@ -402,7 +414,7 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
       rg_stvec    <= word_to_mtvec (truncate (soc_map.m_mtvec_reset_value));
       rg_scause   <= word_to_mcause (0);    // Supposed to be the cause of the reset.
       rg_satp     <= 0;
-      //rg_scounteren <= mcounteren_reset_value;
+      rg_scounteren <= mcounteren_reset_value;
 `endif
 
       // Machine-level CSRs
@@ -544,6 +556,9 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 		     || (csr_addr == csr_addr_mie)
 		     || (csr_addr == csr_addr_mtvec)
 		     || (csr_addr == csr_addr_mcounteren)
+`ifdef RV32
+		     || (csr_addr == csr_addr_mstatush)
+`endif
 
 		     || (csr_addr == csr_addr_mscratch)
 		     || (csr_addr == csr_addr_mepc)
@@ -551,7 +566,8 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 		     || (csr_addr == csr_addr_mtval)
 		     || (csr_addr == csr_addr_mip)
 
-		     // TODO: Phys Mem Protection regs
+		     // Phys Mem Protection regs (pmpcfg0-15, pmpaddr0-63; unimplemented entries read 0)
+		     || fv_is_pmp_csr (csr_addr)
 		     // (csr_addr == csr_pmpcfg0)
 		     // (csr_addr == csr_pmpcfg1)
 		     // (csr_addr == csr_pmpcfg2)
@@ -618,6 +634,9 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
       else if ((csr_addr_mhpmevent3 <= csr_addr) && (csr_addr <= csr_addr_mhpmevent31))
 	 m_csr_value = tagged Valid 0;
 
+      else if (fv_is_pmp_csr (csr_addr))
+	 m_csr_value = pmp.read (csr_addr);
+
       else begin
 	 case (csr_addr)
 	    // User mode csrs
@@ -644,10 +663,10 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 	    csr_addr_sideleg:    m_csr_value = tagged Valid zeroExtend (sideleg);
 	    csr_addr_sie:        m_csr_value = tagged Valid (csr_mie.mv_sie_read);
 	    csr_addr_stvec:      m_csr_value = tagged Valid (mtvec_to_word (rg_stvec));
-	    csr_addr_scounteren: m_csr_value = tagged Valid 0;
+	    csr_addr_scounteren: m_csr_value = tagged Valid (mcounteren_to_word (rg_scounteren));
 
 	    csr_addr_sscratch:   m_csr_value = tagged Valid rg_sscratch;
-	    csr_addr_sepc:       m_csr_value = tagged Valid ((misa.c == 1'b1) ? rg_sepc : (rg_sepc & (~ 2)));
+	    csr_addr_sepc:       m_csr_value = tagged Valid ((misa.c == 1'b1) ? (rg_sepc & (~ 1)) : (rg_sepc & (~ 3)));    // sepc[0] reads zero (rg_sepc is not reset)
 	    csr_addr_scause:     m_csr_value = tagged Valid (mcause_to_word (rg_scause));
 	    csr_addr_stval:      m_csr_value = tagged Valid rg_stval;
 	    csr_addr_sip:        m_csr_value = tagged Valid (csr_mip.mv_sip_read);
@@ -669,6 +688,9 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 	    csr_addr_mie:        m_csr_value = tagged Valid (csr_mie.mv_read);
 	    csr_addr_mtvec:      m_csr_value = tagged Valid (mtvec_to_word (rg_mtvec));
 	    csr_addr_mcounteren: m_csr_value = tagged Valid (mcounteren_to_word (rg_mcounteren));
+`ifdef RV32
+	    csr_addr_mstatush:   m_csr_value = tagged Valid (0);    // MBE = SBE = 0 (little-endian), no H
+`endif
 
 	    csr_addr_mscratch:   m_csr_value = tagged Valid rg_mscratch;
 	    csr_addr_mepc:       m_csr_value = tagged Valid ((misa.c == 1'b1) ? (rg_mepc & (~ 1)) : (rg_mepc & (~ 3)));    // mepc[0] reads zero even before the first write (rg_mepc is not reset; riscv-formal insn_c_beqz)
@@ -745,21 +767,14 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 	 WordXL          new_csr_value  = ?;
 	 Maybe #(WordXL) m_new_csr_value2 = tagged Invalid;
 
-	 if ((csr_addr_mhpmcounter3 <= csr_addr) && (csr_addr <= csr_addr_mhpmcounter31))
-	    begin
-	       new_csr_value = 0;    // hardwired
-	    end
+	 // E21: the hardwired-zero mhpm ranges are disjoint from every case label, so they are
+	 // tested in 'default' (was an if/else-if chain ahead of the case: three range-compare
+	 // carry chains in series with every CSR's write enable).
+	 Bool is_hpm = (   ((csr_addr_mhpmcounter3 <= csr_addr) && (csr_addr <= csr_addr_mhpmcounter31))
 `ifdef RV32
-	 else if ((csr_addr_mhpmcounter3h <= csr_addr) && (csr_addr <= csr_addr_mhpmcounter31h))
-	    begin
-	       new_csr_value = 0;    // hardwired
-	    end
+			|| ((csr_addr_mhpmcounter3h <= csr_addr) && (csr_addr <= csr_addr_mhpmcounter31h))
 `endif
-	 else if ((csr_addr_mhpmevent3 <= csr_addr) && (csr_addr <= csr_addr_mhpmevent31))
-	    begin
-	       new_csr_value = 0;    // hardwired
-	    end
-	 else
+			|| ((csr_addr_mhpmevent3 <= csr_addr) && (csr_addr <= csr_addr_mhpmevent31)));
 	    case (csr_addr)
 	       // User mode csrs
 `ifdef ISA_F
@@ -821,7 +836,11 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 				       new_csr_value = mtvec_to_word (mtvec);
 				       rg_stvec     <= mtvec;
 				    end
-	       csr_addr_scounteren: new_csr_value = 0;    // Hardwired to zero
+	       csr_addr_scounteren: begin
+				       let scounteren = word_to_mcounteren (wordxl);
+				       new_csr_value  = mcounteren_to_word (scounteren);
+				       rg_scounteren <= scounteren;
+				    end
 
 	       csr_addr_sscratch:   begin
 				       new_csr_value = wordxl;
@@ -848,7 +867,19 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 				       new_csr_value <- csr_mip.mav_sip_write (misa, wordxl);
 				    end
 	       csr_addr_satp:       begin
+				       // WARL: ASID hard-wired to 0 (Linux then uses global flushes).
+				       // MODE Sv32 only once fetch translates (SV32_ITLB); until then a
+				       // write selecting it has no effect at all (priv spec: unsupported
+				       // MODE -> no field of satp is modified).
+`ifdef RV32
+				       Bool mode_ok = (wordxl [31] == 1'b0);
+`ifdef SV32_ITLB
+				       mode_ok = True;
+`endif
+				       new_csr_value = (mode_ok ? (wordxl & 'h_803F_FFFF) : rg_satp);
+`else
 				       new_csr_value = wordxl;
+`endif
 				       rg_satp      <= new_csr_value;
 				    end
 	       csr_addr_medeleg:    begin
@@ -856,7 +887,9 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 				       rg_medeleg   <= truncate (new_csr_value);
 				    end
 	       csr_addr_mideleg:    begin
-				       new_csr_value = (wordxl & 'h_0FFF);  // 12 bits relevant
+				       // only the S-level interrupts (SSI, STI, SEI) are delegable;
+				       // M-level bits read-only 0 (Sail; stock Flute allowed 'h_0FFF)
+				       new_csr_value = (wordxl & 'h_0222);
 				       rg_mideleg   <= truncate (new_csr_value);
 				    end
 `endif
@@ -880,6 +913,9 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 				       new_csr_value = mtvec_to_word (mtvec);
 				       rg_mtvec     <= mtvec;
 				    end
+`ifdef RV32
+	       csr_addr_mstatush:   new_csr_value = 0;    // all fields read-only 0; writes ignored
+`endif
 	       csr_addr_mcounteren: begin
 				       let mcounteren = word_to_mcounteren(wordxl);
 				       new_csr_value  = mcounteren_to_word (mcounteren);
@@ -1011,7 +1047,15 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 				    end
 `endif
 
-	       default: success = False;
+	       default: begin
+			   if (fv_is_pmp_csr (csr_addr)) begin
+			      new_csr_value <- pmp.write (csr_addr, wordxl);
+			   end
+			   else begin
+			      new_csr_value = 0;    // mhpm*: hardwired
+			      success = is_hpm;
+			   end
+			end
 	    endcase
 
 	 if ((! success) && (cfg_verbosity > 1))
@@ -1179,6 +1223,8 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
    endmethod
 `endif
 
+   method PMP_Table mv_pmp_table = pmp.pmp_table;
+
    // Read SATP
    method WordXL read_satp;
 `ifdef ISA_PRIV_S
@@ -1317,10 +1363,27 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 
    // Fault on reading counters?
    method Bool csr_counter_read_fault (Priv_Mode  priv, CSR_Addr  csr_addr);
+      // below M a counter needs its mcounteren bit; in U (with S-mode) also its scounteren
+      // bit.  RV32: the h halves follow the same bits (stock Flute checked only the low halves).
+`ifdef ISA_PRIV_S
+      Bool u = (priv == u_Priv_Mode);
+      Bool cy_off = ((rg_mcounteren.cy == 0) || (u && (rg_scounteren.cy == 0)));
+      Bool tm_off = ((rg_mcounteren.tm == 0) || (u && (rg_scounteren.tm == 0)));
+      Bool ir_off = ((rg_mcounteren.ir == 0) || (u && (rg_scounteren.ir == 0)));
+`else
+      Bool cy_off = (rg_mcounteren.cy == 0);
+      Bool tm_off = (rg_mcounteren.tm == 0);
+      Bool ir_off = (rg_mcounteren.ir == 0);
+`endif
       return (   ((priv == s_Priv_Mode) || (priv == u_Priv_Mode))
-	      && (   ((csr_addr == csr_addr_cycle)   && (rg_mcounteren.cy == 0))
-		  || ((csr_addr == csr_addr_time)    && (rg_mcounteren.tm == 0))
-		  || ((csr_addr == csr_addr_instret) && (rg_mcounteren.ir == 0))
+	      && (   ((csr_addr == csr_addr_cycle)   && cy_off)
+		  || ((csr_addr == csr_addr_time)    && tm_off)
+		  || ((csr_addr == csr_addr_instret) && ir_off)
+`ifdef RV32
+		  || ((csr_addr == csr_addr_cycleh)   && cy_off)
+		  || ((csr_addr == csr_addr_timeh)    && tm_off)
+		  || ((csr_addr == csr_addr_instreth) && ir_off)
+`endif
 		  || ((csr_addr_hpmcounter3  <= csr_addr) && (csr_addr <= csr_addr_hpmcounter31))
 `ifdef RV32
 		  || ((csr_addr_hpmcounter3h <= csr_addr) && (csr_addr <= csr_addr_hpmcounter31h))

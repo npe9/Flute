@@ -48,6 +48,7 @@ CSR_Addr   csr_addr_mideleg        = 12'h303;    // Machine interrupt delegation
 CSR_Addr   csr_addr_mie            = 12'h304;    // Machine interrupt-enable
 CSR_Addr   csr_addr_mtvec          = 12'h305;    // Machine trap handler base address
 CSR_Addr   csr_addr_mcounteren     = 12'h306;    // Machine counter enable
+CSR_Addr   csr_addr_mstatush       = 12'h310;    // RV32: upper half of mstatus (MBE/SBE: little-endian, read-only 0)
 
 CSR_Addr   csr_addr_mscratch       = 12'h340;    // Scratch reg for machine trap handlers
 CSR_Addr   csr_addr_mepc           = 12'h341;    // Machine exception program counter
@@ -439,6 +440,11 @@ function Tuple2 #(WordXL, Priv_Mode) fv_new_mstatus_on_ret (MISA       misa,
       to_y = {1'b0, mstatus [mstatus_spp_bitpos]};
       mstatus = fv_assign_bit (mstatus, fromInteger (mstatus_spp_bitpos), default_pp [0]);
    end
+
+   // Priv spec 1.12 / Sail: an xRET to a mode below M clears MPRV
+   // (found by the Sail-derived riscv-formal mret check)
+   if (to_y != m_Priv_Mode)
+      mstatus = fv_assign_bit (mstatus, fromInteger (mstatus_mprv_bitpos), 1'b0);
 
    return tuple2 (mstatus, to_y);
 endfunction

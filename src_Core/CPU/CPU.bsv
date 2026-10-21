@@ -120,6 +120,47 @@ function Bool fn_is_running (CPU_State  cpu_state);
 	   );
 endfunction
 
+`ifdef RVFI
+`ifdef ISA_F
+// RVFI F/D side of one retirement (riscv-formal-fp)
+typedef struct {
+   Bit #(5)  frs1;   Bit #(5)  frs2;   Bit #(5)  frs3;
+   Bool      frs1_v; Bool      frs2_v; Bool      frs3_v;
+   WordFL    frs1_d; WordFL    frs2_d; WordFL    frs3_d;
+   Bit #(5)  frd;    Bool      frd_v;  WordFL    frd_d;
+   Bool      fp_valid;
+   Bit #(8)  fcsr_rmask; Bit #(8) fcsr_wmask; Bit #(8) fcsr_rdata; Bit #(8) fcsr_wdata;
+   WordXL    mstatus_r;  Bool     mstatus_wen; WordXL  mstatus_w;
+   } RVFI_FP
+deriving (Bits);
+
+RVFI_FP rvfi_fp_none = RVFI_FP {frs1: 0, frs2: 0, frs3: 0, frs1_v: False, frs2_v: False, frs3_v: False,
+				frs1_d: 0, frs2_d: 0, frs3_d: 0, frd: 0, frd_v: False, frd_d: 0,
+				fp_valid: False, fcsr_rmask: 0, fcsr_wmask: 0, fcsr_rdata: 0, fcsr_wdata: 0,
+				mstatus_r: 0, mstatus_wen: False, mstatus_w: 0};
+
+Bit #(5) f5_rvfi_FCVT_F_X = 5'b11010;    // FCVT.S/D.W[U]: integer rs1
+Bit #(5) f5_rvfi_FMV_F_X  = 5'b11110;    // FMV.W.X: integer rs1
+
+function Bool fn_rvfi_is_fp_op (Instr instr);
+   let op = instr_opcode (instr);
+   return (   (op == op_LOAD_FP) || (op == op_STORE_FP) || (op == op_FP)
+	   || (op == op_FMADD) || (op == op_FMSUB) || (op == op_FNMSUB) || (op == op_FNMADD));
+endfunction
+
+// FPR sources an (expanded) FP instruction reads: frs1, frs2, frs3
+function Tuple3 #(Bool, Bool, Bool) fn_rvfi_frs_used (Instr instr);
+   let op = instr_opcode (instr);
+   Bit #(5) f5 = instr [31:27];
+   Bool r4 = (op == op_FMADD) || (op == op_FMSUB) || (op == op_FNMSUB) || (op == op_FNMADD);
+   Bool two = (op == op_FP) && (   (f5 == 5'b00000) || (f5 == 5'b00001) || (f5 == 5'b00010) || (f5 == 5'b00011)
+				|| (f5 == 5'b00100) || (f5 == 5'b00101) || (f5 == 5'b10100));
+   Bool one = (op == op_FP) && (f5 != f5_rvfi_FCVT_F_X) && (f5 != f5_rvfi_FMV_F_X);
+   return tuple3 (r4 || one, r4 || two || (op == op_STORE_FP), r4);
+endfunction
+`endif
+`endif
+
 // ================================================================
 
 (* synthesize *)
@@ -225,10 +266,13 @@ module mkCPU (CPU_IFC);
    Reg #(WordXL)    rg_rvfi_pc_rdata  <- mkRegU;
    Reg #(WordXL)    rg_rvfi_pc_wdata  <- mkRegU;
    Reg #(WordXL)    rg_rvfi_mem_addr  <- mkRegU;
-   Reg #(Bit #(4))  rg_rvfi_mem_rmask <- mkRegU;
-   Reg #(Bit #(4))  rg_rvfi_mem_wmask <- mkRegU;
-   Reg #(WordXL)    rg_rvfi_mem_rdata <- mkRegU;
-   Reg #(WordXL)    rg_rvfi_mem_wdata <- mkRegU;
+   Reg #(RVFI_MemMask) rg_rvfi_mem_rmask <- mkRegU;
+   Reg #(RVFI_MemMask) rg_rvfi_mem_wmask <- mkRegU;
+   Reg #(RVFI_MemData) rg_rvfi_mem_rdata <- mkRegU;
+   Reg #(RVFI_MemData) rg_rvfi_mem_wdata <- mkRegU;
+`ifdef ISA_F
+   Reg #(RVFI_FP)   rg_rvfi_fp        <- mkReg (rvfi_fp_none);
+`endif
    // the next retirement is the first instruction of a trap/interrupt handler
    Reg #(Bool)      rg_rvfi_intr_pending <- mkReg (False);
    // size / compressed word of the instruction parked in rg_trap_instr
@@ -261,17 +305,21 @@ module mkCPU (CPU_IFC);
       Bool uses_rs1 = (   (op == op_JALR) || (op == op_LOAD)  || (op == op_OP_IMM)
 		       || (op == op_BRANCH) || (op == op_STORE) || (op == op_OP)
 		       || (op == op_AMO)
+`ifdef ISA_F
+		       || (op == op_LOAD_FP) || (op == op_STORE_FP)
+		       || ((op == op_FP) && ((instr [31:27] == f5_rvfi_FCVT_F_X) || (instr [31:27] == f5_rvfi_FMV_F_X)))
+`endif
 		       || ((op == op_SYSTEM) && (instr_funct3 (instr) != 0) && (instr [14] == 1'b0)));
       Bool uses_rs2 = ((op == op_BRANCH) || (op == op_STORE) || (op == op_OP) || (op == op_AMO));
       return tuple2 ((uses_rs1 ? instr_rs1 (instr) : 0), (uses_rs2 ? instr_rs2 (instr) : 0));
    endfunction
 
-   function Action fa_rvfi (Bool trap, Bool set_intr_pending,
+   function Action fa_rvfi_core (Bool trap, Bool set_intr_pending,
 			    Bool is_i32, Instr instr, Instr_C instr_C,
 			    Bit #(5) rs1, Bit #(5) rs2, WordXL rs1_val, WordXL rs2_val,
 			    Bit #(5) rd, WordXL rd_val,
 			    WordXL pc, WordXL next_pc,
-			    WordXL mem_addr, Bit #(4) rmask, Bit #(4) wmask, WordXL mem_rdata, WordXL mem_wdata);
+			    WordXL mem_addr, RVFI_MemMask rmask, RVFI_MemMask wmask, RVFI_MemData mem_rdata, RVFI_MemData mem_wdata);
       action
 	 rg_rvfi_valid     <= True;
 	 rg_rvfi_order     <= rg_rvfi_order + 1;
@@ -296,15 +344,59 @@ module mkCPU (CPU_IFC);
       endaction
    endfunction
 
+   // every retirement except pipe ops and fcsr CSRRx reports no F/D state
+   function Action fa_rvfi (Bool trap, Bool set_intr_pending,
+			    Bool is_i32, Instr instr, Instr_C instr_C,
+			    Bit #(5) rs1, Bit #(5) rs2, WordXL rs1_val, WordXL rs2_val,
+			    Bit #(5) rd, WordXL rd_val,
+			    WordXL pc, WordXL next_pc,
+			    WordXL mem_addr, RVFI_MemMask rmask, RVFI_MemMask wmask, RVFI_MemData mem_rdata, RVFI_MemData mem_wdata);
+      action
+	 fa_rvfi_core (trap, set_intr_pending, is_i32, instr, instr_C, rs1, rs2, rs1_val, rs2_val, rd, rd_val,
+		       pc, next_pc, mem_addr, rmask, wmask, mem_rdata, mem_wdata);
+`ifdef ISA_F
+	 rg_rvfi_fp <= rvfi_fp_none;
+`endif
+      endaction
+   endfunction
+
    // pipe-op retirement (the 2->3 move in rl_pipe)
+`ifdef ISA_F
+   function Action fa_rvfi_pipe (Data_Stage2_to_Stage3 d3, Tuple2 #(Bool, Bit #(5)) fp_pending);
+`else
    function Action fa_rvfi_pipe (Data_Stage2_to_Stage3 d3);
+`endif
       action
 	 match { .rs1, .rs2 } = fn_rvfi_rs_addrs (d3.instr);
-	 fa_rvfi (False, False, d3.rvfi_is_i32, d3.instr, d3.rvfi_instr_C,
+`ifdef ISA_F
+	 Bool rd_gpr = d3.rd_valid && (! d3.rd_in_fpr);
+`else
+	 Bool rd_gpr = d3.rd_valid;
+`endif
+	 fa_rvfi_core (False, False, d3.rvfi_is_i32, d3.instr, d3.rvfi_instr_C,
 		  rs1, rs2, d3.rvfi_rs1_val, d3.rvfi_rs2_val,
-		  (d3.rd_valid ? d3.rd : 0), d3.rd_val,
+		  (rd_gpr ? d3.rd : 0), d3.rd_val,
 		  d3.pc, d3.rvfi_next_pc,
 		  d3.rvfi_mem_addr, d3.rvfi_mem_rmask, d3.rvfi_mem_wmask, d3.rvfi_mem_rdata, d3.rvfi_mem_wdata);
+`ifdef ISA_F
+	 // FP state: the read view includes the fflags / FS update of the op leaving Stage3 this cycle
+	 match { .pend_dirty, .pend_flags } = fp_pending;
+	 match { .u1, .u2, .u3 } = fn_rvfi_frs_used (d3.instr);
+	 Bool is_fp  = fn_rvfi_is_fp_op (d3.instr);
+	 WordXL fs_sd = ((1 << (xlen - 1)) | (3 << mstatus_fs_bitpos));
+	 WordXL ms0  = (pend_dirty ? (csr_regfile.read_mstatus | fs_sd) : csr_regfile.read_mstatus);
+	 Bit #(5) ff0 = csr_regfile.read_fflags | pend_flags;
+	 Bool dirty  = fn_stage3_sets_fs_dirty (d3);
+	 rg_rvfi_fp <= RVFI_FP {frs1: instr_rs1 (d3.instr), frs2: instr_rs2 (d3.instr), frs3: d3.instr [31:27],
+				frs1_v: u1, frs2_v: u2, frs3_v: u3,
+				frs1_d: d3.rvfi_frs1_val, frs2_d: d3.rvfi_frs2_val, frs3_d: d3.rvfi_frs3_val,
+				frd: d3.rd, frd_v: d3.rd_valid && d3.rd_in_fpr, frd_d: d3.frd_val,
+				fp_valid: is_fp,
+				fcsr_rmask: 'hFF, fcsr_wmask: (d3.upd_flags ? 'h1F : 0),
+				fcsr_rdata: {csr_regfile.read_frm, ff0},
+				fcsr_wdata: {csr_regfile.read_frm, ff0 | (d3.upd_flags ? d3.fpr_flags : 0)},
+				mstatus_r: ms0, mstatus_wen: dirty, mstatus_w: (dirty ? (ms0 | fs_sd) : ms0)};
+`endif
       endaction
    endfunction
 `endif
@@ -863,7 +955,11 @@ module mkCPU (CPU_IFC);
 	 csr_regfile.csr_minstret_incr;
 	 pw_perf_retire.send;
 `ifdef RVFI
+`ifdef ISA_F
+	 fa_rvfi_pipe (stage2.out.data_to_stage3, stage3.mv_rvfi_fp_pending);
+`else
 	 fa_rvfi_pipe (stage2.out.data_to_stage3);
+`endif
 `endif
 
 	 // E2: branch resolution is applied here, when the op leaves
@@ -1086,8 +1182,17 @@ module mkCPU (CPU_IFC);
       else
 	 begin
 	    match { .t_rs1, .t_rs2 } = fn_rvfi_rs_addrs (instr);
-	    fa_rvfi (True, True, rg_rvfi_trap_is_i32, instr, rg_rvfi_trap_instr_C,
+	    fa_rvfi_core (True, True, rg_rvfi_trap_is_i32, instr, rg_rvfi_trap_instr_C,
 		     t_rs1, t_rs2, rg_rvfi_trap_rs1_val, rg_rvfi_trap_rs2_val, 0, 0, epc, next_pc, 0, 0, 0, 0, 0);
+`ifdef ISA_F
+	    // a trapping FP op reports the fcsr it saw (frm decides an rm=DYN illegal-instruction trap);
+	    // the pipe is drained here, so the CSR file is current. mstatus comes with the trap record.
+	    rg_rvfi_fp <= RVFI_FP {frs1: 0, frs2: 0, frs3: 0, frs1_v: False, frs2_v: False, frs3_v: False,
+				   frs1_d: 0, frs2_d: 0, frs3_d: 0, frd: 0, frd_v: False, frd_d: 0,
+				   fp_valid: fn_rvfi_is_fp_op (instr), fcsr_rmask: 'hFF, fcsr_wmask: 0,
+				   fcsr_rdata: {csr_regfile.read_frm, csr_regfile.read_fflags}, fcsr_wdata: 0,
+				   mstatus_r: 0, mstatus_wen: False, mstatus_w: 0};
+`endif
 `ifdef ISA_PRIV_S
 	    Bool to_s = (new_priv == s_Priv_Mode);
 	    rg_rvfi_medeleg   <= fromMaybe (0, csr_regfile.read_csr (csr_addr_medeleg));   // port 2 reads tvec
@@ -1363,10 +1468,30 @@ module mkCPU (CPU_IFC);
       rg_state   <= CPU_CSRRX_RESTART;
 `ifdef RVFI
       Bool rvfi_rs1_used = (funct3 [2] == 1'b0);    // register (not immediate) forms
-      fa_rvfi (False, False, rg_rvfi_trap_is_i32, instr, rg_rvfi_trap_instr_C,
+      fa_rvfi_core (False, False, rg_rvfi_trap_is_i32, instr, rg_rvfi_trap_instr_C,
 	       (rvfi_rs1_used ? rs1 : 0), 0, (rvfi_rs1_used ? rg_csr_val1 : 0), 0,
 	       rd, new_rd_val,
 	       rg_csr_pc, rg_csr_pc + (rg_rvfi_trap_is_i32 ? 4 : 2), 0, 0, 0, 0, 0);
+`ifdef ISA_F
+      // fflags / frm / fcsr alias onto the fcsr channel (riscv-formal-fp rvfi_fcsr_check)
+      begin
+	 let a = rg_csr_waddr;
+	 Bool is_fcsr = (a == csr_addr_fflags) || (a == csr_addr_frm) || (a == csr_addr_fcsr);
+	 Bit #(8) old  = {csr_regfile.read_frm, csr_regfile.read_fflags};
+	 Bit #(8) fmask = ((a == csr_addr_fflags) ? 'h1F : ((a == csr_addr_frm) ? 'hE0 : 'hFF));
+	 Bit #(8) wv   = rg_csr_wval [7:0];
+	 Bit #(8) nv   = ((a == csr_addr_fflags) ? {old [7:5], wv [4:0]}
+			  : ((a == csr_addr_frm) ? {wv [2:0], old [4:0]} : wv));
+	 WordXL ms     = csr_regfile.read_mstatus;
+	 rg_rvfi_fp <= (is_fcsr ? RVFI_FP {frs1: 0, frs2: 0, frs3: 0, frs1_v: False, frs2_v: False, frs3_v: False,
+					   frs1_d: 0, frs2_d: 0, frs3_d: 0, frd: 0, frd_v: False, frd_d: 0,
+					   fp_valid: True, fcsr_rmask: 'hFF, fcsr_wmask: (rg_csr_wen ? fmask : 0),
+					   fcsr_rdata: old, fcsr_wdata: (rg_csr_wen ? nv : old),
+					   mstatus_r: ms, mstatus_wen: rg_csr_wen && isValid (m_new_mstatus),
+					   mstatus_w: fromMaybe (ms, m_new_mstatus)}
+				: rvfi_fp_none);
+      end
+`endif
       rg_rvfi_csr_kind  <= 1;
       rg_rvfi_csr_addr  <= rg_csr_waddr;
       rg_rvfi_csr_rd    <= ! ((funct3 [1:0] == 2'b01) && (rd == 0));    // CSRRW/CSRRWI with rd = x0 does not read
@@ -2048,6 +2173,7 @@ module mkCPU (CPU_IFC);
       end
    endrule
 
+   (* descending_urgency = "stage3_rl_writeback, rl_debug_write_fpr" *)
    rule rl_debug_write_fpr ((rg_state == CPU_DEBUG_MODE) && f_fpr_reqs.first.write);
       let req <- pop (f_fpr_reqs);
       Bit #(5) regname = req.address;
@@ -2273,10 +2399,10 @@ module mkCPU (CPU_IFC);
    method WordXL      mv_rvfi_pc_rdata  = rg_rvfi_pc_rdata;
    method WordXL      mv_rvfi_pc_wdata  = rg_rvfi_pc_wdata;
    method WordXL      mv_rvfi_mem_addr  = rg_rvfi_mem_addr;
-   method Bit #(4)    mv_rvfi_mem_rmask = rg_rvfi_mem_rmask;
-   method Bit #(4)    mv_rvfi_mem_wmask = rg_rvfi_mem_wmask;
-   method WordXL      mv_rvfi_mem_rdata = rg_rvfi_mem_rdata;
-   method WordXL      mv_rvfi_mem_wdata = rg_rvfi_mem_wdata;
+   method RVFI_MemMask mv_rvfi_mem_rmask = rg_rvfi_mem_rmask;
+   method RVFI_MemMask mv_rvfi_mem_wmask = rg_rvfi_mem_wmask;
+   method RVFI_MemData mv_rvfi_mem_rdata = rg_rvfi_mem_rdata;
+   method RVFI_MemData mv_rvfi_mem_wdata = rg_rvfi_mem_wdata;
    method Bit #(3)    mv_rvfi_csr_kind  = rg_rvfi_csr_kind;
    method Bit #(12)   mv_rvfi_csr_addr  = rg_rvfi_csr_addr;
    method Bool        mv_rvfi_csr_rd    = rg_rvfi_csr_rd;
@@ -2290,6 +2416,28 @@ module mkCPU (CPU_IFC);
    method WordXL      mv_rvfi_mtval     = rg_rvfi_mtval;
    method WordXL      mv_rvfi_mtvec     = rg_rvfi_mtvec;
    method WordXL      mv_rvfi_medeleg   = rg_rvfi_medeleg;
+`ifdef ISA_F
+   method Bit #(5)    mv_rvfi_frs1_addr   = rg_rvfi_fp.frs1;
+   method Bit #(5)    mv_rvfi_frs2_addr   = rg_rvfi_fp.frs2;
+   method Bit #(5)    mv_rvfi_frs3_addr   = rg_rvfi_fp.frs3;
+   method Bool        mv_rvfi_frs1_rvalid = rg_rvfi_fp.frs1_v;
+   method Bool        mv_rvfi_frs2_rvalid = rg_rvfi_fp.frs2_v;
+   method Bool        mv_rvfi_frs3_rvalid = rg_rvfi_fp.frs3_v;
+   method WordFL      mv_rvfi_frs1_rdata  = rg_rvfi_fp.frs1_d;
+   method WordFL      mv_rvfi_frs2_rdata  = rg_rvfi_fp.frs2_d;
+   method WordFL      mv_rvfi_frs3_rdata  = rg_rvfi_fp.frs3_d;
+   method Bit #(5)    mv_rvfi_frd_addr    = rg_rvfi_fp.frd;
+   method Bool        mv_rvfi_frd_wvalid  = rg_rvfi_fp.frd_v;
+   method WordFL      mv_rvfi_frd_wdata   = rg_rvfi_fp.frd_d;
+   method Bool        mv_rvfi_fp_valid    = rg_rvfi_fp.fp_valid;
+   method Bit #(8)    mv_rvfi_fcsr_rmask  = rg_rvfi_fp.fcsr_rmask;
+   method Bit #(8)    mv_rvfi_fcsr_wmask  = rg_rvfi_fp.fcsr_wmask;
+   method Bit #(8)    mv_rvfi_fcsr_rdata  = rg_rvfi_fp.fcsr_rdata;
+   method Bit #(8)    mv_rvfi_fcsr_wdata  = rg_rvfi_fp.fcsr_wdata;
+   method WordXL      mv_rvfi_fp_mstatus_r   = rg_rvfi_fp.mstatus_r;
+   method Bool        mv_rvfi_fp_mstatus_wen = rg_rvfi_fp.mstatus_wen;
+   method WordXL      mv_rvfi_fp_mstatus_w   = rg_rvfi_fp.mstatus_w;
+`endif
 `endif
    method Bool mv_perf_retire;
       return (minstret != rg_minstret_d1);

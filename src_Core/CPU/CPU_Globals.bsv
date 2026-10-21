@@ -447,6 +447,11 @@ typedef struct {
    Instr_C    instr_C;
    WordXL     rs1_val;           // RVFI: operand values after bypass
    WordXL     rs2_val;
+`ifdef ISA_F
+   WordFL     rvfi_frs1_val;     // RVFI: FPR operand values after bypass
+   WordFL     rvfi_frs2_val;
+   WordFL     rvfi_frs3_val;
+`endif
 `endif
 
 `ifdef ISA_F
@@ -538,11 +543,16 @@ typedef struct {
    WordXL    rvfi_rs1_val;
    WordXL    rvfi_rs2_val;
    WordXL    rvfi_next_pc;
-   WordXL    rvfi_mem_addr;     // aligned-mem convention (RISCV_FORMAL_ALIGNED_MEM)
-   Bit #(4)  rvfi_mem_rmask;
-   Bit #(4)  rvfi_mem_wmask;
-   WordXL    rvfi_mem_rdata;
-   WordXL    rvfi_mem_wdata;
+   WordXL    rvfi_mem_addr;     // aligned-mem convention (RISCV_FORMAL_ALIGNED_MEM), RVFI_MEMLEN window
+   RVFI_MemMask  rvfi_mem_rmask;
+   RVFI_MemMask  rvfi_mem_wmask;
+   RVFI_MemData  rvfi_mem_rdata;
+   RVFI_MemData  rvfi_mem_wdata;
+`ifdef ISA_F
+   WordFL    rvfi_frs1_val;
+   WordFL    rvfi_frs2_val;
+   WordFL    rvfi_frs3_val;
+`endif
 `endif
 
 `ifdef ISA_F

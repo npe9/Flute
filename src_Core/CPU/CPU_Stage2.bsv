@@ -121,15 +121,21 @@ deriving (Bits);
 // Implementation module
 
 `ifdef RVFI
-// RVFI aligned-mem helpers: byte mask and raw word lanes at the aligned address
-function Bit #(4) fn_rvfi_mask (Bit #(3) funct3, Bit #(2) offset);
-   Bit #(4) m = case (funct3 [1:0]) 2'b00: 4'b0001; 2'b01: 4'b0011; default: 4'b1111; endcase;
+// RVFI aligned-mem helpers: byte mask and raw lanes in the RVFI_MEMLEN-aligned window
+// (64 bits with D, so FLD/FSD fit; funct3[1:0] is the size for LOAD/STORE and LOAD_FP/STORE_FP)
+typedef TLog #(TDiv #(RVFI_MEMLEN, 8)) RVFI_OffBits;
+function RVFI_MemMask fn_rvfi_mask (Bit #(3) funct3, WordXL addr);
+   Bit #(RVFI_OffBits) offset = truncate (addr);
+   RVFI_MemMask m = case (funct3 [1:0]) 2'b00: 'h1; 2'b01: 'h3; 2'b10: 'hF; default: 'hFF; endcase;
    return (m << offset);
 endfunction
-function WordXL fn_rvfi_lanes (Bit #(3) funct3, Bit #(2) offset, WordXL v);
-   WordXL vm = case (funct3 [1:0]) 2'b00: (v & 'hFF); 2'b01: (v & 'hFFFF); default: v; endcase;
-   return (vm << {offset, 3'b000});
+function RVFI_MemData fn_rvfi_lanes (Bit #(3) funct3, WordXL addr, Bit #(64) v);
+   Bit #(RVFI_OffBits) offset = truncate (addr);
+   Bit #(64) vm = case (funct3 [1:0]) 2'b00: (v & 'hFF); 2'b01: (v & 'hFFFF); 2'b10: (v & 'hFFFF_FFFF); default: v; endcase;
+   RVFI_MemData w = truncate (vm);
+   return (w << {offset, 3'b000});
 endfunction
+WordXL rvfi_mem_align = fromInteger (valueOf (TDiv #(RVFI_MEMLEN, 8)) - 1);
 `endif
 
 module mkCPU_Stage2 #(Bit #(4)         verbosity,
@@ -209,6 +215,11 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 						    rvfi_instr_C:   rg_stage2.instr_C,
 						    rvfi_rs1_val:   rg_stage2.rs1_val,
 						    rvfi_rs2_val:   rg_stage2.rs2_val,
+`ifdef ISA_F
+						    rvfi_frs1_val:  rg_stage2.rvfi_frs1_val,
+						    rvfi_frs2_val:  rg_stage2.rvfi_frs2_val,
+						    rvfi_frs3_val:  rg_stage2.rvfi_frs3_val,
+`endif
 						    rvfi_next_pc:   rg_stage2.next_pc,
 						    rvfi_mem_addr:  0,
 						    rvfi_mem_rmask: 0,
@@ -347,9 +358,14 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
             // GPR loads
 	    data_to_stage3.rd_val = result;
 `ifdef RVFI
-	    data_to_stage3.rvfi_mem_addr  = (rg_stage2.addr & (~ 3));
-	    data_to_stage3.rvfi_mem_rmask = fn_rvfi_mask  (funct3, rg_stage2.addr [1:0]);
-	    data_to_stage3.rvfi_mem_rdata = fn_rvfi_lanes (funct3, rg_stage2.addr [1:0], result);
+	    data_to_stage3.rvfi_mem_addr  = (rg_stage2.addr & (~ rvfi_mem_align));
+	    data_to_stage3.rvfi_mem_rmask = fn_rvfi_mask  (funct3, rg_stage2.addr);
+`ifdef ISA_F
+	    data_to_stage3.rvfi_mem_rdata = fn_rvfi_lanes (funct3, rg_stage2.addr,
+							   (rg_stage2.rd_in_fpr ? dcache.word64 : zeroExtend (result)));
+`else
+	    data_to_stage3.rvfi_mem_rdata = fn_rvfi_lanes (funct3, rg_stage2.addr, zeroExtend (result));
+`endif
 `ifdef ISA_A
 	    if (rg_stage2.op_stage2 == OP_Stage2_AMO) begin
 	       // RVFI per the Sail model (riscv_insts_aext.sail) and the RVFI spec:
@@ -360,8 +376,8 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 		  data_to_stage3.rvfi_mem_rmask = 0;
 		  data_to_stage3.rvfi_mem_rdata = 0;
 		  if (result == 0) begin
-		     data_to_stage3.rvfi_mem_wmask = fn_rvfi_mask  (funct3, rg_stage2.addr [1:0]);
-		     data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (funct3, rg_stage2.addr [1:0], rg_stage2.val2);
+		     data_to_stage3.rvfi_mem_wmask = fn_rvfi_mask  (funct3, rg_stage2.addr);
+		     data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (funct3, rg_stage2.addr, zeroExtend (rg_stage2.val2));
 		  end
 	       end
 	       else if (f5 != f5_AMO_LR) begin
@@ -378,8 +394,8 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 				  f5_AMO_MINU: ((old < v2) ? old : v2);
 				  default:     ((old < v2) ? v2 : old);    // MAXU
 			       endcase;
-		  data_to_stage3.rvfi_mem_wmask = fn_rvfi_mask  (funct3, rg_stage2.addr [1:0]);
-		  data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (funct3, rg_stage2.addr [1:0], amo);
+		  data_to_stage3.rvfi_mem_wmask = fn_rvfi_mask  (funct3, rg_stage2.addr);
+		  data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (funct3, rg_stage2.addr, zeroExtend (amo));
 	       end
 	    end
 `endif
@@ -457,9 +473,14 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 	 data_to_stage3.rd       = 0;
 `ifdef RVFI
 	 let st_funct3 = instr_funct3 (rg_stage2.instr);
-	 data_to_stage3.rvfi_mem_addr  = (rg_stage2.addr & (~ 3));
-	 data_to_stage3.rvfi_mem_wmask = fn_rvfi_mask  (st_funct3, rg_stage2.addr [1:0]);
-	 data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (st_funct3, rg_stage2.addr [1:0], rg_stage2.val2);
+	 data_to_stage3.rvfi_mem_addr  = (rg_stage2.addr & (~ rvfi_mem_align));
+	 data_to_stage3.rvfi_mem_wmask = fn_rvfi_mask  (st_funct3, rg_stage2.addr);
+`ifdef ISA_F
+	 data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (st_funct3, rg_stage2.addr,
+							(rg_stage2.rs_frm_fpr ? zeroExtend (rg_stage2.fval2) : zeroExtend (rg_stage2.val2)));
+`else
+	 data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (st_funct3, rg_stage2.addr, zeroExtend (rg_stage2.val2));
+`endif
 `endif
 
 	 output_stage2 = Output_Stage2 {ostatus         : ostatus,

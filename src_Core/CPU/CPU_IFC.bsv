@@ -174,10 +174,10 @@ interface CPU_IFC;
    method WordXL      mv_rvfi_pc_rdata;
    method WordXL      mv_rvfi_pc_wdata;
    method WordXL      mv_rvfi_mem_addr;
-   method Bit #(4)    mv_rvfi_mem_rmask;
-   method Bit #(4)    mv_rvfi_mem_wmask;
-   method WordXL      mv_rvfi_mem_rdata;
-   method WordXL      mv_rvfi_mem_wdata;
+   method RVFI_MemMask mv_rvfi_mem_rmask;
+   method RVFI_MemMask mv_rvfi_mem_wmask;
+   method RVFI_MemData mv_rvfi_mem_rdata;
+   method RVFI_MemData mv_rvfi_mem_wdata;
    // CSR side of the retirement (formal/gen_wrapper.py fans these out to riscv-formal's
    // per-CSR rvfi_csr_<name>_{rmask,wmask,rdata,wdata}).  kind: 0 none, 1 CSRRx, 2 trap, 3 MRET.
    method Bit #(3)    mv_rvfi_csr_kind;     // 0 none 1 CSRRx 2 trap->M 3 MRET 4 trap->S 5 SRET
@@ -193,6 +193,30 @@ interface CPU_IFC;
    method WordXL      mv_rvfi_mtval;        // trap: written
    method WordXL      mv_rvfi_mtvec;        // trap: read
    method WordXL      mv_rvfi_medeleg;      // trap: read
+`ifdef ISA_F
+   // F/D (riscv-formal-fp, docs/rvfi.md names): FPR operands / result, and the fcsr (frm, fflags
+   // aliases included) and mstatus.FS view of an FP instruction or an fflags/frm/fcsr CSRRx
+   method Bit #(5)    mv_rvfi_frs1_addr;
+   method Bit #(5)    mv_rvfi_frs2_addr;
+   method Bit #(5)    mv_rvfi_frs3_addr;
+   method Bool        mv_rvfi_frs1_rvalid;
+   method Bool        mv_rvfi_frs2_rvalid;
+   method Bool        mv_rvfi_frs3_rvalid;
+   method WordFL      mv_rvfi_frs1_rdata;
+   method WordFL      mv_rvfi_frs2_rdata;
+   method WordFL      mv_rvfi_frs3_rdata;
+   method Bit #(5)    mv_rvfi_frd_addr;
+   method Bool        mv_rvfi_frd_wvalid;
+   method WordFL      mv_rvfi_frd_wdata;
+   method Bool        mv_rvfi_fp_valid;       // the fcsr / FS fields below describe this retirement
+   method Bit #(8)    mv_rvfi_fcsr_rmask;
+   method Bit #(8)    mv_rvfi_fcsr_wmask;
+   method Bit #(8)    mv_rvfi_fcsr_rdata;
+   method Bit #(8)    mv_rvfi_fcsr_wdata;
+   method WordXL      mv_rvfi_fp_mstatus_r;   // mstatus before (FS, SD)
+   method Bool        mv_rvfi_fp_mstatus_wen; // FS / SD written
+   method WordXL      mv_rvfi_fp_mstatus_w;
+`endif
 `endif
    method Bool mv_perf_retire;
 

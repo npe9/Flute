@@ -48,6 +48,15 @@ typedef 64 XLEN;
 `endif
 
 typedef TMul #(2, XLEN)  XLEN_2;      // Double-width for multiplications
+
+// RVFI memory window (riscv-formal RISCV_FORMAL_MEMLEN): 64 bits with D (FLD/FSD), else XLEN
+`ifdef ISA_D
+typedef 64 RVFI_MEMLEN;
+`else
+typedef XLEN RVFI_MEMLEN;
+`endif
+typedef Bit #(RVFI_MEMLEN)             RVFI_MemData;
+typedef Bit #(TDiv #(RVFI_MEMLEN, 8))  RVFI_MemMask;
 typedef TSub #(XLEN, 2)  XLEN_MINUS_2;// XLEN-2 for MTVEC base width
 
 Integer xlen = valueOf (XLEN);

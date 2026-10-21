@@ -42,6 +42,9 @@ import CSR_MSTATUS :: *;
 import CSR_MIP     :: *;
 import CSR_MIE     :: *;
 import PMP         :: *;
+`ifdef ISA_ZKR
+import Entropy_Source :: *;
+`endif
 
 // ================================================================
 // Writing a CSR can update multiple CSRs (e.g., writing
@@ -368,6 +371,9 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
    Reg #(Word)       rg_mtval    <- mkRegU;
 
    PMP_IFC pmp <- mkPMP;
+`ifdef ISA_ZKR
+   Entropy_Source_IFC entropy <- mkEntropy_Source_Wait;
+`endif
    // RegFile #(Bit #(2), WordXL)  rf_pmpcfg   <- mkRegFileFull;
    // Vector #(16, Reg #(WordXL))  vrg_pmpaddr <- replicateM (mkRegU);
 
@@ -559,6 +565,9 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 `ifdef RV32
 		     || (csr_addr == csr_addr_mstatush)
 `endif
+`ifdef ISA_ZKR
+		     || (csr_addr == csr_addr_seed)
+`endif
 
 		     || (csr_addr == csr_addr_mscratch)
 		     || (csr_addr == csr_addr_mepc)
@@ -690,6 +699,9 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 	    csr_addr_mcounteren: m_csr_value = tagged Valid (mcounteren_to_word (rg_mcounteren));
 `ifdef RV32
 	    csr_addr_mstatush:   m_csr_value = tagged Valid (0);    // MBE = SBE = 0 (little-endian), no H
+`endif
+`ifdef ISA_ZKR
+	    csr_addr_seed:       m_csr_value = tagged Valid (entropy.seed);
 `endif
 
 	    csr_addr_mscratch:   m_csr_value = tagged Valid rg_mscratch;
@@ -916,6 +928,12 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 `ifdef RV32
 	       csr_addr_mstatush:   new_csr_value = 0;    // all fields read-only 0; writes ignored
 `endif
+`ifdef ISA_ZKR
+	       csr_addr_seed:       begin                 // write value ignored; the access consumes the sample
+				       new_csr_value = 0;
+				       entropy.consume;
+				    end
+`endif
 	       csr_addr_mcounteren: begin
 				       let mcounteren = word_to_mcounteren(wordxl);
 				       new_csr_value  = mcounteren_to_word (mcounteren);
@@ -1082,7 +1100,11 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 
       Bool rw_ok = (read_not_write || (csr_addr [11:10] != 2'b11));
 
-      return (exists && priv_ok && (! tvm_fault) && rw_ok);
+      // Zkr seed (Sail check_seed_CSR): read-only access is illegal; S/U access is illegal
+      // (no mseccfg, so SSEED/USEED are effectively 0)
+      Bool seed_fault = ((csr_addr == csr_addr_seed) && (read_not_write || (priv != m_Priv_Mode)));
+
+      return (exists && priv_ok && (! tvm_fault) && rw_ok && (! seed_fault));
    endfunction: fv_access_permitted
 
    // ================================================================

@@ -1137,6 +1137,8 @@ CSR_Addr   csr_addr_fflags         = 12'h001;    // Floating-point accrued excep
 CSR_Addr   csr_addr_frm            = 12'h002;    // Floating-point Dynamic Rounding Mode
 CSR_Addr   csr_addr_fcsr           = 12'h003;    // Floating-point Control and Status Register (frm + fflags)
 
+CSR_Addr   csr_addr_seed           = 12'h015;    // Zkr entropy source (write-access only; M-mode only, as in Sail)
+
 CSR_Addr   csr_addr_cycle          = 12'hC00;    // Cycle counter for RDCYCLE
 CSR_Addr   csr_addr_time           = 12'hC01;    // Timer for RDTIME
 CSR_Addr   csr_addr_instret        = 12'hC02;    // Instructions retired counter for RDINSTRET

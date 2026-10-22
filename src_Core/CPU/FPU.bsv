@@ -122,9 +122,9 @@ module mkFPU ( FPU_IFC );
       else                           isDoubleFifo.enq(False);
 `endif
 
-      if      (iop == FPNMAdd)    isNegateFifo.enq(True);
-      else if (iop == FPNMSub)    isNegateFifo.enq(True);
-      else                        isNegateFifo.enq(False);
+      // FNMADD/FNMSUB negate their inputs, not the rounded result: -(round(x)) differs from
+      // round(-x) under RDN/RUP and in the sign of an exact zero (TestFloat test/fpu)
+      isNegateFifo.enq(False);
 
       rmdFifo.enq(rmd);
 
@@ -140,8 +140,8 @@ module mkFPU ( FPU_IFC );
 `endif
          FPMAdd:  fpu_madd.request.put(  tuple4(Valid(opd3),         opd1, opd2, rmd) );
          FPMSub:  fpu_madd.request.put(  tuple4(Valid(negate(opd3)), opd1, opd2, rmd) );
-         FPNMAdd: fpu_madd.request.put(  tuple4(Valid(opd3),         opd1, opd2, rmd) );
-         FPNMSub: fpu_madd.request.put(  tuple4(Valid(negate(opd3)), opd1, opd2, rmd) );
+         FPNMAdd: fpu_madd.request.put(  tuple4(Valid(negate(opd3)), negate(opd1), opd2, rmd) );   // -(a*b) - c
+         FPNMSub: fpu_madd.request.put(  tuple4(Valid(opd3),         negate(opd1), opd2, rmd) );   // -(a*b) + c
       endcase
 
    endrule

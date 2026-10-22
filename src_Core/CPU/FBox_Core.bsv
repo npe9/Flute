@@ -1413,6 +1413,17 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
       else
          res = 0;  // note: just ain't possible
 
+      // FMA: inf * 0 is invalid even when the addend is a quiet NaN (the FloatingPoint library
+      // checks the qNaN addend first and returns it without NV)
+      Bool fmaS = isFMADD_S || isFMSUB_S || isFNMADD_S || isFNMSUB_S;
+      Bool infZeroS = (isInfinity (sV1) && isZero (sV2)) || (isZero (sV1) && isInfinity (sV2));
+      if (fmaS && infZeroS) e.invalid_op = True;
+`ifdef ISA_D
+      Bool fmaD = isFMADD_D || isFMSUB_D || isFNMADD_D || isFNMSUB_D;
+      Bool infZeroD = (isInfinity (dV1) && isZero (dV2)) || (isZero (dV1) && isInfinity (dV2));
+      if (fmaD && infZeroD) e.invalid_op = True;
+`endif
+
       let fcsr    = exception_to_fcsr( e );
       fa_driveResponse (res, fcsr);
       resultR     <= tagged Valid (tuple2 (res, fcsr));

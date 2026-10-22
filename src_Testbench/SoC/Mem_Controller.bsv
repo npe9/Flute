@@ -81,7 +81,7 @@ import AXI4_Types  :: *;
 // Raw mem data width:    256 (bits/ 32 x Byte/ 8 x Word32/ 4 x Word64)
 // Raw mem address width: 64  (arbitrarily chosen generously large)
 
-typedef 256  Bits_per_Raw_Mem_Word;
+typedef 512  Bits_per_Raw_Mem_Word;    // option A (mem-optA): = the 64-byte L1 line
 typedef Bit #(Bits_per_Raw_Mem_Word)  Raw_Mem_Word;
 
 typedef 64  Bits_per_Raw_Mem_Addr;
@@ -273,7 +273,9 @@ module mkMem_Controller (Mem_Controller_IFC);
        f_raw_mem_rsps <- mkPipelineFIFOF;
 
    // We maintain a 1-raw_mem_word cache
-   Reg #(Bool)          rg_cached_clean        <- mkRegU;
+   // Option A: per-byte dirty mask instead of a clean bit; writeback sends
+   // only dirty bytes (Sdram_Controller skips bursts with none).
+   Reg #(Bit #(TDiv #(Bits_per_Raw_Mem_Word, 8))) rg_dirty_be <- mkReg (0);
    Reg #(Raw_Mem_Addr)  rg_cached_raw_mem_addr <- mkRegU;
    Reg #(Raw_Mem_Word)  rg_cached_raw_mem_word <- mkRegU;
 
@@ -402,13 +404,13 @@ module mkMem_Controller (Mem_Controller_IFC);
 
    rule rl_writeback_dirty_idle (   (rg_state == STATE_READY)
 				 && (! f_reqs.notEmpty)           // Idle
-				 && (! rg_cached_clean));
+				 && (rg_dirty_be != 0));
       let raw_mem_req = MemoryRequest {write:   True,
-				       byteen:  '1,
+				       byteen:  rg_dirty_be,
 				       address: rg_cached_raw_mem_addr,
 				       data:    rg_cached_raw_mem_word};
       f_raw_mem_reqs.enq (raw_mem_req);
-      rg_cached_clean <= True;
+      rg_dirty_be <= 0;
       if (cfg_verbosity > 2)
 	 $display ("%0d: Mem_Controller.rl_writeback_dirty_idle to raw addr 0x%0h",
 		   cur_cycle, rg_cached_raw_mem_addr);
@@ -422,13 +424,13 @@ module mkMem_Controller (Mem_Controller_IFC);
    rule rl_writeback_dirty (   (rg_state == STATE_READY)
 			    && f_reqs.first.addr_ok
 			    && (rg_cached_raw_mem_addr != req_raw_mem_addr)
-			    && (! rg_cached_clean));
+			    && (rg_dirty_be != 0));
       let raw_mem_req = MemoryRequest {write:   True,
-				       byteen:  '1,
+				       byteen:  rg_dirty_be,
 				       address: rg_cached_raw_mem_addr,
 				       data:    rg_cached_raw_mem_word};
       f_raw_mem_reqs.enq (raw_mem_req);
-      rg_cached_clean <= True;
+      rg_dirty_be <= 0;
       if (cfg_verbosity > 2)
 	 $display ("%0d: Mem_Controller.rl_writeback_dirty to raw addr 0x%0h",
 		   cur_cycle, rg_cached_raw_mem_addr);
@@ -442,7 +444,7 @@ module mkMem_Controller (Mem_Controller_IFC);
    rule rl_miss_clean_req (   (rg_state == STATE_READY)
 			   && f_reqs.first.addr_ok
 			   && (rg_cached_raw_mem_addr != req_raw_mem_addr)
-			   && rg_cached_clean);
+			   && (rg_dirty_be == 0));
       let raw_mem_req = MemoryRequest {write:   False,
 				       byteen:  '1,
 				       address: req_raw_mem_addr,
@@ -461,7 +463,7 @@ module mkMem_Controller (Mem_Controller_IFC);
       Raw_Mem_Word raw_mem_word = unpack (raw_mem_rsp.data);
       rg_cached_raw_mem_word <= raw_mem_word;
       rg_state <= STATE_READY;
-      rg_cached_clean <= True;
+      rg_dirty_be <= 0;
 
       if (cfg_verbosity > 2) begin
 	 $display ("%0d: Mem_Controller.rl_reload: raw addr 0x%0h", cur_cycle, rg_cached_raw_mem_addr);
@@ -537,7 +539,8 @@ module mkMem_Controller (Mem_Controller_IFC);
       // Write it back into the cached raw_mem_word
       raw_mem_word_V_Word64 [word64_in_raw_mem_word] = updated_word64;
       rg_cached_raw_mem_word <= pack (raw_mem_word_V_Word64);
-      rg_cached_clean        <= False;
+      Bit #(TDiv #(Bits_per_Raw_Mem_Word, 8)) be_word = zeroExtend (strobe);
+      rg_dirty_be <= rg_dirty_be | (be_word << { word64_in_raw_mem_word, 3'b0 });
 
       let wrr = AXI4_Wr_Resp {bid:   f_reqs.first.id,
 			      bresp: axi4_resp_okay,
@@ -590,7 +593,7 @@ module mkMem_Controller (Mem_Controller_IFC);
       if (rg_cached_raw_mem_addr == (raw_mem_words_per_mem - 1)) begin
 	 rg_cached_raw_mem_addr <= rg_cached_raw_mem_addr;
 	 rg_cached_raw_mem_word <= unpack (0);
-	 rg_cached_clean        <= True;
+	 rg_dirty_be            <= 0;
 	 rg_state <= STATE_READY;
 
 	 // if (cfg_verbosity != 0)

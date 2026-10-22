@@ -341,6 +341,7 @@ module mkSoC_Map (SoC_Map_IFC);
       return (   fn_is_near_mem_io_addr (addr)
 	      || fn_is_plic_addr (addr)
 	      || fn_is_uart0_addr  (addr)
+	      || ((soc_info_addr_base <= addr) && (addr < soc_info_addr_lim))
 `ifdef INCLUDE_ACCEL0
 	      || fn_is_accel0_addr  (addr)
 `endif

@@ -148,7 +148,7 @@ interface PMP_IFC;
    method PMP_Table pmp_table;
 endinterface
 
-function Bool fv_is_pmp_csr (CSR_Addr a) = ((a [11:4] == 8'h3A) || (a [11:6] == 6'b0011_10) || (a [11:6] == 6'b0011_11));
+function Bool fv_is_pmp_csr (CSR_Addr a) = ((a >= 12'h3A0) && (a <= 12'h3EF));
 // 0x3A0-0x3AF pmpcfg0-15, 0x3B0-0x3EF pmpaddr0-63
 
 // Not synthesized: 'read' is called from both CSR read ports.

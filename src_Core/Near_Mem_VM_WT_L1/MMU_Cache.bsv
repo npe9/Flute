@@ -1101,8 +1101,17 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	 rg_pa <= vm_xlate_result.pa;
 	 let is_mem_addr = soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (vm_xlate_result.pa));
 
+	 // Neither memory nor a mapped device: precise access fault, nothing
+	 // reaches the fabric (a posted write-through store would otherwise
+	 // lose the DECERR and complete silently; TestRIG D1).
+	 if (dmem_not_imem && (! is_mem_addr)
+	     && (! soc_map.m_is_IO_addr (fn_PA_to_Fabric_Addr (vm_xlate_result.pa)))) begin
+	    rg_state    <= MODULE_EXCEPTION_RSP;
+	    rg_exc_code <= access_exc_code;
+	 end
+
 	 // Access to non-memory
-	 if (dmem_not_imem && (! is_mem_addr)) begin
+	 else if (dmem_not_imem && (! is_mem_addr)) begin
 	    // IO requests
 	    rg_state <= IO_REQ;
 
@@ -2154,7 +2163,6 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 `endif
       rg_addr        <= addr;
       rg_st_amo_val  <= st_value;
-      rg_req_seq     <= ! rg_req_seq;
       rg_kill_echo   <= False;    // RLD-4: this req supersedes any stale echo
 
       rg_priv        <= priv;
@@ -2173,6 +2181,11 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       else begin
 	 rg_state <= MODULE_RUNNING;
 	 fa_req_ram_B (addr);
+	 // Toggle only when a RAM read is launched: a misaligned req launches
+	 // none, and rl_age_ram_rsp does not run in MODULE_EXCEPTION_RSP, so a
+	 // toggle there would be cancelled by the next req's toggle and the
+	 // probe would consume the stale rg_tag_ram_q/rg_data_ram_q (TestRIG D2).
+	 rg_req_seq <= ! rg_req_seq;
       end
    endmethod
 

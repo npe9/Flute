@@ -180,6 +180,11 @@ deriving (Bits, Eq, FShow);
 
 Integer status_mem_controller_terminated = 1;
 
+// Option B line-half states
+Bit #(2) hs_invalid = 0;
+Bit #(2) hs_pending = 1;
+Bit #(2) hs_valid   = 2;
+
 // ================================================================
 // Interface
 
@@ -272,10 +277,26 @@ module mkMem_Controller (Mem_Controller_IFC);
    FIFOF #(MemoryResponse #(Bits_per_Raw_Mem_Word))
        f_raw_mem_rsps <- mkPipelineFIFOF;
 
-   // We maintain a 1-raw_mem_word cache
+   // Option B (mem-optB): a one-LINE cache.  A line is two raw_mem_words
+   // (2 x 256 b = the 64-byte L1 line).  On a line switch the half that
+   // holds the requested beat is read first and the other half right
+   // behind it (both queued in Sdram_Controller), so the second half of
+   // an L1 refill no longer pays a full serialized reload.  Each half has
+   // its own state and dirty bit; only dirty halves are written back.
+   Reg #(Raw_Mem_Addr)        rg_line     <- mkReg (0);     // raw_mem_addr >> 1
+   Reg #(Raw_Mem_Word)        rg_half0    <- mkRegU;
+   Reg #(Raw_Mem_Word)        rg_half1    <- mkRegU;
+   Vector #(2, Reg #(Bit #(2))) rg_hstat  <- replicateM (mkReg (hs_invalid));
+   Reg #(Bool)                rg_dirty0   <- mkReg (False);
+   Reg #(Bool)                rg_dirty1   <- mkReg (False);
+   Reg #(Maybe #(Bit #(1)))   rg_issue_other <- mkReg (tagged Invalid);
+   FIFOF #(Bit #(1))          f_rd_order  <- mkSizedFIFOF (2);  // half of each raw read in flight
+
+`ifdef INCLUDE_INITIAL_MEMZERO
    Reg #(Bool)          rg_cached_clean        <- mkRegU;
    Reg #(Raw_Mem_Addr)  rg_cached_raw_mem_addr <- mkRegU;
    Reg #(Raw_Mem_Word)  rg_cached_raw_mem_word <- mkRegU;
+`endif
 
 `ifdef WATCH_TOHOST
    // Ad hoc ISA-test simulation support: watch <tohost> and stop on non-zero write.
@@ -320,17 +341,15 @@ module mkMem_Controller (Mem_Controller_IFC);
       f_reset_rsps.enq (?);
    endrule
 
-   // On reset, we initialize the local cache with contents of raw_mem_addr 0
+   // On reset the line cache starts empty (both halves invalid).
    rule rl_reset_reload_cache (rg_state == STATE_RESET_RELOAD_CACHE);
-      let raw_mem_req = MemoryRequest {write:   False,
-				       byteen:  '1,
-				       address: 0,
-				       data:    ?};
-      f_raw_mem_reqs.enq (raw_mem_req);
-      rg_cached_raw_mem_addr <= 0;
-      rg_state <= STATE_RELOADING;
-      if (cfg_verbosity > 1)
-	 $display ("%0d: Mem_Controller.rl_reset_reload_cache => STATE_RELOADING", cur_cycle);
+      rg_hstat [0]   <= hs_invalid;
+      rg_hstat [1]   <= hs_invalid;
+      rg_dirty0      <= False;
+      rg_dirty1      <= False;
+      rg_issue_other <= tagged Invalid;
+      f_rd_order.clear;
+      rg_state       <= STATE_READY;
    endrule
 
    // ----------------------------------------------------------------
@@ -396,159 +415,157 @@ module mkMem_Controller (Mem_Controller_IFC);
 
    let req_raw_mem_addr = f_reqs.first.raw_addr;    // E15: precomputed at merge
 
-   // ----------------
-   // This rule fires when there's no fabric req and the cached raw_mem_word is dirty;
-   // it writes back the dirty raw_mem_word; the cached raw_mem_word becomes clean
+   Raw_Mem_Addr req_line = req_raw_mem_addr >> 1;
+   Bit #(1)     req_half = req_raw_mem_addr [0];
+   Bool         same_line = (rg_line == req_line);
+   Bool         any_pending = (rg_hstat [0] == hs_pending) || (rg_hstat [1] == hs_pending);
+   Bool         req_half_valid = (rg_hstat [req_half] == hs_valid);
 
-   rule rl_writeback_dirty_idle (   (rg_state == STATE_READY)
-				 && (! f_reqs.notEmpty)           // Idle
-				 && (! rg_cached_clean));
-      let raw_mem_req = MemoryRequest {write:   True,
-				       byteen:  '1,
-				       address: rg_cached_raw_mem_addr,
-				       data:    rg_cached_raw_mem_word};
-      f_raw_mem_reqs.enq (raw_mem_req);
-      rg_cached_clean <= True;
-      if (cfg_verbosity > 2)
-	 $display ("%0d: Mem_Controller.rl_writeback_dirty_idle to raw addr 0x%0h",
-		   cur_cycle, rg_cached_raw_mem_addr);
+   function Action fa_raw_write (Bit #(1) h, Raw_Mem_Word w);
+      action
+         f_raw_mem_reqs.enq (MemoryRequest {write:   True,
+                                            byteen:  '1,
+                                            address: { rg_line [valueOf (Bits_per_Raw_Mem_Addr) - 2 : 0], h },
+                                            data:    w});
+      endaction
+   endfunction
+
+   function Action fa_raw_read (Raw_Mem_Addr line, Bit #(1) h);
+      action
+         f_raw_mem_reqs.enq (MemoryRequest {write:   False,
+                                            byteen:  '1,
+                                            address: { line [valueOf (Bits_per_Raw_Mem_Addr) - 2 : 0], h },
+                                            data:    ?});
+         f_rd_order.enq (h);
+      endaction
+   endfunction
+
+   // ----------------
+   // Raw-memory read responses arrive in issue order; f_rd_order says which half.
+   (* descending_urgency = "rl_raw_rsp, rl_process_wr_req" *)
+   rule rl_raw_rsp;
+      let raw_mem_rsp <- pop (f_raw_mem_rsps);
+      let h = f_rd_order.first;  f_rd_order.deq;
+      if (h == 0) rg_half0 <= raw_mem_rsp.data; else rg_half1 <= raw_mem_rsp.data;
+      rg_hstat [h] <= hs_valid;
+   endrule
+
+   // Second half of a line switch, issued the cycle after the critical half.
+   rule rl_issue_other (rg_state == STATE_READY &&& rg_issue_other matches tagged Valid .h);
+      fa_raw_read (rg_line, h);
+      rg_issue_other <= tagged Invalid;
    endrule
 
    // ----------------
-   // This rule fires on a fabric req when the cached raw_mem_word has a
-   // different raw_mem_word-addr and is dirty;
-   // it writes back the dirty raw_mem_word; the cached raw_mem_word becomes clean
+   // Write back dirty halves: when idle, or when the next request is for another line.
 
    rule rl_writeback_dirty (   (rg_state == STATE_READY)
-			    && f_reqs.first.addr_ok
-			    && (rg_cached_raw_mem_addr != req_raw_mem_addr)
-			    && (! rg_cached_clean));
-      let raw_mem_req = MemoryRequest {write:   True,
-				       byteen:  '1,
-				       address: rg_cached_raw_mem_addr,
-				       data:    rg_cached_raw_mem_word};
-      f_raw_mem_reqs.enq (raw_mem_req);
-      rg_cached_clean <= True;
-      if (cfg_verbosity > 2)
-	 $display ("%0d: Mem_Controller.rl_writeback_dirty to raw addr 0x%0h",
-		   cur_cycle, rg_cached_raw_mem_addr);
-   endrule
-
-   // ----------------
-   // This rule fires on a fabric req when the cached raw_mem_word has a
-   // different addr and is clean; we overwrite with the correct raw_mem_word
-   // by reloading from memory; the new cached raw_mem_word is clean.
-
-   rule rl_miss_clean_req (   (rg_state == STATE_READY)
-			   && f_reqs.first.addr_ok
-			   && (rg_cached_raw_mem_addr != req_raw_mem_addr)
-			   && rg_cached_clean);
-      let raw_mem_req = MemoryRequest {write:   False,
-				       byteen:  '1,
-				       address: req_raw_mem_addr,
-				       data:    ?};
-      f_raw_mem_reqs.enq (raw_mem_req);
-      rg_cached_raw_mem_addr <= req_raw_mem_addr;
-      rg_state <= STATE_RELOADING;
-
-      if (cfg_verbosity > 2)
-	 $display ("%0d: Mem_Controller.rl_miss_clean_req: read raw addr 0x%0h",
-		   cur_cycle, req_raw_mem_addr);
-   endrule
-
-   rule rl_reload (rg_state == STATE_RELOADING);
-      let raw_mem_rsp <- pop (f_raw_mem_rsps);
-      Raw_Mem_Word raw_mem_word = unpack (raw_mem_rsp.data);
-      rg_cached_raw_mem_word <= raw_mem_word;
-      rg_state <= STATE_READY;
-      rg_cached_clean <= True;
-
-      if (cfg_verbosity > 2) begin
-	 $display ("%0d: Mem_Controller.rl_reload: raw addr 0x%0h", cur_cycle, rg_cached_raw_mem_addr);
-	 $display ("        ", fshow (raw_mem_word));
+                            && ((! f_reqs.notEmpty) || (f_reqs.first.addr_ok && (! same_line)))
+                            && (rg_dirty0 || rg_dirty1));
+      if (rg_dirty0) begin
+         fa_raw_write (0, rg_half0);
+         rg_dirty0 <= False;
       end
+      else begin
+         fa_raw_write (1, rg_half1);
+         rg_dirty1 <= False;
+      end
+      if (cfg_verbosity > 2)
+         $display ("%0d: Mem_Controller.rl_writeback_dirty line 0x%0h", cur_cycle, rg_line);
    endrule
 
    // ----------------
-   // This rule fires on a fabric read request when the cached raw_mem_word has the
-   // same addr ('hit'), whether clean or dirty.
-   // Returns the full Wd_Data-wide word containing the byte specified by the address.
-   // i.e., we do not extract relevant bytes here, leaving that to the requestor.
+   // Line switch: clean, nothing in flight.  Critical half first.
+
+   rule rl_switch_line (   (rg_state == STATE_READY)
+                        && f_reqs.first.addr_ok
+                        && (! same_line)
+                        && (! rg_dirty0) && (! rg_dirty1)
+                        && (! f_rd_order.notEmpty)
+                        && (! isValid (rg_issue_other)));
+      fa_raw_read (req_line, req_half);
+      rg_line        <= req_line;
+      rg_hstat [req_half]     <= hs_pending;
+      rg_hstat [1 - req_half] <= hs_pending;
+      rg_issue_other <= tagged Valid (1 - req_half);
+      if (cfg_verbosity > 2)
+         $display ("%0d: Mem_Controller.rl_switch_line: raw addr 0x%0h", cur_cycle, req_raw_mem_addr);
+   endrule
+
+   // Same line, half invalid (only after reset): fetch just that half.
+   rule rl_fill_half (   (rg_state == STATE_READY)
+                      && f_reqs.first.addr_ok
+                      && same_line
+                      && (rg_hstat [req_half] == hs_invalid)
+                      && (! f_rd_order.notEmpty)
+                      && (! isValid (rg_issue_other)));
+      fa_raw_read (rg_line, req_half);
+      rg_hstat [req_half] <= hs_pending;
+   endrule
+
+   // ----------------
+   // Read hit: returns the full Wd_Data-wide word containing the target byte.
 
    rule rl_process_rd_req  (   (rg_state == STATE_READY)
-			    && f_reqs.first.addr_ok
-			    && (rg_cached_raw_mem_addr == req_raw_mem_addr)
-			    && (f_reqs.first.req_op == REQ_OP_RD));
-
-      // ----------------
-      // We need to select the fabric data word from the raw mem word that contains the target address.
-
-      // View the raw mem word as a vector of fabric data words (Wd_Data width words)
-      Vector #(Fabric_Data_per_Raw_Mem_Word, Bit #(Wd_Data)) raw_mem_word_V_fabric_data = unpack (rg_cached_raw_mem_word);
-
-      // Get the index into this vector of the fabric word containing the target address.
-      // For this index, use a generous size (here Bit #(16)), and let zeroExtend pad it automaticallly.
+                            && f_reqs.first.addr_ok
+                            && same_line && req_half_valid
+                            && (f_reqs.first.req_op == REQ_OP_RD));
+      Raw_Mem_Word w = (req_half == 0) ? rg_half0 : rg_half1;
+      Vector #(Fabric_Data_per_Raw_Mem_Word, Bit #(Wd_Data)) raw_mem_word_V_fabric_data = unpack (w);
       Fabric_Addr addr = f_reqs.first.addr;
       Bit #(Bits_per_Byte_in_Raw_Mem_Word) n = addr [hi_byte_in_raw_mem_word : 0];
       n = (n >> lo_fabric_data);
-
-      // Select the fabric data word of interest
       Bit #(Wd_Data) rdata = raw_mem_word_V_fabric_data [n];
 
       let rdr = AXI4_Rd_Data {rid:   f_reqs.first.id,
-			      rdata: rdata,
-			      rresp: axi4_resp_okay,
-			      rlast: True,
-			      ruser: f_reqs.first.user};
+                              rdata: rdata,
+                              rresp: axi4_resp_okay,
+                              rlast: True,
+                              ruser: f_reqs.first.user};
       slave_xactor.i_rd_data.enq (rdr);
       f_reqs.deq;
 
       if (cfg_verbosity > 1) begin
-	 $display ("%0d: Mem_Controller.rl_process_rd_req: ", cur_cycle);
-	 $display ("        ", fshow (f_reqs.first));
-	 $display ("     => ", fshow (rdr));
+         $display ("%0d: Mem_Controller.rl_process_rd_req: ", cur_cycle);
+         $display ("        ", fshow (f_reqs.first));
+         $display ("     => ", fshow (rdr));
       end
    endrule
 
    // ----------------
-   // This rule fires on a fabric write request when the cached raw_mem_word has the
-   // same addr ('hit'), whether clean or dirty.
+   // Write hit (half valid, clean or dirty).
 
    rule rl_process_wr_req  (   (rg_state == STATE_READY)
-			    && f_reqs.first.addr_ok
-			    && (rg_cached_raw_mem_addr == req_raw_mem_addr)
-			    && (f_reqs.first.req_op == REQ_OP_WR));
-      // Get the old (cached) value of the word64
+                            && f_reqs.first.addr_ok
+                            && same_line && req_half_valid
+                            && (f_reqs.first.req_op == REQ_OP_WR));
+      Raw_Mem_Word w = (req_half == 0) ? rg_half0 : rg_half1;
       Word64_in_Raw_Mem_Word word64_in_raw_mem_word = f_reqs.first.addr [hi_byte_in_raw_mem_word : 3];
-      Vector #(Word64s_per_Raw_Mem_Word, Bit #(64)) raw_mem_word_V_Word64 = unpack (rg_cached_raw_mem_word);
+      Vector #(Word64s_per_Raw_Mem_Word, Bit #(64)) raw_mem_word_V_Word64 = unpack (w);
       Bit #(64) word64_old = raw_mem_word_V_Word64 [word64_in_raw_mem_word];
 
-      // Lane-adjust the new word64
       Bit #(64) word64_new = zeroExtend (f_reqs.first.data);
       Bit #(8)  strobe     = zeroExtend (f_reqs.first.wstrb);
       if ((valueOf (Wd_Data) == 32) && (f_reqs.first.addr [2] == 1'b1)) begin
-	 // Upper 32b only
-	 word64_new = { word64_new [31:0], 0 };
-	 strobe     = { strobe     [3:0],  0 };
+         word64_new = { word64_new [31:0], 0 };
+         strobe     = { strobe     [3:0],  0 };
       end
       Bit #(64) mask     = fn_strobe_to_mask (strobe);
       let updated_word64 = ((word64_old & (~ mask)) | (word64_new & mask));
-
-      // Write it back into the cached raw_mem_word
       raw_mem_word_V_Word64 [word64_in_raw_mem_word] = updated_word64;
-      rg_cached_raw_mem_word <= pack (raw_mem_word_V_Word64);
-      rg_cached_clean        <= False;
+      if (req_half == 0) begin rg_half0 <= pack (raw_mem_word_V_Word64); rg_dirty0 <= True; end
+      else               begin rg_half1 <= pack (raw_mem_word_V_Word64); rg_dirty1 <= True; end
 
       let wrr = AXI4_Wr_Resp {bid:   f_reqs.first.id,
-			      bresp: axi4_resp_okay,
-			      buser: f_reqs.first.user};
+                              bresp: axi4_resp_okay,
+                              buser: f_reqs.first.user};
       slave_xactor.i_wr_resp.enq (wrr);
       f_reqs.deq;
 
       if (cfg_verbosity > 1) begin
-	 $display ("%0d: Mem_Controller.rl_process_wr_req: ", cur_cycle);
-	 $display ("        ", fshow (f_reqs.first));
-	 $display ("     => ", fshow (wrr));
+         $display ("%0d: Mem_Controller.rl_process_wr_req: ", cur_cycle);
+         $display ("        ", fshow (f_reqs.first));
+         $display ("     => ", fshow (wrr));
       end
 
 `ifdef WATCH_TOHOST

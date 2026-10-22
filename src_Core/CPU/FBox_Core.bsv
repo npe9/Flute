@@ -128,6 +128,23 @@ function Bool fv_FDoubleIsPositiveZero ( FDouble x );
    return ( isZero (x) && !(x.sign) );
 endfunction
 
+// FCVT.WU/LU of a negative non-zero value: True if it rounds to 0 under rm (a valid result, NX only),
+// False if it rounds to -1 or below (out of range: NV only). |f| < 0.5, == 0.5, < 1 from the exponent.
+function Bool fv_negRoundsToZero (FloatingPoint #(e, m) f, Bit #(3) rm);
+   Bit #(e) bias_v = '1 >> 1;
+   Bool ltHalf = f.exp < (bias_v - 1);
+   Bool isHalf = (f.exp == (bias_v - 1)) && (f.sfd == 0);
+   Bool ltOne  = f.exp < bias_v;
+   case (rm)
+      3'h0:    return (ltHalf || isHalf);   // RNE: -0.5 ties to even (0)
+      3'h1:    return ltOne;                // RTZ
+      3'h2:    return False;                // RDN: any negative rounds to <= -1
+      3'h3:    return ltOne;                // RUP
+      3'h4:    return ltHalf;               // RMM: -0.5 rounds away to -1
+      default: return False;
+   endcase
+endfunction
+
 // ================================================================
 
 `ifdef RVFI_ALTOPS
@@ -633,6 +650,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
          v = (1<<63) - 1;
 
       Bit #(64) res = ( pack (v) );
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -650,13 +668,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
 
       // Extra work if the operand is negative. The original convert function
       // prioritizes the sign of the operand before inexact checks
-      if (f.sign) begin
-         // Result is zero
+      if (f.sign && !isNaN (f) && !isZero (f)) begin
+         // Result is zero: NX only if the value rounds to 0 under rm, otherwise out of range (NV only)
          v = 0;
-         // No exceptions were signalled, signal invalid exception, otherwise
-         // let original exception remain
-         if (pack (e) == 0)
-            e.invalid_op = True;
+         e = defaultValue;
+         if (fv_negRoundsToZero (f, rm)) e.inexact = True;
+         else                            e.invalid_op = True;
       end
 
       // Handle infinity and NaNs
@@ -665,6 +682,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
          v = 64'hffffffffffffffff;
 
       Bit #(64) res = ( pack (v) );
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -683,6 +701,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
          v = (1<<31) - 1;
 
       Bit #(64) res = signExtend (pack (v));
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -700,13 +719,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
 
       // Extra work if the operand is negative. The original convert function
       // prioritizes the sign of the operand before inexact checks
-      if (f.sign) begin
-         // Result is zero
+      if (f.sign && !isNaN (f) && !isZero (f)) begin
+         // Result is zero: NX only if the value rounds to 0 under rm, otherwise out of range (NV only)
          v = 0;
-         // No exceptions were signalled, signal invalid exception, otherwise
-         // let original exception remain
-         if (pack (e) == 0)
-            e.invalid_op = True;
+         e = defaultValue;
+         if (fv_negRoundsToZero (f, rm)) e.inexact = True;
+         else                            e.invalid_op = True;
       end
 
       // Handle infinity and NaNs
@@ -717,6 +735,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
       // This is meant for the GPR. If the GPR is 64-bit, the 32-bit result is
       // stored, sign-extended as per the v2.2 of the spec
       Bit #(64) res = signExtend(pack (v));
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -1041,6 +1060,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
          v = (1<<31) - 1;
 
       Bit #(64) res = signExtend(pack (v));
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -1058,13 +1078,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
 
       // Extra work if the operand is negative. The original convert function
       // prioritizes the sign of the operand before inexact checks
-      if (f.sign) begin
-         // Result is zero
+      if (f.sign && !isNaN (f) && !isZero (f)) begin
+         // Result is zero: NX only if the value rounds to 0 under rm, otherwise out of range (NV only)
          v = 0;
-         // No exceptions were signalled, signal invalid exception, otherwise
-         // let original exception remain
-         if (pack (e) == 0)
-            e.invalid_op = True;
+         e = defaultValue;
+         if (fv_negRoundsToZero (f, rm)) e.inexact = True;
+         else                            e.invalid_op = True;
       end
 
       // Handle infinity and NaNs
@@ -1075,6 +1094,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
       // This is meant for the GPR. If the GPR is 64-bit, the 32-bit result is
       // stored, sign-extended as per the v2.2 of the spec
       Bit #(64) res = signExtend(pack(v));
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -1115,6 +1135,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
          v = (1<<63) - 1;
 
       Bit #(64) res = pack (v);
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -1132,13 +1153,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
 
       // Extra work if the operand is negative. The original convert function
       // prioritizes the sign of the operand before inexact checks
-      if (f.sign) begin
-         // Result is zero
+      if (f.sign && !isNaN (f) && !isZero (f)) begin
+         // Result is zero: NX only if the value rounds to 0 under rm, otherwise out of range (NV only)
          v = 0;
-         // No exceptions were signalled, signal invalid exception, otherwise
-         // let original exception remain
-         if (pack (e) == 0)
-            e.invalid_op = True;
+         e = defaultValue;
+         if (fv_negRoundsToZero (f, rm)) e.inexact = True;
+         else                            e.invalid_op = True;
       end
 
       // Handle infinity and NaNs
@@ -1147,6 +1167,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
          v = 64'hffffffffffffffff;
 
       Bit #(64) res = pack (v);
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr    = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;

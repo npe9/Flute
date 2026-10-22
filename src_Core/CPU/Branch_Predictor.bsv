@@ -68,6 +68,11 @@ endinterface
 // Ignore PCs[0] since PCs are at least 2-byte aligned (word-aligned).
 
 `ifdef RVFI
+`ifndef RVFI_DII
+`define RVFI_TINY_BTB
+`endif
+`endif
+`ifdef RVFI_TINY_BTB
 typedef   16  BTB_Num_Sets;    // riscv-formal build: short reset loop
 `else
 typedef  512  BTB_Num_Sets;

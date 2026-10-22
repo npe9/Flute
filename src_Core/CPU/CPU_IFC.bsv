@@ -34,6 +34,10 @@ import PC_Trace :: *;
 import TV_Trace_Data :: *;
 `endif
 
+`ifdef RVFI_DII
+import RVFI_DII_Types :: *;
+`endif
+
 // ================================================================
 // CPU interface
 
@@ -149,6 +153,12 @@ interface CPU_IFC;
    // Misc. status; 0 = running, no error
    (* always_ready *)
    method Bit #(8) mv_status;
+
+`ifdef RVFI_DII
+   // TestRIG RVFI-DII: instruction-trace index requests / injected instruction words
+   interface Get #(Dii_Id)                      dii_seq_req;
+   interface Put #(Tuple2 #(Dii_Id, Bit #(32))) dii_instr_rsp;
+`endif
 
    // ----------------
    // Performance-monitoring taps (one-cycle pulses)

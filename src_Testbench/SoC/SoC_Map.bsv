@@ -307,7 +307,17 @@ module mkSoC_Map (SoC_Map_IFC);
    // (Caches need this information to cache these addresses.)
 
    function Bool fn_is_mem_addr (Fabric_Addr addr);
-`ifdef RVFI
+`ifdef RVFI_DII_RAM_8M
+      // TestRIG RVFI-DII harness, Sail's default platform: RAM only, 8 MiB at
+      // 0x8000_0000 (rv_ram_base/size in Sail's c_emulator/riscv_sim.c).
+      return (('h_8000_0000 <= addr) && (addr < 'h_8080_0000));
+`elsif RVFI_DII
+      // TestRIG RVFI-DII harness, default map: all of the 32-bit space is RAM
+      // except the top 64-byte line.  Sail's RAM size register is XLEN wide, so
+      // its RAM cannot reach 2^32; ending both models at a line-aligned limit
+      // makes Sail's end-of-access check and the cache's line granularity agree.
+      return (addr < 'h_FFFF_FFC0);
+`elsif RVFI
       // riscv-formal build: every address is cacheable memory (the formal AXI
       // slave answers everything), so symbolic addresses never fault.
       return True;
@@ -341,8 +351,14 @@ module mkSoC_Map (SoC_Map_IFC);
    // ----------------------------------------------------------------
    // PC, MTVEC and NMIVEC reset values
 
+`ifdef RVFI_DII
+   // TestRIG RVFI-DII harness: start of RAM; mtvec resets to 0 as in Sail (init_sys)
+   Bit #(64) pc_reset_value     = 'h_8000_0000;
+   Bit #(64) mtvec_reset_value  = 0;
+`else
    Bit #(64) pc_reset_value     = boot_rom_addr_base;
    Bit #(64) mtvec_reset_value  = 'h1000;    // TODO
+`endif
 
    // Non-maskable interrupt vector
    Bit #(64) nmivec_reset_value = ?;         // TODO

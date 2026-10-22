@@ -74,19 +74,27 @@ module mkGPR_RegFile (GPR_RegFile_IFC);
    // The spec does not require this, but it's useful for debugging
    // and tandem verification
 
+// TestRIG (RVFI_DII) also needs x1..x31 = 0 at every reset.
 `ifdef INCLUDE_TANDEM_VERIF
+`define GPR_RESET_ZERO
+`endif
+`ifdef RVFI_DII
+`define GPR_RESET_ZERO
+`endif
+
+`ifdef GPR_RESET_ZERO
    Reg #(RegName) rg_j <- mkRegU;    // reset loop index
 `endif
 
    rule rl_reset_start (rg_state == RF_RESET_START);
       rg_state <= RF_RESETTING;
-`ifdef INCLUDE_TANDEM_VERIF
+`ifdef GPR_RESET_ZERO
       rg_j <= 1;
 `endif
    endrule
 
    rule rl_reset_loop (rg_state == RF_RESETTING);
-`ifdef INCLUDE_TANDEM_VERIF
+`ifdef GPR_RESET_ZERO
       regfile.upd (rg_j, 0);
       rg_j <= rg_j + 1;
       if (rg_j == 31)

@@ -443,6 +443,19 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
       rg_tselect    <= 0;
       rg_tdata1     <= 0;    // ISA test rv64mi-p-breakpoint assumes reset value 0.
 
+`ifdef RVFI_DII
+      // TestRIG: these reset values are UNSPECIFIED by the ISA; zero them as
+      // Sail does (init_sys) so traces compare from a defined state.
+      rg_mscratch   <= 0;
+      rg_mepc       <= 0;
+      rg_mtval      <= 0;
+`ifdef ISA_PRIV_S
+      rg_sscratch   <= 0;
+      rg_sepc       <= 0;
+      rg_stval      <= 0;
+`endif
+`endif
+
       rw_minstret.wset (0);
 
 `ifdef INCLUDE_GDB_CONTROL

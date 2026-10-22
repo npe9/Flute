@@ -9,8 +9,15 @@ package Cache_Decls;
 
 // ================================================================
 
-`ifdef RV32
+// RVFI_DII (TestRIG) builds also define RVFI but keep the production geometry.
 `ifdef RVFI
+`ifndef RVFI_DII
+`define RVFI_TINY_CACHES
+`endif
+`endif
+
+`ifdef RV32
+`ifdef RVFI_TINY_CACHES
 // riscv-formal build: tiny geometry so the cache reset loops fit in a BMC bound
 `ifdef SV32
 import Cache_Decls_RV32_Sv32_1KB_1way :: *;   // 34-bit PA (Gen_BSV_Cache_Decls.py)

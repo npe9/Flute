@@ -69,6 +69,12 @@ import CPU_Stage3 :: *;    // Writeback
 
 import Near_Mem_IFC :: *;    // Caches or TCM
 
+`ifdef RVFI_DII
+// TestRIG direct instruction injection: replaces the I-side instruction bits
+import RVFI_DII_Types :: *;
+import CPU_DII_IMem   :: *;
+`endif
+
 `ifdef Near_Mem_Caches
 import Near_Mem_Caches :: *;
 `endif
@@ -160,9 +166,19 @@ module mkCPU (CPU_IFC);
    // Take imem as is from near_mem, or use wrapper for 'C' extension
 `ifdef ISA_C
    // E20: the I-side (ICache_Pipe) presents 16/32-bit instructions itself.
-   IMem_IFC imem = near_mem.imem;
+`ifdef RVFI_DII
+   CPU_DII_IMem_IFC dii_imem <- mkCPU_DII_IMem (near_mem.imem);
+   IMem_IFC imem = dii_imem.imem;
 `else
    IMem_IFC imem = near_mem.imem;
+`endif
+`else
+`ifdef RVFI_DII
+   CPU_DII_IMem_IFC dii_imem <- mkCPU_DII_IMem (near_mem.imem);
+   IMem_IFC imem = dii_imem.imem;
+`else
+   IMem_IFC imem = near_mem.imem;
+`endif
 `endif
 
    // ----------------
@@ -533,7 +549,11 @@ module mkCPU (CPU_IFC);
    // Actions to restart from Debug Mode (e.g., GDB 'continue' after a breakpoint)
    // We re-initialize CPI_instrs and CPI_cycles.
 
+`ifdef RVFI_DII
+   function Action fa_stageF_redirect_core (Addr new_pc);
+`else
    function Action fa_stageF_redirect (Addr new_pc);
+`endif
       action
 	 // Update epoch
 	 let new_epoch = rg_epoch + 1;
@@ -553,6 +573,22 @@ module mkCPU (CPU_IFC);
 		      minstret, new_pc, rg_cur_priv, rg_epoch, new_epoch);
       endaction
    endfunction
+
+`ifdef RVFI_DII
+   // RVFI-DII: every redirect happens after the redirecting instruction has
+   // retired, so the next instruction's trace index is the number of RVFI
+   // records emitted so far (rg_rvfi_order), plus one when the redirect is in
+   // the same rule as that instruction's fa_rvfi (FENCE.I / FENCE / SFENCE.VMA).
+   function Action fa_stageF_redirect_dii (Addr new_pc, Bool retired_here);
+      action
+	 Dii_Id ix = truncate (rg_rvfi_order + (retired_here ? 1 : 0));
+	 dii_imem.req_seq (ix);
+	 fa_stageF_redirect_core (new_pc);
+      endaction
+   endfunction
+
+   function Action fa_stageF_redirect (Addr new_pc) = fa_stageF_redirect_dii (new_pc, False);
+`endif
 
    function Action fa_restart_from_halt (Addr resume_pc);
       action
@@ -967,6 +1003,11 @@ module mkCPU (CPU_IFC);
       stageF.deq;
 
       // Feed Stage F (RAS trained from the instruction leaving StageF)
+`ifdef RVFI_DII
+      // RVFI-DII: sequential fetch takes the next trace index
+      if (! stage2.out.redirect)
+	 dii_imem.req_seq (dii_imem.cur_seq + 1);
+`endif
       if (! stage2.out.redirect)
 	 stageF.enq (d.epoch,
 		     d.pred_pc,
@@ -1103,7 +1144,11 @@ module mkCPU (CPU_IFC);
 	    rg_rvfi_mepc      <= epc;
 	    rg_rvfi_mcause    <= mcause;
 	    rg_rvfi_mtval     <= tval;
+`ifndef RVFI_DII
+	    // (Not in RVFI_DII builds: TestRIG does not use the CSR side, and Bluesim
+	    // cannot schedule a value-method argument computed from csr_trap_actions.)
 	    rg_rvfi_mtvec     <= fromMaybe (0, csr_regfile.read_csr_port2 (to_s ? csr_addr_stvec : csr_addr_mtvec));
+`endif
 	 end
 `endif
 
@@ -1531,7 +1576,11 @@ module mkCPU (CPU_IFC);
       // Resume pipe
       stageD.set_full (False);
       stage1.set_full (False);    fa_step_check;
+`ifdef RVFI_DII
+      fa_stageF_redirect_dii (rg_next_pc, True);    // this rule also retired the fence (fa_rvfi)
+`else
       fa_stageF_redirect (rg_next_pc);
+`endif
    endrule: rl_finish_FENCE_I
 
    // ================================================================
@@ -1581,7 +1630,11 @@ module mkCPU (CPU_IFC);
       // Resume pipe
       stageD.set_full (False);
       stage1.set_full (False);    fa_step_check;
+`ifdef RVFI_DII
+      fa_stageF_redirect_dii (rg_next_pc, True);    // this rule also retired the fence (fa_rvfi)
+`else
       fa_stageF_redirect (rg_next_pc);
+`endif
    endrule: rl_finish_FENCE
 
    // ================================================================
@@ -1633,7 +1686,11 @@ module mkCPU (CPU_IFC);
       // Resume pipe
       stageD.set_full (False);
       stage1.set_full (False);    fa_step_check;
+`ifdef RVFI_DII
+      fa_stageF_redirect_dii (rg_next_pc, True);    // this rule also retired the fence (fa_rvfi)
+`else
       fa_stageF_redirect (rg_next_pc);
+`endif
    endrule: rl_finish_SFENCE_VMA
 `endif
 
@@ -1653,7 +1710,13 @@ module mkCPU (CPU_IFC);
 		       && (stageF.out.ostatus != OSTATUS_BUSY));
 
       rg_next_pc     <= stage1.out.next_pc;
+`ifdef RVFI_DII
+      // TestRIG: Sail retires WFI as a NOP and the harness has no interrupt
+      // sources, so restart the pipe at once (via rl_trap_fetch).
+      rg_state       <= CPU_START_TRAP_HANDLER;
+`else
       rg_state       <= CPU_WFI_PAUSED;
+`endif
       rg_wfi_counter <= 1;
 `ifdef RVFI
       let rvfi_d2 = stage1.out.data_to_stage2;
@@ -2255,6 +2318,10 @@ module mkCPU (CPU_IFC);
    endmethod
 
    // Performance-monitoring taps (see interface comment)
+`ifdef RVFI_DII
+   interface Get dii_seq_req   = dii_imem.dii_seq_req;
+   interface Put dii_instr_rsp = dii_imem.dii_instr_rsp;
+`endif
 `ifdef RVFI
    method Bool        mv_rvfi_valid     = rg_rvfi_valid;
    method Bit #(64)   mv_rvfi_order     = rg_rvfi_order;

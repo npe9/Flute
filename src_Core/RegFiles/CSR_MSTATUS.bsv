@@ -212,19 +212,19 @@ endfunction
 function WordXL fv_fixup_mstatus (MISA misa, WordXL  wordxl);
    // MIE, WPRI_2, SIE, UIE
    Bit #(1) uie    = ((misa.n == 0) ? 0 : wordxl [mstatus_uie_bitpos]);
-   Bit #(1) wpri_2 = wordxl [mstatus_WPRI_2_bitpos];
+   Bit #(1) wpri_2 = 0;    // WPRI: read-only zero
    Bit #(1) sie    = ((misa.s == 0) ? 0 : wordxl [mstatus_sie_bitpos]);
    Bit #(1) mie    = wordxl [mstatus_mie_bitpos];
 
    // MPIE, WPRI_6, SPIE, UPIE
    Bit #(1) upie   = ((misa.n == 0) ? 0 : wordxl [mstatus_upie_bitpos]);
-   Bit #(1) wpri_6 = wordxl [mstatus_WPRI_6_bitpos];
+   Bit #(1) wpri_6 = 0;    // WPRI: read-only zero
    Bit #(1) spie   = ((misa.s == 0) ? 0 : wordxl [mstatus_spie_bitpos]);
    Bit #(1) mpie   = wordxl [mstatus_mpie_bitpos];
 
    // SPP, WPRI_9, MPP
    Bit #(1) spp    = ((misa.s == 0) ? u_Priv_Mode [0] : wordxl [mstatus_spp_bitpos]);
-   Bit #(2) wpri_9 = fv_get_bits (wordxl, fromInteger (mstatus_WPRI_9_bitpos));
+   Bit #(2) wpri_9 = 0;    // VS (no V): read-only zero
 
    // MPP
    Bit #(2) mpp = fv_get_bits (wordxl, fromInteger (mstatus_mpp_bitpos));

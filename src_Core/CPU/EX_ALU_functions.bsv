@@ -1022,7 +1022,8 @@ function ALU_Outputs fv_FP (ALU_Inputs inputs, Bit #(3) rm);
    alu_outputs.fval2     = inputs.frs2_val;
    alu_outputs.fval3     = inputs.frs3_val;
 
-   alu_outputs.rd_in_fpr = !fv_is_rd_in_GPR (funct7, rs2);
+   // R4 (FMADD/FMSUB/FNMSUB/FNMADD) funct7 is {rs3, fmt}: only op_FP can target a GPR
+   alu_outputs.rd_in_fpr = !((opcode == op_FP) && fv_is_rd_in_GPR (funct7, rs2));
 
 `ifdef INCLUDE_TANDEM_VERIF
    // Normal trace output (if no trap)

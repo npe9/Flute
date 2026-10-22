@@ -731,17 +731,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
       let rs1IsNeg0 = isNegativeZero (sV1);
       let rs2IsNeg0 = isNegativeZero (sV2);
       // One or both of the values are NaNs
-      if ( isSNaN (sV1) && isSNaN (sV2) )
+      // Both NaN -> canonical NaN; one NaN -> the other operand (F/D 2.2+, Sail)
+      if ( isNaN (sV1) && isNaN (sV2) )
          res = fv_nanbox (extend (pack ( canonicalNaN32 )));
-      else if ( isSNaN (sV1) )
+      else if ( isNaN (sV1) )
          res = fv_nanbox (extend (pack ( sV2 )));
-      else if ( isSNaN (sV2) )
-         res = fv_nanbox (extend (pack ( sV1 )));
-      else if ( isQNaN (sV1) && isQNaN (sV2) )
-         res = fv_nanbox (extend (pack ( canonicalNaN32 )));
-      else if ( isQNaN (sV1) )
-         res = fv_nanbox (extend (pack ( sV2 )));
-      else if ( isQNaN (sV2) )
+      else if ( isNaN (sV2) )
          res = fv_nanbox (extend (pack ( sV1 )));
       else if ( rs1IsNeg0 && rs2IsPos0 )
          res = fv_nanbox (extend (pack ( sV1 )));
@@ -770,17 +765,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
       let rs2IsNeg0 = isNegativeZero (sV2);
 
       // One or both of the values are NaNs
-      if ( isSNaN (sV1) && isSNaN (sV2) )
+      // Both NaN -> canonical NaN; one NaN -> the other operand (F/D 2.2+, Sail)
+      if ( isNaN (sV1) && isNaN (sV2) )
          res = fv_nanbox (extend (pack ( canonicalNaN32 )));
-      else if ( isSNaN (sV1) )
+      else if ( isNaN (sV1) )
          res = fv_nanbox (extend (pack ( sV2 )));
-      else if ( isSNaN (sV2) )
-         res = fv_nanbox (extend (pack ( sV1 )));
-      else if ( isQNaN (sV1) && isQNaN (sV2) )
-         res = fv_nanbox (extend (pack ( canonicalNaN32 )));
-      else if ( isQNaN (sV1) )
-         res = fv_nanbox (extend (pack ( sV2 )));
-      else if ( isQNaN (sV2) )
+      else if ( isNaN (sV2) )
          res = fv_nanbox (extend (pack ( sV1 )));
       else if ( rs1IsNeg0 && rs2IsPos0 )
          res = fv_nanbox (extend (pack ( sV2 )));
@@ -1211,17 +1201,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
       let rs1IsNeg0 = isNegativeZero (dV1);
       let rs2IsNeg0 = isNegativeZero (dV2);
 
-      if ( isSNaN (dV1) && isSNaN (dV2) )
+      // Both NaN -> canonical NaN; one NaN -> the other operand (F/D 2.2+, Sail)
+      if ( isNaN (dV1) && isNaN (dV2) )
          res = pack (canonicalNaN64);
-      else if ( isSNaN (dV1) )
+      else if ( isNaN (dV1) )
          res = pack ( dV2 );
-      else if ( isSNaN (dV2) )
-         res = pack ( dV1 );
-      else if ( isQNaN (dV1) && isQNaN (dV2) )
-         res = pack (canonicalNaN64);
-      else if ( isQNaN (dV1) )
-         res = pack ( dV2 );
-      else if ( isQNaN (dV2) )
+      else if ( isNaN (dV2) )
          res = pack ( dV1 );
       else if ( rs1IsNeg0 && rs2IsPos0 )
          res = pack ( dV1 );
@@ -1249,17 +1234,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
       let rs1IsNeg0 = isNegativeZero (dV1);
       let rs2IsNeg0 = isNegativeZero (dV2);
 
-      if ( isSNaN (dV1) && isSNaN (dV2) )
+      // Both NaN -> canonical NaN; one NaN -> the other operand (F/D 2.2+, Sail)
+      if ( isNaN (dV1) && isNaN (dV2) )
          res = pack ( canonicalNaN64 );
-      else if ( isSNaN (dV1) )
+      else if ( isNaN (dV1) )
          res = pack ( dV2 );
-      else if ( isSNaN (dV2) )
-         res = pack ( dV1 );
-      else if ( isQNaN (dV1) && isQNaN (dV2) )
-         res = pack ( canonicalNaN64 );
-      else if ( isQNaN (dV1) )
-         res = pack ( dV2 );
-      else if ( isQNaN (dV2) )
+      else if ( isNaN (dV2) )
          res = pack ( dV1 );
       else if ( rs1IsNeg0 && rs2IsPos0 )
          res = pack ( dV2 );

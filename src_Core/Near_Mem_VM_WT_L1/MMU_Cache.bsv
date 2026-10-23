@@ -199,6 +199,7 @@ typedef enum {MODULE_PRERESET,              // After power on reset, before soft
               MODULE_READY,                 // Reset done, ready for first request
               MODULE_RUNNING,               // Normal operation, during hits
               MODULE_EXCEPTION_RSP,         // On misaligned and access exceptions
+              UDTLB_FILL,                   // uDTLB miss: translate, check, fill (slow path)
 
               PTW_START,                    // On TLB miss, initiate refill of PTE into TLB
 `ifdef RV64
@@ -222,6 +223,22 @@ typedef enum {MODULE_PRERESET,              // After power on reset, before soft
 	      IO_AWAITING_AMO_READ_RSP
    } Module_State
 deriving (Bits, Eq, FShow);
+
+// uDTLB entry (see the uDTLB comment in mkMMU_Cache)
+typedef 4 UDTLB_Size;
+typedef Bit #(TLog #(UDTLB_Size)) UDTLB_Index;
+typedef Bit #(TSub #(XLEN, 12))   UDTLB_VPN;
+typedef Bit #(TSub #(PA_sz, 12))  UDTLB_PPN;
+
+typedef struct {
+   Bool       valid;
+   UDTLB_VPN  vpn;
+   UDTLB_PPN  ppn;      // the 4 KiB page (a 4 MiB leaf fills the page it covers)
+   Bool       ok_ld;    // LD, LR
+   Bool       ok_st;    // ST, SC
+   Bool       ok_amo;   // other AMOs (Sail ReadWrite: PMP R and W)
+   } UDTLB_Entry
+deriving (Bits, FShow);
 
 Bool bram_cmd_read  = False;
 Bool bram_cmd_write = True;
@@ -817,6 +834,55 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 `endif
 
    // ----------------------------------------------------------------
+   // uDTLB (V12 timing): a small fully associative register TLB in front of
+   // the probe.  Each entry maps one 4 KiB page under the context it was
+   // filled in, with the PTE permission, A/D, PMP and PMA verdicts
+   // precomputed per access kind.  The probe's hit test is then VPN compares
+   // and a PPN mux, instead of the TLB LUTRAM read, fav_vm_xlate, the PMP
+   // range compares and the SoC map (V11's critical path: ~21 of 37 ns, then
+   // the CPU's stage-advance cone).  Entries are filled only for memory pages
+   // whose current access passes every check; IO, vacant, faulting and
+   // TLB-miss accesses always take the slow path (rl_udtlb_fill: the original
+   // translation code), at +2 cycles.
+   // Invalidation (ICache_Pipe's scheme): req toggles rg_udtlb_ctx_seq when
+   // priv / SUM / MXR / satp change, ma_pmp toggles rg_udtlb_pmp_seq when the
+   // table changes, tlb_flush (SFENCE.VMA) toggles rg_udtlb_tlb_seq.  Entries
+   // are dead while any seq differs from its _seen copy; the next fill clears
+   // them all.  Svade (A = 0, or D = 0 on a write, faults), so a filled entry
+   // never needs a PTE update.  PMP is re-checked on every change, so no
+   // SFENCE.VMA is needed after a PMP write (Sail checks PMP synchronously).
+
+   Vector #(UDTLB_Size, Reg #(UDTLB_Entry)) vrg_udtlb <- replicateM (mkReg (unpack (0)));
+   Reg #(UDTLB_Index) rg_udtlb_victim   <- mkReg (0);
+   Reg #(Bool)        rg_udtlb_ctx_seq  <- mkReg (False);
+   Reg #(Bool)        rg_udtlb_pmp_seq  <- mkReg (False);
+   Reg #(Bool)        rg_udtlb_tlb_seq  <- mkReg (False);
+   Reg #(Bool)        rg_udtlb_ctx_seen <- mkReg (False);
+   Reg #(Bool)        rg_udtlb_pmp_seen <- mkReg (False);
+   Reg #(Bool)        rg_udtlb_tlb_seen <- mkReg (False);
+
+   Bool udtlb_fresh = (   (rg_udtlb_ctx_seq == rg_udtlb_ctx_seen)
+		       && (rg_udtlb_pmp_seq == rg_udtlb_pmp_seen)
+		       && (rg_udtlb_tlb_seq == rg_udtlb_tlb_seen));
+
+   UDTLB_VPN udtlb_vpn = truncate (rg_addr >> 12);
+   Bool      udtlb_ld  = ((rg_op == CACHE_LD) || is_AMO_LR);
+   Bool      udtlb_st  = ((rg_op == CACHE_ST) || is_AMO_SC);
+
+   function Bool fn_udtlb_match (UDTLB_Entry e);
+      Bool ok = (udtlb_ld ? e.ok_ld : (udtlb_st ? e.ok_st : e.ok_amo));
+      return (e.valid && (e.vpn == udtlb_vpn) && ok);
+   endfunction
+
+   Vector #(UDTLB_Size, Bool) udtlb_matches = map (fn_udtlb_match, readVReg (vrg_udtlb));
+   Bool udtlb_hit = (udtlb_fresh && any (id, udtlb_matches));
+
+   UDTLB_PPN udtlb_ppn = 0;
+   for (Integer i = 0; i < valueOf (UDTLB_Size); i = i + 1)
+      udtlb_ppn = udtlb_ppn | (udtlb_matches [i] ? vrg_udtlb [i].ppn : 0);
+   PA        udtlb_pa  = { udtlb_ppn, rg_addr [11:0] };
+
+   // ----------------------------------------------------------------
    // Functions to drive read-responses (outputs)
 
    // Memory-read responses
@@ -1041,9 +1107,6 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // Otherwise, moves to other states that handle TLB misses, cache
    // misses, 1-cycle delayed responses for ST and AMO, I/O requests, etc.
 
-`ifdef ISA_PRIV_S
-   (* descending_urgency = "rl_probe_and_immed_rsp, rl_writeback_updated_PTE" *)
-`endif
 
    rule rl_probe_and_immed_rsp (rg_ddr4_ready && (rg_state == MODULE_RUNNING)
 				&& (rg_age_seen == rg_req_seq)
@@ -1074,85 +1137,33 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       end
 
       // ----------------
-      // Virtual Memory translation
+      // uDTLB: the translation, PMP and PMA checks ran when the entry was
+      // filled (rl_udtlb_fill), so a hit needs only the VPN compare.  A miss
+      // costs the slow path: rl_udtlb_fill, then this rule again.
 
-`ifdef ISA_PRIV_S
-      VM_Xlate_Result vm_xlate_result <- fav_vm_xlate (rg_addr,
-						       rg_satp,
-						       tlb_result,
-						       dmem_not_imem,
-						       ((rg_op == CACHE_LD) || is_AMO_LR),
-						       rg_priv,
-						       rg_sstatus_SUM,
-						       rg_mstatus_MXR);
-`else
-      // In non-VM, PA is always WordXL
-      VM_Xlate_Result vm_xlate_result = VM_Xlate_Result {outcome:      VM_XLATE_OK,
-							 pa:           rg_addr,
-							 exc_code:     ?};
-`endif
-
-      if (cfg_verbosity > 1)
-	 $display ("    TLB result: ", fshow (vm_xlate_result));
-
-      // ---- TLB miss
-      if (vm_xlate_result.outcome == VM_XLATE_TLB_MISS) begin
-	 rg_state <= PTW_START;
+      if (! udtlb_hit) begin
+	 rg_state <= UDTLB_FILL;
+	 if (cfg_verbosity > 1)
+	    $display ("        uDTLB miss -> UDTLB_FILL");
       end
 
-      // ---- TLB translation exception
-      else if (vm_xlate_result.outcome == VM_XLATE_EXCEPTION) begin
-	 rg_state <= MODULE_EXCEPTION_RSP;
-	 rg_exc_code <= vm_xlate_result.exc_code;
-      end
-
-      // ---- vm_xlate_result.outcome == VM_XLATE_OK
       else begin
-`ifdef ISA_PRIV_S
-	 fa_record_pte_A_D_updates (tlb_result, vm_xlate_result);
-`endif
+	 PA pa = udtlb_pa;
+	 rg_pa <= pa;
 
-	 rg_pa <= vm_xlate_result.pa;
-	 let is_mem_addr = soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (vm_xlate_result.pa));
-
-	 // PMP (Sail pmpCheck on the translated PA): access fault, nothing reaches the fabric
-	 // (and PA[33:32] == 0: the fabric is 32-bit, a higher PPN would alias into SDRAM)
-	 // SC without a matching reservation fails (rd = 1) with no access: Sail checks the
-	 // reservation before the PMP / PMA / bus, so no access fault for it (IO SCs always fail).
-	 if (is_AMO_SC && ((! rg_lrsc_valid) || (rg_lrsc_pa != vm_xlate_result.pa))) begin
+	 // SC without a matching reservation fails (rd = 1) with no access
+	 // (Sail checks the reservation before the PMP / PMA / bus).
+	 if (is_AMO_SC && ((! rg_lrsc_valid) || (rg_lrsc_pa != pa))) begin
 	    rg_lrsc_valid <= False;
 	    fa_drive_mem_rsp (rg_f3, rg_addr, 1, 0);
 	    if (cfg_verbosity > 1)
 	       $display ("        AMO SC: fail (no matching reservation), no access");
 	 end
 
-	 else if (((vm_xlate_result.pa >> 32) != 0) || (! fv_pmp_ok (rg_pmp, fv_pa_page (vm_xlate_result.pa), rg_priv, pmp_acc))) begin
-	    rg_state    <= MODULE_EXCEPTION_RSP;
-	    rg_exc_code <= access_exc_code;
-	 end
-
-	 // Neither memory nor a mapped device: precise access fault, nothing
-	 // reaches the fabric (a posted write-through store would otherwise
-	 // lose the DECERR and complete silently; TestRIG D1).
-	 else if (dmem_not_imem && (! is_mem_addr)
-		  && (! soc_map.m_is_IO_addr (fn_PA_to_Fabric_Addr (vm_xlate_result.pa)))) begin
-	    rg_state    <= MODULE_EXCEPTION_RSP;
-	    rg_exc_code <= access_exc_code;
-	 end
-
-	 // Access to non-memory
-	 else if (dmem_not_imem && (! is_mem_addr)) begin
-	    // IO requests
-	    rg_state <= IO_REQ;
-
-	    if (cfg_verbosity > 1)
-	       $display ("    => IO_REQ");
-	 end
-
-	 // Memory requests. Note: it's ok that this can go to non-memory space.
+	 // Memory requests (an entry exists only for a memory page)
 	 else begin
 	    // Compute cache hit/miss. If hit, also compute Way_in_CSet and Word64
-	    let pa_ctag = fn_PA_to_CTag (vm_xlate_result.pa);
+	    let pa_ctag = fn_PA_to_CTag (pa);
 	    match { .hit, .way_hit, .word64 } <- fn_test_cache_hit_or_miss (pa_ctag);
 
 	    // ----------------
@@ -1165,9 +1176,9 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 `ifdef ISA_A
 		  if (is_AMO_LR) begin
 		     rg_lrsc_valid <= True;
-		     rg_lrsc_pa    <= vm_xlate_result.pa;
+		     rg_lrsc_pa    <= pa;
 		     if (cfg_verbosity > 1)
-			$display ("        AMO LR: reserving PA 0x%0h", vm_xlate_result.pa);
+			$display ("        AMO LR: reserving PA 0x%0h", pa);
 		  end
 `endif
 		  if (cfg_verbosity > 1) begin
@@ -1181,7 +1192,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 		     $display ("        Read Miss: -> CACHE_START_REFILL.");
 `ifdef ISA_A
 		  // TODO: this is pessimistic; unnecessary in a single-hart system?
-		  if (is_AMO_LR && (vm_xlate_result.pa == rg_lrsc_pa)) begin
+		  if (is_AMO_LR && (pa == rg_lrsc_pa)) begin
 		     rg_lrsc_valid <= False;
 		     if (cfg_verbosity > 1)
 			$display ("        AMO LR: cache refill: cancelling LR/SC reservation for PA 0x%0h", rg_lrsc_pa);
@@ -1196,10 +1207,10 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	       Bool do_write = True;    // Always True for ST; success/fail for AMO_SC
 `ifdef ISA_A
 	       // ST: if to an LR/SC reserved address, invalidate the reservation
-	       if ((rg_op == CACHE_ST) && (vm_xlate_result.pa == rg_lrsc_pa)) begin
+	       if ((rg_op == CACHE_ST) && (pa == rg_lrsc_pa)) begin
 		  rg_lrsc_valid <= False;
 		  if (cfg_verbosity > 1)
-		     $display ("        ST: cancelling LR/SC reservation for PA", vm_xlate_result.pa);
+		     $display ("        ST: cancelling LR/SC reservation for PA", pa);
 	       end
 
 	       // AMO_SC
@@ -1210,11 +1221,11 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 		     if (cfg_verbosity > 1)
 			$display ("        AMO SC: fail due to invalid LR/SC reservation");
 		  end
-		  else if (rg_lrsc_pa != vm_xlate_result.pa) begin
+		  else if (rg_lrsc_pa != pa) begin
 		     do_write = False;
 		     if (cfg_verbosity > 1)
 			$display ("        AMO SC: fail: reserved addr 0x%0h, this address 0x%0h",
-				  rg_lrsc_pa, vm_xlate_result.pa);
+				  rg_lrsc_pa, pa);
 		  end
 
 		  // SC result=0 on success, =1 on failure
@@ -1230,28 +1241,28 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 		  // ST, or successful SC
 		  if (hit) begin
 		     // Update cache line in cache
-		     let new_cword_set = fn_update_cword_set (cword_set, way_hit, vm_xlate_result.pa, rg_f3, rg_st_amo_val);
+		     let new_cword_set = fn_update_cword_set (cword_set, way_hit, pa, rg_f3, rg_st_amo_val);
 		     ram_cword_set.a.put (bram_cmd_write, cset_cword_in_cache, new_cword_set);
 `ifdef BRAM_HAZARD_ASSERT
 		     fa_haz_A_write (False, bram_cmd_write, extend (cset_cword_in_cache));
 `endif
 
 		     if (cfg_verbosity > 1) begin
-			$display ("        Write-Cache-Hit: pa 0x%0h word64 0x%0h", vm_xlate_result.pa, rg_st_amo_val);
+			$display ("        Write-Cache-Hit: pa 0x%0h word64 0x%0h", pa, rg_st_amo_val);
 			$write   ("        New Word64_Set:");
 			fa_display_cword_set (cset_in_cache, cword_in_cline, new_cword_set);
 		     end
 		  end
 		  else begin
 		     if (cfg_verbosity > 1)
-			$display ("        Write-Cache-Miss: pa 0x%0h word64 0x%0h", vm_xlate_result.pa, rg_st_amo_val);
+			$display ("        Write-Cache-Miss: pa 0x%0h word64 0x%0h", pa, rg_st_amo_val);
 		  end
 
 		  if (cfg_verbosity > 1)
 		     $display ("        Write-Cache-Hit/Miss: eaddr 0x%0h word64 0x%0h", rg_addr, rg_st_amo_val);
 
 		  // For write-hits and write-misses, writeback data to memory (so cache remains clean)
-		  fa_fabric_send_write_req (rg_f3, vm_xlate_result.pa, rg_st_amo_val);
+		  fa_fabric_send_write_req (rg_f3, pa, rg_st_amo_val);
 
 		  // Provide write-response after 1-cycle delay (thus locking the cset for 1 cycle),
 		  // in case the next incoming request tries to read from the same SRAM address.
@@ -1282,7 +1293,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 		  if (cfg_verbosity > 1) begin
 		     $display ("        AMO: addr 0x%0h amo_f7 0x%0h f3 %0d rs2_val 0x%0h",
 			       rg_addr, rg_amo_funct7, rg_f3, rg_st_amo_val);
-		     $display ("          PA 0x%0h ", vm_xlate_result.pa);
+		     $display ("          PA 0x%0h ", pa);
 		     $display ("          Cache word64 0x%0h, load-result 0x%0h", word64, word64);
 		  end
 
@@ -1298,10 +1309,10 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 		  // TODO: should we invalidate even if to a different
 		  // addr, since LR/SC pairs are not supposed to have
 		  // other mem ops between them?
-		  if (vm_xlate_result.pa == rg_lrsc_pa) begin
+		  if (pa == rg_lrsc_pa) begin
 		     rg_lrsc_valid <= False;
 		     if (cfg_verbosity > 1)
-			$display ("        AMO_op: cancelling LR/SC reservation for PA", vm_xlate_result.pa);
+			$display ("        AMO_op: cancelling LR/SC reservation for PA", pa);
 		  end
 
 		  rg_state <= CACHE_AMO_EXEC;
@@ -1311,6 +1322,147 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	 end
       end
    endrule: rl_probe_and_immed_rsp
+
+   // ----------------------------------------------------------------
+   // uDTLB slow path: the original probe translation (TLB, fav_vm_xlate,
+   // PMP, SoC map).  It never drives a response, so none of this logic
+   // reaches the CPU's valid/exc cone: every outcome is a state the existing
+   // rules handle, and a fill returns to MODULE_RUNNING, where the probe
+   // runs again as a uDTLB hit (the captured RAM outputs are unchanged: no
+   // RAM read is launched here, and rg_age_seen == rg_req_seq still holds).
+
+`ifdef ISA_PRIV_S
+   (* descending_urgency = "rl_udtlb_fill, rl_writeback_updated_PTE" *)
+`endif
+   rule rl_udtlb_fill (rg_state == UDTLB_FILL);
+      if (rg_kill_echo) begin
+	 // RLD-4: stale op; exit (see rl_ST_AMO_response).
+	 rg_state <= MODULE_READY;
+      end
+      else begin
+`ifdef ISA_PRIV_S
+      VM_Xlate_Result vm_xlate_result <- fav_vm_xlate (rg_addr,
+						       rg_satp,
+						       tlb_result,
+						       dmem_not_imem,
+						       ((rg_op == CACHE_LD) || is_AMO_LR),
+						       rg_priv,
+						       rg_sstatus_SUM,
+						       rg_mstatus_MXR);
+`else
+      // In non-VM, PA is always WordXL
+      VM_Xlate_Result vm_xlate_result = VM_Xlate_Result {outcome:      VM_XLATE_OK,
+							 pa:           rg_addr,
+							 exc_code:     ?};
+`endif
+
+      if (cfg_verbosity > 1)
+	 $display ("%0d: %s: rl_udtlb_fill: TLB result: ", cur_cycle, d_or_i, fshow (vm_xlate_result));
+
+      // ---- TLB miss
+      if (vm_xlate_result.outcome == VM_XLATE_TLB_MISS) begin
+	 rg_state <= PTW_START;
+      end
+
+      // ---- TLB translation exception
+      else if (vm_xlate_result.outcome == VM_XLATE_EXCEPTION) begin
+	 rg_state <= MODULE_EXCEPTION_RSP;
+	 rg_exc_code <= vm_xlate_result.exc_code;
+      end
+
+      // ---- vm_xlate_result.outcome == VM_XLATE_OK
+      else begin
+`ifdef ISA_PRIV_S
+	 fa_record_pte_A_D_updates (tlb_result, vm_xlate_result);
+`endif
+
+	 PA   pa          = vm_xlate_result.pa;
+	 rg_pa <= pa;
+	 let  page        = fv_pa_page (pa);
+	 Bool is_mem_addr = soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (pa));
+	 Bool pa_hi_ok    = ((pa >> 32) == 0);    // the fabric is 32-bit
+	 Bool pmp_ok      = fv_pmp_ok (rg_pmp, page, rg_priv, pmp_acc);
+
+	 // ---- Memory page and this access passes: fill, then re-probe.
+	 // (The SC reservation check happens in the probe, as before.)
+	 if (pa_hi_ok && pmp_ok && (is_mem_addr || (! dmem_not_imem))) begin
+	    // Per-kind verdicts for this page under the current context
+	    Bool pte_ld = True;
+	    Bool pte_st = True;
+`ifdef ISA_PRIV_S
+	    `ifdef RV32
+	    Bool xlate = ((rg_priv <= s_Priv_Mode) && (vm_mode == satp_mode_RV32_sv32));
+`else
+	    Bool xlate = ((rg_priv <= s_Priv_Mode) && (vm_mode == satp_mode_RV64_sv39));
+`endif
+	    if (xlate) begin
+	       PTE pte = vm_xlate_result.pte;
+	       pte_ld = (   (! is_pte_denial (dmem_not_imem, True,  rg_priv, rg_sstatus_SUM, rg_mstatus_MXR, pte))
+			 && (! is_pte_A_D_fault (True,  pte)));
+	       pte_st = (   (! is_pte_denial (dmem_not_imem, False, rg_priv, rg_sstatus_SUM, rg_mstatus_MXR, pte))
+			 && (! is_pte_A_D_fault (False, pte)));
+	    end
+`endif
+	    let e = UDTLB_Entry {valid:  True,
+				 vpn:    udtlb_vpn,
+				 ppn:    truncate (pa >> 12),
+				 ok_ld:  pte_ld && fv_pmp_ok (rg_pmp, page, rg_priv, PMP_R),
+				 ok_st:  pte_st && fv_pmp_ok (rg_pmp, page, rg_priv, PMP_W),
+				 ok_amo: pte_st && fv_pmp_ok (rg_pmp, page, rg_priv, PMP_RW)};
+
+	    // Stale entries (context / PMP / SFENCE.VMA changed) die here.
+	    UDTLB_Index slot = (udtlb_fresh ? rg_udtlb_victim : 0);
+	    for (Integer i = 0; i < valueOf (UDTLB_Size); i = i + 1) begin
+	       if (fromInteger (i) == slot)
+		  vrg_udtlb [i] <= e;
+	       else if (! udtlb_fresh)
+		  vrg_udtlb [i] <= unpack (0);
+	    end
+	    rg_udtlb_victim   <= slot + 1;
+	    rg_udtlb_ctx_seen <= rg_udtlb_ctx_seq;
+	    rg_udtlb_pmp_seen <= rg_udtlb_pmp_seq;
+	    rg_udtlb_tlb_seen <= rg_udtlb_tlb_seq;
+
+	    rg_state <= MODULE_RUNNING;
+	    if (cfg_verbosity > 1)
+	       $display ("        uDTLB fill [%0d]: ", slot, fshow (e));
+	 end
+
+	 // SC without a matching reservation fails (rd = 1) with no access,
+	 // ahead of the PMP / PMA checks (Sail order; IO SCs always fail).
+	 // The response is driven by rl_ST_AMO_response from rg_ld_val.
+	 else if (is_AMO_SC && ((! rg_lrsc_valid) || (rg_lrsc_pa != pa))) begin
+	    rg_lrsc_valid <= False;
+	    rg_ld_val     <= 1;
+	    rg_state      <= CACHE_ST_AMO_RSP;
+	    if (cfg_verbosity > 1)
+	       $display ("        AMO SC: fail (no matching reservation), no access");
+	 end
+
+	 // PMP (Sail pmpCheck on the translated PA): access fault, nothing reaches the fabric
+	 // (and PA[33:32] == 0: the fabric is 32-bit, a higher PPN would alias into SDRAM)
+	 else if ((! pa_hi_ok) || (! pmp_ok)) begin
+	    rg_state    <= MODULE_EXCEPTION_RSP;
+	    rg_exc_code <= access_exc_code;
+	 end
+
+	 // Neither memory nor a mapped device: precise access fault, nothing
+	 // reaches the fabric (a posted write-through store would otherwise
+	 // lose the DECERR and complete silently; TestRIG D1).
+	 else if (! soc_map.m_is_IO_addr (fn_PA_to_Fabric_Addr (pa))) begin
+	    rg_state    <= MODULE_EXCEPTION_RSP;
+	    rg_exc_code <= access_exc_code;
+	 end
+
+	 // Access to non-memory
+	 else begin
+	    rg_state <= IO_REQ;
+	    if (cfg_verbosity > 1)
+	       $display ("    => IO_REQ");
+	 end
+      end
+      end
+   endrule: rl_udtlb_fill
 
 `ifdef ISA_PRIV_S
    // ****************************************************************
@@ -2218,6 +2370,11 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       rg_st_amo_val  <= st_value;
       rg_kill_echo   <= False;    // RLD-4: this req supersedes any stale echo
 
+      // uDTLB: entries are valid only for the context they were filled in
+      if (   (priv != rg_priv) || (sstatus_SUM != rg_sstatus_SUM)
+	  || (mstatus_MXR != rg_mstatus_MXR) || (satp != rg_satp))
+	 rg_udtlb_ctx_seq <= ! rg_udtlb_ctx_seq;
+
       rg_priv        <= priv;
       rg_sstatus_SUM <= sstatus_SUM;
       rg_mstatus_MXR <= mstatus_MXR;
@@ -2295,6 +2452,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       // (stock) could cut off an in-flight refill (the RLD-4 abandoned-burst hazard);
       // Near_Mem's rl_sfence_vma waits for !mv_busy before calling this.
       tlb.flush;
+      rg_udtlb_tlb_seq <= ! rg_udtlb_tlb_seq;
       if (cfg_verbosity > 1)
 	 $display ("%0d: %s.tlb_flush", cur_cycle, d_or_i);
 `else
@@ -2345,6 +2503,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
    method Action ma_pmp (PMP_Table t);
       rg_pmp <= t;
+      if (pack (t) != pack (rg_pmp)) rg_udtlb_pmp_seq <= ! rg_udtlb_pmp_seq;
    endmethod
 
 endmodule: mkMMU_Cache

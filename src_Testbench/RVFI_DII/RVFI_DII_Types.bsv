@@ -76,7 +76,7 @@ typedef struct {
 
     // XXX: SC writes something other than read value, but the value that would be read is unimportant.
     // Unsure what the point of this is, it's only relevant when the value is going to be in rd anyway.
-    Bit#(xlen)    rvfi_mem_rdata; // [578 - 641] Read data:               Data read from mem_addr (i.e. before write)
+    Bit#(memwidth) rvfi_mem_rdata; // [578 - 641] Read data:               Data read from mem_addr (i.e. before write)
 } RVFI_DII_Execution#(numeric type xlen, numeric type memwidth) deriving (Bits, Eq, FShow);
 
 typedef struct {

@@ -41,10 +41,14 @@ import DII_AXI4_Mem :: *;
 // fields (word address, lane-shifted mask/data); Sail / TestRIG report the
 // byte address of the access with LSB-aligned mask/data.
 
-typedef RVFI_DII_Execution #(XLEN, 32) Flute_RVFI;
+typedef RVFI_DII_Execution #(XLEN, RVFI_MEMLEN) Flute_RVFI;
 
-function Bit #(2) fn_lowest_lane (Bit #(4) m);
-   return ((m [0] == 1) ? 0 : ((m [1] == 1) ? 1 : ((m [2] == 1) ? 2 : ((m [3] == 1) ? 3 : 0))));
+// RVFI_MemMask is 4 bits, or 8 with ISA_D (FLD/FSD: RVFI_MEMLEN = 64)
+function Bit #(TLog #(SizeOf #(RVFI_MemMask))) fn_lowest_lane (RVFI_MemMask m);
+   Bit #(TLog #(SizeOf #(RVFI_MemMask))) lane = 0;
+   for (Integer j = valueOf (SizeOf #(RVFI_MemMask)) - 1; j >= 0; j = j - 1)
+      if (m [j] == 1) lane = fromInteger (j);
+   return lane;
 endfunction
 
 // RVC HINTs that Flute executes as a write of rd's unchanged value
@@ -121,7 +125,7 @@ module mkFlute_DII_DUT (Flute_DII_DUT_IFC);
 
    (* fire_when_enabled *)
    rule rl_rvfi (cpu.mv_rvfi_valid);
-      Bit #(4) m  = cpu.mv_rvfi_mem_rmask | cpu.mv_rvfi_mem_wmask;
+      RVFI_MemMask m  = cpu.mv_rvfi_mem_rmask | cpu.mv_rvfi_mem_wmask;
       let     sh = fn_lowest_lane (m);
       Bool    hint = (! cpu.mv_rvfi_trap) && fn_rvc_rd_hint (cpu.mv_rvfi_insn);
       Flute_RVFI r = RVFI_DII_Execution {
@@ -159,7 +163,7 @@ endmodule
 
 (* synthesize *)
 module mkFlute_RVFI_DII (Empty);
-   RVFI_DII_Bridge_Scalar #(XLEN, 32) bridge <- mkRVFI_DII_Bridge_Scalar ("RVFI_DII", 5001);
+   RVFI_DII_Bridge_Scalar #(XLEN, RVFI_MEMLEN) bridge <- mkRVFI_DII_Bridge_Scalar ("RVFI_DII", 5001);
    Flute_DII_DUT_IFC dut <- mkFlute_DII_DUT (reset_by bridge.new_rst);
 
    // Instruction words by trace index; past the end of the trace, a NOP

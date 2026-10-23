@@ -129,7 +129,7 @@ deriving (Bits);
 typedef TLog #(TDiv #(RVFI_MEMLEN, 8)) RVFI_OffBits;
 function RVFI_MemMask fn_rvfi_mask (Bit #(3) funct3, WordXL addr);
    Bit #(RVFI_OffBits) offset = truncate (addr);
-   RVFI_MemMask m = case (funct3 [1:0]) 2'b00: 'h1; 2'b01: 'h3; 2'b10: 'hF; default: 'hFF; endcase;
+   RVFI_MemMask m = case (funct3 [1:0]) 2'b00: 'h1; 2'b01: 'h3; 2'b10: 'hF; default: '1; endcase;
    return (m << offset);
 endfunction
 function RVFI_MemData fn_rvfi_lanes (Bit #(3) funct3, WordXL addr, Bit #(64) v);

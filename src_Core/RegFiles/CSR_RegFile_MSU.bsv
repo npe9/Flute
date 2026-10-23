@@ -687,7 +687,8 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 	    csr_addr_sstatus:    m_csr_value = tagged Valid (csr_mstatus.mv_sstatus_read);
 	    csr_addr_sedeleg:    m_csr_value = tagged Valid zeroExtend (sedeleg);
 	    csr_addr_sideleg:    m_csr_value = tagged Valid zeroExtend (sideleg);
-	    csr_addr_sie:        m_csr_value = tagged Valid (csr_mie.mv_sie_read);
+	    // sie / sip: bits of interrupts not delegated in mideleg are read-only 0 (Sail)
+	    csr_addr_sie:        m_csr_value = tagged Valid (csr_mie.mv_sie_read & zeroExtend (rg_mideleg));
 	    csr_addr_stvec:      m_csr_value = tagged Valid (mtvec_to_word (rg_stvec));
 	    csr_addr_scounteren: m_csr_value = tagged Valid (mcounteren_to_word (rg_scounteren));
 
@@ -695,7 +696,7 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 	    csr_addr_sepc:       m_csr_value = tagged Valid ((misa.c == 1'b1) ? (rg_sepc & (~ 1)) : (rg_sepc & (~ 3)));    // sepc[0] reads zero (rg_sepc is not reset)
 	    csr_addr_scause:     m_csr_value = tagged Valid (mcause_to_word (rg_scause));
 	    csr_addr_stval:      m_csr_value = tagged Valid rg_stval;
-	    csr_addr_sip:        m_csr_value = tagged Valid (csr_mip.mv_sip_read);
+	    csr_addr_sip:        m_csr_value = tagged Valid (csr_mip.mv_sip_read & zeroExtend (rg_mideleg));
 
 	    csr_addr_satp:       m_csr_value = tagged Valid rg_satp;
 
@@ -858,7 +859,10 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 				       new_csr_value = 0;               // Hardwired to 0 (no delegation)
 				    end
 	       csr_addr_sie:        begin
-				       new_csr_value <- csr_mie.mav_sie_write (misa, wordxl);
+				       // only delegated bits are writable; the others keep their mie value
+				       WordXL deleg = zeroExtend (rg_mideleg);
+				       let v <- csr_mie.mav_sie_write (misa, (wordxl & deleg) | (csr_mie.mv_read & (~ deleg)));
+				       new_csr_value = v & deleg;
 				    end
 	       csr_addr_stvec:      begin
 				       let mtvec     = word_to_mtvec (wordxl);
@@ -893,7 +897,9 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 				       rg_stval     <= new_csr_value;
 				    end
 	       csr_addr_sip:        begin
-				       new_csr_value <- csr_mip.mav_sip_write (misa, wordxl);
+				       WordXL deleg = zeroExtend (rg_mideleg);
+				       let v <- csr_mip.mav_sip_write (misa, (wordxl & deleg) | (csr_mip.mv_read & (~ deleg)));
+				       new_csr_value = v & deleg;
 				    end
 	       csr_addr_satp:       begin
 				       // WARL: ASID hard-wired to 0 (Linux then uses global flushes).

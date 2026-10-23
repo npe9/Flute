@@ -75,6 +75,9 @@ import RISCV_XBox  :: *;
 `ifdef ISA_F
 import FBox_Top    :: *;
 import FBox_Core   :: *;   // For fv_nanbox function
+`ifdef FPU_TRIM
+import FPU_Trim    :: *;   // area-trimmed F/D unit (same FBox_Top_IFC)
+`endif
 `endif
 
 // ================================================================
@@ -186,7 +189,11 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
    // Floating point box
 
 `ifdef ISA_F
+`ifdef FPU_TRIM
+   FBox_Top_IFC fbox <- mkFPU_Trim (0);
+`else
    FBox_Top_IFC fbox <- mkFBox_Top (0);
+`endif
 `endif
 
    // ----------------

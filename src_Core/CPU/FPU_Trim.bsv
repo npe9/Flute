@@ -33,6 +33,8 @@ import FIFOF        :: *;
 import GetPut       :: *;
 import ClientServer :: *;
 
+import Vector       :: *;
+
 import GetPut_Aux :: *;
 
 import ISA_Decls :: *;
@@ -44,8 +46,8 @@ typedef Bit #(108) FT_Sig;
 typedef Int #(14)  FT_Exp;
 
 typedef enum {
-   FT_IDLE, FT_LOAD, FT_MUL, FT_NORM1, FT_NORM2, FT_ALIGN, FT_ADD,
-   FT_DIVINIT, FT_DIVITER, FT_DIVEND, FT_RND0, FT_RND1, FT_PACK, FT_F2I, FT_IPACK
+   FT_IDLE, FT_LOAD, FT_MUL, FT_NORM1, FT_NORM2, FT_ALIGN0, FT_ALIGN, FT_ADD,
+   FT_DIVINIT, FT_DIVITER, FT_DIVEND, FT_RND0, FT_DENORM, FT_RND1, FT_PACK, FT_F2I, FT_IPACK
 } FT_State deriving (Bits, Eq, FShow);
 
 typedef struct {
@@ -94,6 +96,23 @@ function FT_Sig fn_shr_jam (FT_Sig x, Bit #(7) amt);
       end
    end
    return { x [107:1], x [0] | st };
+endfunction
+
+// leading-zero count, log-depth tree (merge = concatenation, no adders); 0 -> 108
+function Bit #(7) fn_lzc (FT_Sig s);
+   Bit #(128) x = { s, 20'h80000 };
+   Vector #(128, Bool)     z = replicate (False);
+   Vector #(128, Bit #(7)) c = replicate (0);
+   for (Integer i = 0; i < 128; i = i + 1) z [i] = (x [127 - i] == 0);
+   for (Integer lvl = 0; lvl < 7; lvl = lvl + 1) begin
+      Integer n = 64 / (2 ** lvl);
+      for (Integer i = 0; i < n; i = i + 1) begin
+         Bool zl = z [2 * i];
+         c [i] = (zl ? (fromInteger (2 ** lvl) | c [2 * i + 1]) : c [2 * i]);
+         z [i] = zl && z [2 * i + 1];
+      end
+   end
+   return c [0];
 endfunction
 
 // shift amount clamped to 127 (>= 108 shifts everything into the jam bit); x >= 0
@@ -162,7 +181,8 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
    Reg #(FT_Sig)    rg_x    <- mkRegU;
    Reg #(FT_Exp)    rg_es   <- mkRegU;
    Reg #(FT_Exp)    rg_ex   <- mkRegU;
-   Reg #(Bit #(7))  rg_lz   <- mkRegU;
+   Reg #(Bit #(7))  rg_amt  <- mkRegU;    // shifter amount (always registered)
+   Reg #(Bool)      rg_xneg <- mkRegU;    // ALIGN: X has the larger exponent, shift S
    Reg #(Bit #(72)) rg_pp   <- mkRegU;
    Reg #(Bit #(57)) rg_r    <- mkRegU;
    Reg #(Bit #(54)) rg_d    <- mkRegU;
@@ -202,25 +222,20 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
    // Shared datapath
 
    // ---- shifter (right with jam; left via bit reversal)
-   FT_Exp ediff = rg_es - rg_ex;
+   // all shifter controls are registers (amount set in the previous state)
+   FT_Exp ediff  = rg_es - rg_ex;
    FT_Exp ediffn = rg_ex - rg_es;
-   Bool   xneg  = (ediff < 0);      // ALIGN: X has the larger exponent, shift S
 
    Bool sh_selx = ((((rg_state == FT_NORM1) || (rg_state == FT_NORM2)) && (! rg_pns))
-                   || ((rg_state == FT_ALIGN) && (! xneg)));
+                   || ((rg_state == FT_ALIGN) && (! rg_xneg)));
    Bool sh_left = (rg_state == FT_NORM2);
-   Bit #(7) sh_amt = case (rg_state)
-                        FT_NORM2: rg_lz;
-                        FT_ALIGN: (xneg ? fn_clamp (ediffn) : fn_clamp (ediff));
-                        FT_RND0:  fn_clamp (emin - rg_es);
-                        default:  fn_clamp (52 - rg_es);         // FT_F2I
-                     endcase;
+   Bit #(7) sh_amt = rg_amt;
    FT_Sig sh_src = (sh_selx ? rg_x : rg_s);
    FT_Sig sh_in  = (sh_left ? reverseBits (sh_src) : sh_src);
    FT_Sig sh_o   = fn_shr_jam (sh_in, sh_amt);
    FT_Sig sh_out = (sh_left ? reverseBits (sh_o) : sh_o);
 
-   UInt #(7) lzc = countZerosMSB (sh_src);
+   Bit #(7) lzc = fn_lzc (sh_src);
 
    // ---- adder: S + X, S - X or X - S, result >> 1 with jam
    FT_Sig    ad_a = ((rg_sub && rg_xbig)    ? (~ rg_s) : rg_s);
@@ -262,7 +277,7 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
    function FT_State fn_next (Bool pns, Bool pnx, Bool pmul, Bool padd, Bool pdiv, Bool f2i);
       if (pns || pnx) return FT_NORM1;
       else if (pmul)  return FT_MUL;
-      else if (padd)  return FT_ALIGN;
+      else if (padd)  return FT_ALIGN0;
       else if (pdiv)  return FT_DIVINIT;
       else if (f2i)   return FT_F2I;
       else            return FT_RND0;
@@ -329,6 +344,84 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
 
    Bit #(64) f2i_sat_pos = ((rg_rs2 [0] == 1) ? 64'hffffffffffffffff : 64'h7fffffff);
    Bit #(64) f2i_sat_neg = ((rg_rs2 [0] == 1) ? 0 : 64'hffffffff80000000);
+
+   // =============================================================
+   // RVFI_ALTOPS (riscv-formal-fp, formal builds only): arithmetic and FCVT ops return the stand-in
+   // functions of riscv-formal-fp insns/generate.py (same table and constants as FBox_Core).
+`ifdef RVFI_ALTOPS
+   function Bit #(32) fn_rotl32 (Bit #(32) x, Integer n) = ((x << n) | (x >> (32 - n)));
+   function Bit #(64) fn_rotl64 (Bit #(64) x, Integer n) = ((x << n) | (x >> (64 - n)));
+   function Bit #(32) fn_unbox32 (Bit #(64) v) = ((v [63:32] == '1) ? v [31:0] : 32'h7fc00000);
+   Bit #(32) alt_a = fn_unbox32 (rg_v1);
+   Bit #(32) alt_b = fn_unbox32 (rg_v2);
+   Bit #(32) alt_c = fn_unbox32 (rg_v3);
+   Bit #(64) alt_da = rg_v1;
+   Bit #(64) alt_db = rg_v2;
+   Bit #(64) alt_dc = rg_v3;
+   Bit #(32) alt_x  = rg_v1 [31:0];
+   Bit #(32) alt_rm32 = zeroExtend (rg_rm);
+   Bit #(64) alt_rm64 = zeroExtend (rg_rm);
+`ifdef RVFI_MUTANT_FSUB_SWAP
+   Bit #(32) alt_fsub_s_e = alt_b - fn_rotl32 (alt_a, 1);
+`else
+   Bit #(32) alt_fsub_s_e = alt_a - fn_rotl32 (alt_b, 1);
+`endif
+   Bit #(32) alt_ab_s = alt_a + fn_rotl32 (alt_b, 1);
+   Bit #(64) alt_ab_d = alt_da + fn_rotl64 (alt_db, 1);
+   Bit #(32) alt_s = ?;
+   Bit #(64) alt_d = ?;
+   Bool      alt_hit = True;
+   Bool      alt_dres = out_dbl;       // result is an f64 (else f32 boxed, or integer)
+   Bool      alt_ires = False;         // integer result (sign-extended 32 bits)
+   Bit #(2)  fmav = rg_opc [3:2];      // FMADD FMSUB FNMSUB FNMADD
+   if (is_fma && (! out_dbl))
+      alt_s = case (fmav)
+                 2'b00: ((alt_ab_s + fn_rotl32 (alt_c, 2)) ^ 32'hd6b3f97 ^ alt_rm32);
+                 2'b01: ((alt_ab_s - fn_rotl32 (alt_c, 2)) ^ 32'h48c27a1d ^ alt_rm32);
+                 2'b10: (((~ alt_ab_s) + fn_rotl32 (alt_c, 2)) ^ 32'h31f9e063 ^ alt_rm32);
+                 2'b11: (((~ alt_ab_s) - fn_rotl32 (alt_c, 2)) ^ 32'h6a84d2fb ^ alt_rm32);
+              endcase;
+   else if (is_fma)
+      alt_d = case (fmav)
+                 2'b00: ((alt_ab_d + fn_rotl64 (alt_dc, 2)) ^ 64'hd6b3f9752ac8e04 ^ alt_rm64);
+                 2'b01: ((alt_ab_d - fn_rotl64 (alt_dc, 2)) ^ 64'h48c27a1db93f6052 ^ alt_rm64);
+                 2'b10: (((~ alt_ab_d) + fn_rotl64 (alt_dc, 2)) ^ 64'h31f9e0634d8a1bc7 ^ alt_rm64);
+                 2'b11: (((~ alt_ab_d) - fn_rotl64 (alt_dc, 2)) ^ 64'h6a84d2fb0c57e913 ^ alt_rm64);
+              endcase;
+   else if (is_add && (! is_subop))
+      begin alt_s = alt_ab_s ^ 32'h2c1e5a07 ^ alt_rm32;
+            alt_d = alt_ab_d ^ 64'h2c1e5a07d4c3b2a1 ^ alt_rm64; end
+   else if (is_add)
+      begin alt_s = alt_fsub_s_e ^ 32'h6f3d1b42 ^ alt_rm32;
+            alt_d = (alt_da - fn_rotl64 (alt_db, 1)) ^ 64'h6f3d1b4291e8f705 ^ alt_rm64; end
+   else if (is_mul)
+      begin alt_s = (alt_a ^ fn_rotl32 (alt_b, 3)) ^ 32'h13a5c6e9 ^ alt_rm32;
+            alt_d = (alt_da ^ fn_rotl64 (alt_db, 3)) ^ 64'h13a5c6e97b2d4e18 ^ alt_rm64; end
+   else if (is_div)
+      begin alt_s = (alt_a - fn_rotl32 (alt_b, 5)) ^ 32'h5b0f8d31 ^ alt_rm32;
+            alt_d = (alt_da - fn_rotl64 (alt_db, 5)) ^ 64'h5b0f8d3106f1a9c3 ^ alt_rm64; end
+   else if (is_sqrt)
+      begin alt_s = fn_rotl32 (alt_a, 7) ^ 32'h7e29b4c5 ^ alt_rm32;
+            alt_d = fn_rotl64 (alt_da, 7) ^ 64'h7e29b4c5e8173d6b ^ alt_rm64; end
+   else if (is_f2i) begin
+      alt_ires = True;
+      Bit #(32) dx = alt_da [31:0] ^ alt_da [63:32];
+      alt_s = (out_dbl ? ((rg_rs2 [0] == 0) ? (dx ^ 32'h3d2f75e1) : (dx ^ 32'h60a4c83f))
+                       : ((rg_rs2 [0] == 0) ? (alt_a ^ 32'h1b7e3c55) : (alt_a ^ 32'h26d1a0c9))) ^ alt_rm32;
+   end
+   else if (is_i2f)
+      begin alt_s = ((rg_rs2 [0] == 0) ? (alt_x ^ 32'h4f5a9e13) : (alt_x ^ 32'h573c08ad)) ^ alt_rm32;
+            alt_d = ((rg_rs2 [0] == 0) ? ({ alt_x, alt_x } ^ 64'h4f5a9e13a8c6205d)
+                                       : ({ alt_x, alt_x } ^ 64'h573c08ad1f94b6e2)) ^ alt_rm64; end
+   else if (is_cvtff)
+      begin alt_s = (alt_da [31:0] ^ alt_da [63:32]) ^ 32'he9b6271 ^ alt_rm32;
+            alt_d = { alt_a, alt_a } ^ 64'he9b627195da43f8 ^ alt_rm64; end
+   else
+      alt_hit = False;
+   Bit #(64) alt_value = (alt_ires ? signExtend (alt_s)
+                                   : (alt_dres ? alt_d : { 32'hffffffff, alt_s }));
+   Bit #(5)  alt_flags = (alt_ires ? alt_s [9:5] : (alt_dres ? alt_d [9:5] : alt_s [9:5]));
+`endif
 
    // =============================================================
    // BEHAVIOR
@@ -496,6 +589,14 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
          end
          // anything else is not an F/D op (Stage1 traps those): result 0
 
+`ifdef RVFI_ALTOPS
+         if (alt_hit) begin
+            done = True;
+            res  = alt_value;
+            fl   = alt_flags;
+         end
+`endif
+
          rg_dbl   <= out_dbl;
          rg_p53   <= out_dbl || is_f2i;
          rg_sqrt  <= is_sqrt;
@@ -517,6 +618,7 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
          rg_padd  <= padd;
          rg_pdiv  <= pdiv;
          rg_f2i   <= f2i;
+         rg_amt   <= fn_clamp (52 - ua.e);     // FT_F2I: units bit to S[55]
          if (done) fa_done (res, fl);
          else      rg_state <= fn_next (pns, pnx, pmul, padd, pdiv, f2i);
       end
@@ -542,13 +644,13 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
             // exact zero from cancellation: +0, or -0 under RDN
             fa_done (fn_zero ((rg_rm == 3'b010) ? 1 : 0), 0);
          else begin
-            rg_lz    <= pack (lzc);
+            rg_amt   <= lzc;
             rg_state <= FT_NORM2;
          end
       end
 
       FT_NORM2: begin
-         FT_Exp lz = unpack (zeroExtend (rg_lz));
+         FT_Exp lz = unpack (zeroExtend (rg_amt));
          Bool pns = rg_pns;
          Bool pnx = rg_pnx;
          if (rg_pns) begin
@@ -568,8 +670,15 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
 
       // ----------------------------------------------------------------
       // align: shift the operand with the smaller exponent
+      FT_ALIGN0: begin
+         Bool xneg = (ediff < 0);
+         rg_xneg  <= xneg;
+         rg_amt   <= (xneg ? fn_clamp (ediffn) : fn_clamp (ediff));
+         rg_state <= FT_ALIGN;
+      end
+
       FT_ALIGN: begin
-         if (xneg) begin
+         if (rg_xneg) begin
             rg_s    <= sh_out;
             rg_es   <= rg_ex;
             rg_xbig <= True;
@@ -636,11 +745,18 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
       // ----------------------------------------------------------------
       // round: tininess after rounding, denormalize
       FT_RND0: begin
+         rg_amt <= fn_clamp (emin - rg_es);
          if (rg_es < emin) begin
-            rg_tiny <= ! ((rg_es == emin - 1) && rn_ones && rn_inc);
-            rg_s    <= sh_out;
-            rg_es   <= emin;
+            rg_tiny  <= ! ((rg_es == emin - 1) && rn_ones && rn_inc);
+            rg_state <= FT_DENORM;
          end
+         else
+            rg_state <= FT_RND1;
+      end
+
+      FT_DENORM: begin
+         rg_s     <= sh_out;
+         rg_es    <= emin;
          rg_state <= FT_RND1;
       end
 

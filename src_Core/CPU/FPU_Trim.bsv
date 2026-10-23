@@ -91,7 +91,7 @@ function Bit #(64) fn_box (Bool dbl, Bit #(64) x) = (dbl ? x : { 32'hffffffff, x
 
 // x >> amt (0..31), with every bit shifted out ORed into bit 0 (jam).  Larger shifts take
 // several passes (jam composes).
-function FT_Sig fn_shr_jam (FT_Sig x, Bit #(5) amt);
+function FT_Sig fn_shr_jam (FT_Sig x, Bit #(5) amt, Bool jam);
    Bit #(1) st = 0;
    for (Integer k = 0; k < 5; k = k + 1) begin
       Integer n = 2 ** k;
@@ -101,7 +101,7 @@ function FT_Sig fn_shr_jam (FT_Sig x, Bit #(5) amt);
          x = x >> n;
       end
    end
-   return { x [107:1], x [0] | st };
+   return { x [107:1], x [0] | (jam ? st : 0) };
 endfunction
 
 // leading zeros of the top 32 bits of s (0..32), log-depth tree (merge = concatenation, no
@@ -192,7 +192,6 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
    Reg #(Bool)      rg_xneg <- mkRegU;    // ALIGN: X has the larger exponent, shift S
    Reg #(Bit #(72)) rg_pp   <- mkRegU;
    Reg #(Bit #(57)) rg_r    <- mkRegU;
-   Reg #(Bit #(54)) rg_d    <- mkRegU;
    Reg #(Bit #(55)) rg_q    <- mkRegU;
    Reg #(Bit #(54)) rg_rsig <- mkRegU;
 
@@ -235,13 +234,13 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
 
    Bool sh_selx = ((((rg_state == FT_NORM1) || (rg_state == FT_NORM2)) && (! rg_pns))
                    || ((rg_state == FT_ALIGN) && (! rg_xneg)));
-   Bool sh_left = (rg_state == FT_NORM2);
+   Bool sh_left = ((rg_state == FT_NORM2) || (rg_state == FT_DIVITER));   // DIVITER: sqrt radicand
    Bool     sh_more = (rg_amt > 31);          // another pass after this one
    Bit #(5) sh_amt  = (sh_more ? 31 : rg_amt [4:0]);
    FT_Exp   sh_p    = unpack (zeroExtend (sh_amt));
    FT_Sig sh_src = (sh_selx ? rg_x : rg_s);
    FT_Sig sh_in  = (sh_left ? reverseBits (sh_src) : sh_src);
-   FT_Sig sh_o   = fn_shr_jam (sh_in, sh_amt);
+   FT_Sig sh_o   = fn_shr_jam (sh_in, sh_amt, ! sh_left);
    FT_Sig sh_out = (sh_left ? reverseBits (sh_o) : sh_o);
 
    Bit #(6) lzc = fn_lzc32 (sh_src);
@@ -268,8 +267,11 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
    FT_Sig    mul_out = { m_acc, rg_s [53:18] };
 
    // ---- div / sqrt recurrence
-   Bit #(59) dv_rn = (rg_sqrt ? { rg_r, rg_d [53:52] } : { 1'b0, rg_r, 1'b0 });
-   Bit #(59) dv_y  = (rg_sqrt ? zeroExtend ({ rg_q, 2'b01 }) : zeroExtend ({ rg_d, 1'b0 }));
+   // div: R << 1 against divisor X << 1.  sqrt: R << 2 | next 2 radicand bits from the top of S
+   // (S shifts left 2 per step; 1 on the first step for an even exponent), against 4Q + 1.
+   Bit #(2)  dv_b  = ((rg_amt [1:0] == 1) ? { 1'b0, rg_s [107] } : rg_s [107:106]);
+   Bit #(59) dv_rn = (rg_sqrt ? { rg_r, dv_b } : { 1'b0, rg_r, 1'b0 });
+   Bit #(59) dv_y  = (rg_sqrt ? zeroExtend ({ rg_q, 2'b01 }) : zeroExtend ({ rg_x [107:55], 1'b0 }));
    Bit #(60) dv_t  = zeroExtend (dv_rn) - zeroExtend (dv_y);
    Bool      dv_ge = (dv_t [59] == 0);
 
@@ -744,12 +746,11 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
          rg_q <= 0;
          if (rg_sqrt) begin
             rg_r  <= 0;
-            rg_d  <= ((pack (rg_es) [0] == 1) ? { rg_s [107:55], 1'b0 } : { 1'b0, rg_s [107:55] });
+            rg_amt <= ((pack (rg_es) [0] == 1) ? 2 : 1);     // odd exponent: radicand 2 * sig
             rg_es <= rg_es >> 1;
          end
          else begin
             rg_r  <= zeroExtend (rg_s [107:55]);
-            rg_d  <= zeroExtend (rg_x [107:55]);
             rg_es <= rg_es - rg_ex;
          end
          rg_cnt   <= (rg_dbl ? 55 : 26);
@@ -759,7 +760,10 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
       FT_DIVITER: begin
          rg_r <= (dv_ge ? dv_t [56:0] : dv_rn [56:0]);
          rg_q <= { rg_q [53:0], pack (dv_ge) };
-         if (rg_sqrt) rg_d <= rg_d << 2;
+         if (rg_sqrt) begin
+            rg_s   <= sh_out;
+            rg_amt <= 2;
+         end
          rg_cnt <= rg_cnt - 1;
          if (rg_cnt == 1) rg_state <= FT_DIVEND;
       end

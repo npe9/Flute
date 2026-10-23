@@ -45,6 +45,11 @@ import FBox_Top  :: *;    // FBox_Top_IFC
 typedef Bit #(108) FT_Sig;
 typedef Int #(14)  FT_Exp;
 
+Bit #(2) k_raw  = 0;
+Bit #(2) k_nan  = 1;
+Bit #(2) k_inf  = 2;
+Bit #(2) k_zero = 3;
+
 typedef enum {
    FT_IDLE, FT_LOAD, FT_MUL, FT_NORM1, FT_NORM2, FT_ALIGN0, FT_ALIGN, FT_ADD,
    FT_DIVINIT, FT_DIVITER, FT_DIVEND, FT_RND0, FT_DENORM, FT_RND1, FT_PACK, FT_F2I, FT_IPACK
@@ -84,10 +89,11 @@ endfunction
 
 function Bit #(64) fn_box (Bool dbl, Bit #(64) x) = (dbl ? x : { 32'hffffffff, x [31:0] });
 
-// x >> amt, with every bit shifted out ORed into bit 0 (jam)
-function FT_Sig fn_shr_jam (FT_Sig x, Bit #(7) amt);
+// x >> amt (0..31), with every bit shifted out ORed into bit 0 (jam).  Larger shifts take
+// several passes (jam composes).
+function FT_Sig fn_shr_jam (FT_Sig x, Bit #(5) amt);
    Bit #(1) st = 0;
-   for (Integer k = 0; k < 7; k = k + 1) begin
+   for (Integer k = 0; k < 5; k = k + 1) begin
       Integer n = 2 ** k;
       FT_Sig mask = fromInteger (2 ** n - 1);
       if (amt [k] == 1) begin
@@ -98,21 +104,22 @@ function FT_Sig fn_shr_jam (FT_Sig x, Bit #(7) amt);
    return { x [107:1], x [0] | st };
 endfunction
 
-// leading-zero count, log-depth tree (merge = concatenation, no adders); 0 -> 108
-function Bit #(7) fn_lzc (FT_Sig s);
-   Bit #(128) x = { s, 20'h80000 };
-   Vector #(128, Bool)     z = replicate (False);
-   Vector #(128, Bit #(7)) c = replicate (0);
-   for (Integer i = 0; i < 128; i = i + 1) z [i] = (x [127 - i] == 0);
-   for (Integer lvl = 0; lvl < 7; lvl = lvl + 1) begin
-      Integer n = 64 / (2 ** lvl);
+// leading zeros of the top 32 bits of s (0..32), log-depth tree (merge = concatenation, no
+// adders).  32 = all zero: normalize shifts 31 and counts again.
+function Bit #(6) fn_lzc32 (FT_Sig s);
+   Bit #(32) x = s [107:76];
+   Vector #(32, Bool)     z = replicate (False);
+   Vector #(32, Bit #(5)) c = replicate (0);
+   for (Integer i = 0; i < 32; i = i + 1) z [i] = (x [31 - i] == 0);
+   for (Integer lvl = 0; lvl < 5; lvl = lvl + 1) begin
+      Integer n = 16 / (2 ** lvl);
       for (Integer i = 0; i < n; i = i + 1) begin
          Bool zl = z [2 * i];
          c [i] = (zl ? (fromInteger (2 ** lvl) | c [2 * i + 1]) : c [2 * i]);
          z [i] = zl && z [2 * i + 1];
       end
    end
-   return c [0];
+   return (z [0] ? 32 : zeroExtend (c [0]));
 endfunction
 
 // shift amount clamped to 127 (>= 108 shifts everything into the jam bit); x >= 0
@@ -229,13 +236,15 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
    Bool sh_selx = ((((rg_state == FT_NORM1) || (rg_state == FT_NORM2)) && (! rg_pns))
                    || ((rg_state == FT_ALIGN) && (! rg_xneg)));
    Bool sh_left = (rg_state == FT_NORM2);
-   Bit #(7) sh_amt = rg_amt;
+   Bool     sh_more = (rg_amt > 31);          // another pass after this one
+   Bit #(5) sh_amt  = (sh_more ? 31 : rg_amt [4:0]);
+   FT_Exp   sh_p    = unpack (zeroExtend (sh_amt));
    FT_Sig sh_src = (sh_selx ? rg_x : rg_s);
    FT_Sig sh_in  = (sh_left ? reverseBits (sh_src) : sh_src);
    FT_Sig sh_o   = fn_shr_jam (sh_in, sh_amt);
    FT_Sig sh_out = (sh_left ? reverseBits (sh_o) : sh_o);
 
-   Bit #(7) lzc = fn_lzc (sh_src);
+   Bit #(6) lzc = fn_lzc32 (sh_src);
 
    // ---- adder: S + X, S - X or X - S, result >> 1 with jam
    FT_Sig    ad_a = ((rg_sub && rg_xbig)    ? (~ rg_s) : rg_s);
@@ -295,11 +304,18 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
    // =============================================================
    // LOAD: quick ops, special operands, datapath setup
 
-   Bit #(64) cnan = (out_dbl ? 64'h7ff8000000000000 : 64'hffffffff7fc00000);
-   function Bit #(64) fn_inf (Bit #(1) s)  = (out_dbl ? { s, 11'h7ff, 52'b0 } : { 32'hffffffff, s, 8'hff, 23'b0 });
-   function Bit #(64) fn_zero (Bit #(1) s) = (out_dbl ? { s, 63'b0 } : { 32'hffffffff, s, 31'b0 });
-   function Bit #(64) fn_sgn (Bit #(1) s, Bit #(64) raw)
-      = (out_dbl ? { s, raw [62:0] } : { 32'hffffffff, s, raw [30:0] });
+   // quick FP results: k_raw = the selected operand with sign rsg (sign injection, min/max,
+   // FMA passing the addend through), else canonical NaN / infinity / zero with sign rsg
+   function Bit #(64) fn_fmt (Bit #(2) kind, Bit #(1) rsg, Bool selx);
+      Bit #(64) raw  = (selx ? ux.raw : ua.raw);
+      Bool      isr  = (kind == k_raw);
+      Bool      ones = (kind == k_nan) || (kind == k_inf);
+      Bit #(1)  sgn  = ((kind == k_nan) ? 0 : rsg);
+      Bit #(1)  q    = pack (kind == k_nan);
+      Bit #(63) d    = (isr ? raw [62:0] : { (ones ? 11'h7ff : 11'h0), q, 51'b0 });
+      Bit #(31) f    = (isr ? raw [30:0] : { (ones ? 8'hff : 8'h0), q, 22'b0 });
+      return (out_dbl ? { sgn, d } : { 32'hffffffff, sgn, f });
+   endfunction
 
    // compares
    Bit #(63) mag_a = (in_dbl ? ua.raw [62:0] : zeroExtend (ua.raw [30:0]));
@@ -444,9 +460,14 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
 
       // ----------------------------------------------------------------
       FT_LOAD: begin
-         // quick results (done) or datapath setup (go)
+         // Quick results (done): an FP value built by fn_fmt from (kind, sign, operand), or an
+         // integer value.  Otherwise datapath setup.
          Bool      done = True;
-         Bit #(64) res  = 0;
+         Bool      fpr  = True;            // FP-format result (else ires)
+         Bit #(2)  kind = k_raw;
+         Bit #(1)  rsg  = 0;
+         Bool      selx = False;           // k_raw operand: X operand (rs2 / rs3) instead of rs1
+         Bit #(64) ires = 0;
          Bit #(5)  fl   = 0;
          FT_Sig    s0   = { ua.sig, 55'b0 };
          FT_Exp    es0  = ua.e;
@@ -455,21 +476,19 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
          Bool pdiv = False; Bool f2i = False;
 
          if (is_sgnj) begin
-            Bit #(1) sa = ua.raw [in_dbl ? 63 : 31];
-            Bit #(1) sb = ub.raw [in_dbl ? 63 : 31];
-            Bit #(1) s  = case (rg_rm)
-                             3'b000:  sb;
-                             3'b001:  ~ sb;
-                             default: sa ^ sb;
-                          endcase;
-            res = fn_sgn (s, ua.raw);
+            rsg = case (rg_rm)
+                     3'b000:  ux.sign;
+                     3'b001:  ~ ux.sign;
+                     default: ua.sign ^ ux.sign;
+                  endcase;
          end
          else if (is_minmax) begin
             Bool take_a = ((rg_rm [0] == 0) ? lt_tot : (! lt_tot));
-            res = ((ua.nan && ub.nan) ? cnan
-                   : (ua.nan ? fn_box (out_dbl, ub.raw)
-                      : (ub.nan ? fn_box (out_dbl, ua.raw)
-                         : fn_box (out_dbl, (take_a ? ua.raw : ub.raw)))));
+            if (ua.nan && ub.nan) kind = k_nan;
+            else begin
+               selx = ua.nan || ((! ub.nan) && (! take_a));
+               rsg  = (selx ? ux.sign : ua.sign);
+            end
             fl = (any_snan2 ? 5'h10 : 0);
          end
          else if (is_cmp) begin
@@ -479,31 +498,40 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
                          default: eq_ieee;
                       endcase;
             Bool nv = ((rg_rm == 3'b010) ? any_snan2 : any_nan2);
-            res = (((! any_nan2) && r) ? 1 : 0);
-            fl  = (nv ? 5'h10 : 0);
+            fpr  = False;
+            ires = (((! any_nan2) && r) ? 1 : 0);
+            fl   = (nv ? 5'h10 : 0);
          end
-         else if (is_mvx)
-            res = ((rg_rm [0] == 1) ? zeroExtend (fn_class (ua)) : signExtend (rg_v1 [31:0]));
-         else if (is_mvw)
-            res = { 32'hffffffff, rg_v1 [31:0] };
+         else if (is_mvx) begin
+            fpr  = False;
+            ires = ((rg_rm [0] == 1) ? zeroExtend (fn_class (ua)) : signExtend (rg_v1 [31:0]));
+         end
+         else if (is_mvw) begin
+            fpr  = False;
+            ires = { 32'hffffffff, rg_v1 [31:0] };
+         end
 
          // ---- FMA / FMUL / FADD / FSUB
          else if (is_fma || is_mul || is_add) begin
             if (p_nan || (has_c && ux.nan) || p_inv) begin
-               res = cnan;
-               fl  = ((fma_snan || p_inv) ? 5'h10 : 0);
+               kind = k_nan;
+               fl   = ((fma_snan || p_inv) ? 5'h10 : 0);
             end
             else if (p_inf) begin
-               if (has_c && ux.inf && (sp != sc)) begin res = cnan; fl = 5'h10; end
-               else res = fn_inf (sp);
+               if (has_c && ux.inf && (sp != sc)) begin kind = k_nan; fl = 5'h10; end
+               else begin kind = k_inf; rsg = sp; end
             end
-            else if (has_c && ux.inf)
-               res = fn_inf (sc);
+            else if (has_c && ux.inf) begin
+               kind = k_inf; rsg = sc;
+            end
             else if (p_zero) begin
-               if ((! has_c) || ux.zero)
-                  res = fn_zero (((! has_c) || (sp == sc)) ? sp : ((rg_rm == 3'b010) ? 1 : 0));
-               else
-                  res = fn_sgn (sc, ux.raw);
+               if ((! has_c) || ux.zero) begin
+                  kind = k_zero;
+                  rsg  = (((! has_c) || (sp == sc)) ? sp : ((rg_rm == 3'b010) ? 1 : 0));
+               end
+               else begin
+                  selx = True; rsg = sc;       // the addend, exactly
+               end
             end
             else begin
                done = False;
@@ -522,13 +550,14 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
          // ---- FDIV
          else if (is_div) begin
             Bit #(1) s = ua.sign ^ ub.sign;
+            rsg = s;
             if (any_nan2 || (ua.inf && ub.inf) || both_z) begin
-               res = cnan;
-               fl  = ((any_snan2 || (! any_nan2)) ? 5'h10 : 0);
+               kind = k_nan;
+               fl   = ((any_snan2 || (! any_nan2)) ? 5'h10 : 0);
             end
-            else if (ua.inf)            res = fn_inf (s);
-            else if (ub.zero) begin     res = fn_inf (s); fl = 5'h08; end
-            else if (ua.zero || ub.inf) res = fn_zero (s);
+            else if (ua.inf)            kind = k_inf;
+            else if (ub.zero) begin     kind = k_inf; fl = 5'h08; end
+            else if (ua.zero || ub.inf) kind = k_zero;
             else begin
                done = False;
                sg   = s;
@@ -540,10 +569,11 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
 
          // ---- FSQRT
          else if (is_sqrt) begin
-            if (ua.nan)            begin res = cnan; fl = (ua.snan ? 5'h10 : 0); end
-            else if (ua.zero)      res = fn_zero (ua.sign);
-            else if (ua.sign == 1) begin res = cnan; fl = 5'h10; end
-            else if (ua.inf)       res = fn_inf (0);
+            rsg = ua.sign;
+            if (ua.nan)            begin kind = k_nan; fl = (ua.snan ? 5'h10 : 0); end
+            else if (ua.zero)      kind = k_zero;
+            else if (ua.sign == 1) begin kind = k_nan; fl = 5'h10; end
+            else if (ua.inf)       kind = k_inf;
             else begin
                done = False;
                pns  = ua.sub;
@@ -553,9 +583,10 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
 
          // ---- FCVT.S.D / FCVT.D.S
          else if (is_cvtff) begin
-            if (ua.nan)       begin res = cnan; fl = (ua.snan ? 5'h10 : 0); end
-            else if (ua.inf)  res = fn_inf (ua.sign);
-            else if (ua.zero) res = fn_zero (ua.sign);
+            rsg = ua.sign;
+            if (ua.nan)       begin kind = k_nan; fl = (ua.snan ? 5'h10 : 0); end
+            else if (ua.inf)  kind = k_inf;
+            else if (ua.zero) kind = k_zero;
             else begin
                done = False;
                pns  = ua.sub;
@@ -564,11 +595,12 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
 
          // ---- FCVT.W[U].S/D
          else if (is_f2i) begin
+            fpr = False;
             if (ua.nan) begin
-               res = f2i_sat_pos; fl = 5'h10;
+               ires = f2i_sat_pos; fl = 5'h10;
             end
             else if (ua.inf || (ua.e > 32)) begin
-               res = ((ua.sign == 1) ? f2i_sat_neg : f2i_sat_pos); fl = 5'h10;
+               ires = ((ua.sign == 1) ? f2i_sat_neg : f2i_sat_pos); fl = 5'h10;
             end
             else if (! ua.zero) begin
                done = False;
@@ -578,7 +610,7 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
 
          // ---- FCVT.S/D.W[U]
          else if (is_i2f) begin
-            if (i_val == 0) res = fn_zero (0);
+            if (i_val == 0) kind = k_zero;
             else begin
                done = False;
                s0   = { i_mag, 76'b0 };
@@ -592,7 +624,8 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
 `ifdef RVFI_ALTOPS
          if (alt_hit) begin
             done = True;
-            res  = alt_value;
+            fpr  = False;
+            ires = alt_value;
             fl   = alt_flags;
          end
 `endif
@@ -619,7 +652,7 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
          rg_pdiv  <= pdiv;
          rg_f2i   <= f2i;
          rg_amt   <= fn_clamp (52 - ua.e);     // FT_F2I: units bit to S[55]
-         if (done) fa_done (res, fl);
+         if (done) fa_done ((fpr ? fn_fmt (kind, rsg, selx) : ires), fl);
          else      rg_state <= fn_next (pns, pnx, pmul, padd, pdiv, f2i);
       end
 
@@ -640,28 +673,31 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
       // ----------------------------------------------------------------
       // normalize S (pending first) or X
       FT_NORM1: begin
-         if (rg_pns && (rg_s == 0))
-            // exact zero from cancellation: +0, or -0 under RDN
-            fa_done (fn_zero ((rg_rm == 3'b010) ? 1 : 0), 0);
+         if (rg_pns && (rg_s == 0)) begin
+            // exact zero from cancellation: +0, or -0 under RDN; S = 0 rounds and packs to zero
+            rg_sign  <= ((rg_rm == 3'b010) ? 1 : 0);
+            rg_pns   <= False;
+            rg_state <= FT_RND0;
+         end
          else begin
-            rg_amt   <= lzc;
+            rg_amt   <= zeroExtend (lzc);
             rg_state <= FT_NORM2;
          end
       end
 
       FT_NORM2: begin
-         FT_Exp lz = unpack (zeroExtend (rg_amt));
+         Bool again = sh_more;      // top 32 bits were all zero: shifted 31, count again
          Bool pns = rg_pns;
          Bool pnx = rg_pnx;
          if (rg_pns) begin
             rg_s  <= sh_out;
-            rg_es <= rg_es - lz;
-            pns = False;
+            rg_es <= rg_es - sh_p;
+            pns = again;
          end
          else begin
             rg_x  <= sh_out;
-            rg_ex <= rg_ex - lz;
-            pnx = False;
+            rg_ex <= rg_ex - sh_p;
+            pnx = again;
          end
          rg_pns   <= pns;
          rg_pnx   <= pnx;
@@ -685,7 +721,8 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
          end
          else
             rg_x <= sh_out;
-         rg_state <= FT_ADD;
+         rg_amt   <= rg_amt - 31;
+         rg_state <= (sh_more ? FT_ALIGN : FT_ADD);
       end
 
       FT_ADD: begin
@@ -739,7 +776,8 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
       // FCVT to integer: units bit to S[55]
       FT_F2I: begin
          rg_s     <= sh_out;
-         rg_state <= FT_RND1;
+         rg_amt   <= rg_amt - 31;
+         rg_state <= (sh_more ? FT_F2I : FT_RND1);
       end
 
       // ----------------------------------------------------------------
@@ -757,7 +795,8 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
       FT_DENORM: begin
          rg_s     <= sh_out;
          rg_es    <= emin;
-         rg_state <= FT_RND1;
+         rg_amt   <= rg_amt - 31;
+         rg_state <= (sh_more ? FT_DENORM : FT_RND1);
       end
 
       FT_RND1: begin

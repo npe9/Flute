@@ -9,16 +9,25 @@ package FPU_Trim;
 //
 //   S, X     108-bit significand registers.  A value is S * 2^(eS - 107): bit 107 has weight 2^eS.
 //            Operands are unpacked to a 53-bit significand at S[107:55] (f32: 24 bits at S[107:84]).
-//   shifter  ONE right shifter with sticky (jam into bit 0), on S or X.  Left shifts (normalize)
-//            go through the same shifter with the operand and result bit-reversed.
-//   LZC      on the shifter operand; normalize = NORM1 (count, registered) + NORM2 (shift).
+//   shifter  ONE 5-level right shifter with sticky (jam into bit 0), on S or X, amount always from a
+//            register; shifts > 31 take extra passes (rare: large exponent gaps, denormals, FCVT to
+//            int).  Left shifts (normalize, sqrt radicand) use the same shifter with operand and
+//            result bit-reversed, without jam.
+//   LZC      leading zeros of the top 32 bits of the shifter operand; normalize = NORM1 (count,
+//            registered) + NORM2 (shift), repeated only while the top 32 bits are all zero.
 //   adder    ONE 109-bit add/subtract S +- X, result >> 1 with jam (eS + 1).
 //   mul      54 x 18 bits per cycle on 3 DSPs; the 106-bit product accumulates in S (f64: 3 chunks,
 //            f32: 2 chunks), one pipeline register between the DSPs and the accumulator.
-//   div/sqrt shared radix-2 restoring recurrence (R, D, Q registers), 55 (f64) / 26 (f32) cycles.
-//   round    RND0: tininess (after rounding) + denormalize shift; RND1: increment at 24 or 53 bits;
+//   div/sqrt shared radix-2 restoring recurrence (R, Q registers; divisor read from X, sqrt
+//            radicand streamed 2 bits per step from the top of S through the shifter),
+//            55 (f64) / 26 (f32) steps.
+//   round    RND0: tininess (after rounding) + DENORM shift; RND1: increment at 24 or 53 bits;
 //            PACK: exponent, overflow, flags.  FCVT to integer rounds at the 53-bit position after
 //            shifting the units bit there (F2I state) and packs in IPACK.
+//
+// Latencies (req to valid, normal operands, no extra shift passes): compare / min / max / sgnj /
+// class / moves 2; FCVT.S.D / D.S 5; FCVT.W[U] 5-6; FCVT.S/D.W[U] 7; FADD/FSUB 10; FMUL 10 (f32) /
+// 11 (f64); FMA 15 / 16; FDIV / FSQRT 35 (f32) / 64 (f64).
 //
 // Sign injection, min/max, compares, class and moves are combinational from the request registers
 // (LOAD state).  FMA is fused: the exact product is normalized and added to the addend in the

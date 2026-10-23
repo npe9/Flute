@@ -17,6 +17,9 @@ package CPU_Stage3;
 
 export
 CPU_Stage3_IFC (..),
+`ifdef ISA_F
+fn_stage3_sets_fs_dirty,
+`endif
 mkCPU_Stage3;
 
 // ================================================================
@@ -50,6 +53,18 @@ import TV_Trace_Data :: *;
 // ================================================================
 // Interface
 
+`ifdef ISA_F
+// mstatus.FS becomes Dirty when this op leaves Stage3 (an FPR write, or an FBox op that accrues
+// fflags). Shared by fa_deq and the RVFI record (CPU.bsv), so RVFI reports what the hardware does.
+function Bool fn_stage3_sets_fs_dirty (Data_Stage2_to_Stage3 x);
+`ifdef RVFI_MUTANT_NO_FS_DIRTY
+   return False;    // riscv-formal-fp mutant: must FAIL the FP insn checks
+`else
+   return (x.upd_flags || (x.rd_valid && x.rd_in_fpr));
+`endif
+endfunction
+`endif
+
 interface CPU_Stage3_IFC;
    // ---- Reset
    interface Server #(Token, Token) server_reset;
@@ -67,6 +82,15 @@ interface CPU_Stage3_IFC;
 
    (* always_ready *)
    method Action set_full (Bool full);
+
+`ifdef RVFI
+`ifdef ISA_F
+   // RVFI: fflags / FS update of the op in Stage3, applied when it leaves (fa_deq), i.e. in the same
+   // cycle as the next retirement; that retirement's fcsr / mstatus read view must include it
+   (* always_ready *)
+   method Tuple2 #(Bool, Bit #(5)) mv_rvfi_fp_pending;
+`endif
+`endif
 
    // ---- Debugging
    method Action show_state;
@@ -198,15 +222,6 @@ module mkCPU_Stage3 #(Bit #(4)         verbosity,
                $display ("    S3.fa_deq: write GRd 0x%0h, rd_val 0x%0h",
                          rg_stage3.rd, rg_stage3.rd_val);
 
-`ifdef ISA_F
-         // Update FCSR.fflags
-         if (rg_stage3.upd_flags)
-            csr_regfile.ma_update_fcsr_fflags (rg_stage3.fpr_flags);
-
-         // Update MSTATUS.FS
-         if (rg_stage3.upd_flags || rg_stage3.rd_in_fpr)
-            csr_regfile.ma_update_mstatus_fs (fs_xs_dirty);
-`endif
    endrule
 
    // ----------------
@@ -214,7 +229,17 @@ module mkCPU_Stage3 #(Bit #(4)         verbosity,
 
    function Action fa_deq;
       action
+`ifdef ISA_F
+	 // fflags / mstatus.FS are updated once, at deq (not in rl_writeback, which
+	 // re-fires every cycle Stage3 is full: a repeated fflags OR could land after a
+	 // CSR write to fflags, and CSR methods conflict with rl_trap / debug CSR writes)
+	 if (rg_full && rg_stage3.upd_flags)
+	    csr_regfile.ma_update_fcsr_fflags (rg_stage3.fpr_flags);
+	 if (rg_full && fn_stage3_sets_fs_dirty (rg_stage3))
+	    csr_regfile.ma_update_mstatus_fs (fs_xs_dirty);
+`else
 	 noAction;
+`endif
       endaction
    endfunction
 
@@ -245,6 +270,16 @@ module mkCPU_Stage3 #(Bit #(4)         verbosity,
    method Action set_full (Bool full);
       rg_full <= full;
    endmethod
+
+`ifdef RVFI
+`ifdef ISA_F
+   method Tuple2 #(Bool, Bit #(5)) mv_rvfi_fp_pending;
+      Bool dirty = rg_full && fn_stage3_sets_fs_dirty (rg_stage3);
+      Bit #(5) flags = ((rg_full && rg_stage3.upd_flags) ? rg_stage3.fpr_flags : 0);
+      return tuple2 (dirty, flags);
+   endmethod
+`endif
+`endif
 
    // ---- Debugging
    method Action show_state;

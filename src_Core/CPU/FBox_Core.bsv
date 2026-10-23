@@ -128,7 +128,56 @@ function Bool fv_FDoubleIsPositiveZero ( FDouble x );
    return ( isZero (x) && !(x.sign) );
 endfunction
 
+// FCVT.WU/LU of a negative non-zero value: True if it rounds to 0 under rm (a valid result, NX only),
+// False if it rounds to -1 or below (out of range: NV only). |f| < 0.5, == 0.5, < 1 from the exponent.
+function Bool fv_negRoundsToZero (FloatingPoint #(e, m) f, Bit #(3) rm);
+   Bit #(e) bias_v = '1 >> 1;
+   Bool ltHalf = f.exp < (bias_v - 1);
+   Bool isHalf = (f.exp == (bias_v - 1)) && (f.sfd == 0);
+   Bool ltOne  = f.exp < bias_v;
+   case (rm)
+      3'h0:    return (ltHalf || isHalf);   // RNE: -0.5 ties to even (0)
+      3'h1:    return ltOne;                // RTZ
+      3'h2:    return False;                // RDN: any negative rounds to <= -1
+      3'h3:    return ltOne;                // RUP
+      3'h4:    return ltHalf;               // RMM: -0.5 rounds away to -1
+      default: return False;
+   endcase
+endfunction
+
 // ================================================================
+
+`ifdef RVFI_ALTOPS
+// RVFI_ALTOPS: no FPU (all its ops are stand-ins); resets still complete
+module mkFPU_AltStub (FPU_IFC);
+   FIFOF #(Token) f_rst <- mkFIFOF;
+   interface Server server_core;
+      interface Put request;
+         method Action put (Fpu_Req r);
+            noAction;
+         endmethod
+      endinterface
+      interface Get response;
+         method ActionValue #(Fpu_Rsp) get () if (False);
+            return ?;
+         endmethod
+      endinterface
+   endinterface
+   interface Server server_reset;
+      interface Put request;
+         method Action put (Token t);
+            f_rst.enq (t);
+         endmethod
+      endinterface
+      interface Get response;
+         method ActionValue #(Token) get;
+            f_rst.deq;
+            return f_rst.first;
+         endmethod
+      endinterface
+   endinterface
+endmodule
+`endif
 
 (* synthesize *)
 module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
@@ -158,7 +207,11 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
         Bit #(64)
       , Bit #(5))))        resultR              <- mkRegU;
    
+`ifdef RVFI_ALTOPS
+   FPU_IFC                 fpu                  <- mkFPU_AltStub;
+`else
    FPU_IFC                 fpu                  <- mkFPU;
+`endif
 
    // =============================================================
    // Drive response to the pipeline
@@ -269,6 +322,135 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
    dV3 = unpack (v3);
 
    let rmd = fv_getRoundMode (rm);
+
+   // =============================================================
+   // RVFI_ALTOPS (riscv-formal-fp): arithmetic and FCVT ops replaced by the stand-in functions of
+   // riscv-formal-fp insns/generate.py (same table, constants generated from it). Formal builds only:
+   // the RVFI checks then prove operand / rounding-mode / fflags / writeback plumbing; TestFloat proves
+   // the IEEE arithmetic of the real FPU, which is not instantiated here.
+`ifdef RVFI_ALTOPS
+   function Bit #(32) fn_rotl32 (Bit #(32) x, Integer n) = ((x << n) | (x >> (32 - n)));
+   function Bit #(64) fn_rotl64 (Bit #(64) x, Integer n) = ((x << n) | (x >> (64 - n)));
+   Bit #(32) alt_a = pack (sV1);
+   Bit #(32) alt_b = pack (sV2);
+   Bit #(32) alt_c = pack (sV3);
+   Bit #(64) alt_da = v1;
+   Bit #(64) alt_db = v2;
+   Bit #(64) alt_dc = v3;
+   Bit #(32) alt_x  = v1 [31:0];    // integer rs1 (FCVT.S/D.W[U])
+   Bit #(32) alt_rm32 = zeroExtend (rm);
+   Bit #(64) alt_rm64 = zeroExtend (rm);
+`ifdef RVFI_MUTANT_FSUB_SWAP
+   Bit #(32) alt_fsub_s_e = alt_b - fn_rotl32 (alt_a, 1);    // riscv-formal-fp mutant: rs1/rs2 swapped
+`else
+   Bit #(32) alt_fsub_s_e = alt_a - fn_rotl32 (alt_b, 1);
+`endif
+   Bit #(32) alt_ab_s = alt_a + fn_rotl32 (alt_b, 1);
+   Bit #(64) alt_ab_d = alt_da + fn_rotl64 (alt_db, 1);
+
+   Bit #(32) alt_fadd_s = alt_ab_s ^ 32'h2c1e5a07 ^ alt_rm32;
+   Bit #(32) alt_fsub_s = alt_fsub_s_e ^ 32'h6f3d1b42 ^ alt_rm32;
+   Bit #(32) alt_fmul_s = (alt_a ^ fn_rotl32 (alt_b, 3)) ^ 32'h13a5c6e9 ^ alt_rm32;
+   Bit #(32) alt_fdiv_s = (alt_a - fn_rotl32 (alt_b, 5)) ^ 32'h5b0f8d31 ^ alt_rm32;
+   Bit #(32) alt_fsqrt_s = fn_rotl32 (alt_a, 7) ^ 32'h7e29b4c5 ^ alt_rm32;
+   Bit #(32) alt_fmadd_s = (alt_ab_s + fn_rotl32 (alt_c, 2)) ^ 32'hd6b3f97 ^ alt_rm32;
+   Bit #(32) alt_fmsub_s = (alt_ab_s - fn_rotl32 (alt_c, 2)) ^ 32'h48c27a1d ^ alt_rm32;
+   Bit #(32) alt_fnmsub_s = ((~ alt_ab_s) + fn_rotl32 (alt_c, 2)) ^ 32'h31f9e063 ^ alt_rm32;
+   Bit #(32) alt_fnmadd_s = ((~ alt_ab_s) - fn_rotl32 (alt_c, 2)) ^ 32'h6a84d2fb ^ alt_rm32;
+   Bit #(32) alt_fcvt_w_s = alt_a ^ 32'h1b7e3c55 ^ alt_rm32;
+   Bit #(32) alt_fcvt_wu_s = alt_a ^ 32'h26d1a0c9 ^ alt_rm32;
+   Bit #(32) alt_fcvt_s_w = alt_x ^ 32'h4f5a9e13 ^ alt_rm32;
+   Bit #(32) alt_fcvt_s_wu = alt_x ^ 32'h573c08ad ^ alt_rm32;
+`ifdef ISA_D
+   Bit #(64) alt_fadd_d = alt_ab_d ^ 64'h2c1e5a07d4c3b2a1 ^ alt_rm64;
+   Bit #(64) alt_fsub_d = (alt_da - fn_rotl64 (alt_db, 1)) ^ 64'h6f3d1b4291e8f705 ^ alt_rm64;
+   Bit #(64) alt_fmul_d = (alt_da ^ fn_rotl64 (alt_db, 3)) ^ 64'h13a5c6e97b2d4e18 ^ alt_rm64;
+   Bit #(64) alt_fdiv_d = (alt_da - fn_rotl64 (alt_db, 5)) ^ 64'h5b0f8d3106f1a9c3 ^ alt_rm64;
+   Bit #(64) alt_fsqrt_d = fn_rotl64 (alt_da, 7) ^ 64'h7e29b4c5e8173d6b ^ alt_rm64;
+   Bit #(64) alt_fmadd_d = (alt_ab_d + fn_rotl64 (alt_dc, 2)) ^ 64'hd6b3f9752ac8e04 ^ alt_rm64;
+   Bit #(64) alt_fmsub_d = (alt_ab_d - fn_rotl64 (alt_dc, 2)) ^ 64'h48c27a1db93f6052 ^ alt_rm64;
+   Bit #(64) alt_fnmsub_d = ((~ alt_ab_d) + fn_rotl64 (alt_dc, 2)) ^ 64'h31f9e0634d8a1bc7 ^ alt_rm64;
+   Bit #(64) alt_fnmadd_d = ((~ alt_ab_d) - fn_rotl64 (alt_dc, 2)) ^ 64'h6a84d2fb0c57e913 ^ alt_rm64;
+   Bit #(32) alt_fcvt_w_d = (alt_da [31:0] ^ alt_da [63:32]) ^ 32'h3d2f75e1 ^ alt_rm32;
+   Bit #(32) alt_fcvt_wu_d = (alt_da [31:0] ^ alt_da [63:32]) ^ 32'h60a4c83f ^ alt_rm32;
+   Bit #(64) alt_fcvt_d_w = {alt_x, alt_x} ^ 64'h4f5a9e13a8c6205d ^ alt_rm64;
+   Bit #(64) alt_fcvt_d_wu = {alt_x, alt_x} ^ 64'h573c08ad1f94b6e2 ^ alt_rm64;
+   Bit #(32) alt_fcvt_s_d = (alt_da [31:0] ^ alt_da [63:32]) ^ 32'he9b6271 ^ alt_rm32;
+   Bit #(64) alt_fcvt_d_s = {alt_a, alt_a} ^ 64'he9b627195da43f8 ^ alt_rm64;
+`endif
+   Tuple3 #(Bool, Bit #(64), Bit #(5)) alt_res = tuple3 (False, ?, ?);
+   if (False) alt_res = tuple3 (False, ?, ?);
+   else if (isFADD_S) alt_res = tuple3 (True, fv_nanbox (zeroExtend (alt_fadd_s)), alt_fadd_s [9:5]);
+   else if (isFSUB_S) alt_res = tuple3 (True, fv_nanbox (zeroExtend (alt_fsub_s)), alt_fsub_s [9:5]);
+   else if (isFMUL_S) alt_res = tuple3 (True, fv_nanbox (zeroExtend (alt_fmul_s)), alt_fmul_s [9:5]);
+   else if (isFDIV_S) alt_res = tuple3 (True, fv_nanbox (zeroExtend (alt_fdiv_s)), alt_fdiv_s [9:5]);
+   else if (isFSQRT_S) alt_res = tuple3 (True, fv_nanbox (zeroExtend (alt_fsqrt_s)), alt_fsqrt_s [9:5]);
+   else if (isFMADD_S) alt_res = tuple3 (True, fv_nanbox (zeroExtend (alt_fmadd_s)), alt_fmadd_s [9:5]);
+   else if (isFMSUB_S) alt_res = tuple3 (True, fv_nanbox (zeroExtend (alt_fmsub_s)), alt_fmsub_s [9:5]);
+   else if (isFNMSUB_S) alt_res = tuple3 (True, fv_nanbox (zeroExtend (alt_fnmsub_s)), alt_fnmsub_s [9:5]);
+   else if (isFNMADD_S) alt_res = tuple3 (True, fv_nanbox (zeroExtend (alt_fnmadd_s)), alt_fnmadd_s [9:5]);
+   else if (isFCVT_W_S) alt_res = tuple3 (True, signExtend (alt_fcvt_w_s), alt_fcvt_w_s [9:5]);
+   else if (isFCVT_WU_S) alt_res = tuple3 (True, signExtend (alt_fcvt_wu_s), alt_fcvt_wu_s [9:5]);
+   else if (isFCVT_S_W) alt_res = tuple3 (True, fv_nanbox (zeroExtend (alt_fcvt_s_w)), alt_fcvt_s_w [9:5]);
+   else if (isFCVT_S_WU) alt_res = tuple3 (True, fv_nanbox (zeroExtend (alt_fcvt_s_wu)), alt_fcvt_s_wu [9:5]);
+`ifdef ISA_D
+   else if (isFADD_D) alt_res = tuple3 (True, alt_fadd_d, alt_fadd_d [9:5]);
+   else if (isFSUB_D) alt_res = tuple3 (True, alt_fsub_d, alt_fsub_d [9:5]);
+   else if (isFMUL_D) alt_res = tuple3 (True, alt_fmul_d, alt_fmul_d [9:5]);
+   else if (isFDIV_D) alt_res = tuple3 (True, alt_fdiv_d, alt_fdiv_d [9:5]);
+   else if (isFSQRT_D) alt_res = tuple3 (True, alt_fsqrt_d, alt_fsqrt_d [9:5]);
+   else if (isFMADD_D) alt_res = tuple3 (True, alt_fmadd_d, alt_fmadd_d [9:5]);
+   else if (isFMSUB_D) alt_res = tuple3 (True, alt_fmsub_d, alt_fmsub_d [9:5]);
+   else if (isFNMSUB_D) alt_res = tuple3 (True, alt_fnmsub_d, alt_fnmsub_d [9:5]);
+   else if (isFNMADD_D) alt_res = tuple3 (True, alt_fnmadd_d, alt_fnmadd_d [9:5]);
+   else if (isFCVT_W_D) alt_res = tuple3 (True, signExtend (alt_fcvt_w_d), alt_fcvt_w_d [9:5]);
+   else if (isFCVT_WU_D) alt_res = tuple3 (True, signExtend (alt_fcvt_wu_d), alt_fcvt_wu_d [9:5]);
+   else if (isFCVT_D_W) alt_res = tuple3 (True, alt_fcvt_d_w, alt_fcvt_d_w [9:5]);
+   else if (isFCVT_D_WU) alt_res = tuple3 (True, alt_fcvt_d_wu, alt_fcvt_d_wu [9:5]);
+   else if (isFCVT_S_D) alt_res = tuple3 (True, fv_nanbox (zeroExtend (alt_fcvt_s_d)), alt_fcvt_s_d [9:5]);
+   else if (isFCVT_D_S) alt_res = tuple3 (True, alt_fcvt_d_s, alt_fcvt_d_s [9:5]);
+`endif
+   match {.alt_hit, .alt_value, .alt_flags} = alt_res;
+   // the FPU-dispatch / local rules of these ops never fire under RVFI_ALTOPS
+   isFADD_S = False;
+   isFSUB_S = False;
+   isFMUL_S = False;
+`ifdef INCLUDE_FDIV
+   isFDIV_S = False;
+`endif
+`ifdef INCLUDE_FSQRT
+   isFSQRT_S = False;
+`endif
+   isFMADD_S = False;
+   isFMSUB_S = False;
+   isFNMSUB_S = False;
+   isFNMADD_S = False;
+   isFCVT_W_S = False;
+   isFCVT_WU_S = False;
+   isFCVT_S_W = False;
+   isFCVT_S_WU = False;
+`ifdef ISA_D
+   isFADD_D = False;
+   isFSUB_D = False;
+   isFMUL_D = False;
+`ifdef INCLUDE_FDIV
+   isFDIV_D = False;
+`endif
+`ifdef INCLUDE_FSQRT
+   isFSQRT_D = False;
+`endif
+   isFMADD_D = False;
+   isFMSUB_D = False;
+   isFNMSUB_D = False;
+   isFNMADD_D = False;
+   isFCVT_W_D = False;
+   isFCVT_WU_D = False;
+   isFCVT_D_W = False;
+   isFCVT_D_WU = False;
+   isFCVT_S_D = False;
+   isFCVT_D_S = False;
+`endif
+`endif
 
    // =============================================================
    // BEHAVIOR
@@ -468,6 +650,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
          v = (1<<63) - 1;
 
       Bit #(64) res = ( pack (v) );
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -485,13 +668,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
 
       // Extra work if the operand is negative. The original convert function
       // prioritizes the sign of the operand before inexact checks
-      if (f.sign) begin
-         // Result is zero
+      if (f.sign && !isNaN (f) && !isZero (f)) begin
+         // Result is zero: NX only if the value rounds to 0 under rm, otherwise out of range (NV only)
          v = 0;
-         // No exceptions were signalled, signal invalid exception, otherwise
-         // let original exception remain
-         if (pack (e) == 0)
-            e.invalid_op = True;
+         e = defaultValue;
+         if (fv_negRoundsToZero (f, rm)) e.inexact = True;
+         else                            e.invalid_op = True;
       end
 
       // Handle infinity and NaNs
@@ -500,6 +682,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
          v = 64'hffffffffffffffff;
 
       Bit #(64) res = ( pack (v) );
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -518,6 +701,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
          v = (1<<31) - 1;
 
       Bit #(64) res = signExtend (pack (v));
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -535,13 +719,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
 
       // Extra work if the operand is negative. The original convert function
       // prioritizes the sign of the operand before inexact checks
-      if (f.sign) begin
-         // Result is zero
+      if (f.sign && !isNaN (f) && !isZero (f)) begin
+         // Result is zero: NX only if the value rounds to 0 under rm, otherwise out of range (NV only)
          v = 0;
-         // No exceptions were signalled, signal invalid exception, otherwise
-         // let original exception remain
-         if (pack (e) == 0)
-            e.invalid_op = True;
+         e = defaultValue;
+         if (fv_negRoundsToZero (f, rm)) e.inexact = True;
+         else                            e.invalid_op = True;
       end
 
       // Handle infinity and NaNs
@@ -552,6 +735,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
       // This is meant for the GPR. If the GPR is 64-bit, the 32-bit result is
       // stored, sign-extended as per the v2.2 of the spec
       Bit #(64) res = signExtend(pack (v));
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -566,17 +750,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
       let rs1IsNeg0 = isNegativeZero (sV1);
       let rs2IsNeg0 = isNegativeZero (sV2);
       // One or both of the values are NaNs
-      if ( isSNaN (sV1) && isSNaN (sV2) )
+      // Both NaN -> canonical NaN; one NaN -> the other operand (F/D 2.2+, Sail)
+      if ( isNaN (sV1) && isNaN (sV2) )
          res = fv_nanbox (extend (pack ( canonicalNaN32 )));
-      else if ( isSNaN (sV1) )
+      else if ( isNaN (sV1) )
          res = fv_nanbox (extend (pack ( sV2 )));
-      else if ( isSNaN (sV2) )
-         res = fv_nanbox (extend (pack ( sV1 )));
-      else if ( isQNaN (sV1) && isQNaN (sV2) )
-         res = fv_nanbox (extend (pack ( canonicalNaN32 )));
-      else if ( isQNaN (sV1) )
-         res = fv_nanbox (extend (pack ( sV2 )));
-      else if ( isQNaN (sV2) )
+      else if ( isNaN (sV2) )
          res = fv_nanbox (extend (pack ( sV1 )));
       else if ( rs1IsNeg0 && rs2IsPos0 )
          res = fv_nanbox (extend (pack ( sV1 )));
@@ -605,17 +784,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
       let rs2IsNeg0 = isNegativeZero (sV2);
 
       // One or both of the values are NaNs
-      if ( isSNaN (sV1) && isSNaN (sV2) )
+      // Both NaN -> canonical NaN; one NaN -> the other operand (F/D 2.2+, Sail)
+      if ( isNaN (sV1) && isNaN (sV2) )
          res = fv_nanbox (extend (pack ( canonicalNaN32 )));
-      else if ( isSNaN (sV1) )
+      else if ( isNaN (sV1) )
          res = fv_nanbox (extend (pack ( sV2 )));
-      else if ( isSNaN (sV2) )
-         res = fv_nanbox (extend (pack ( sV1 )));
-      else if ( isQNaN (sV1) && isQNaN (sV2) )
-         res = fv_nanbox (extend (pack ( canonicalNaN32 )));
-      else if ( isQNaN (sV1) )
-         res = fv_nanbox (extend (pack ( sV2 )));
-      else if ( isQNaN (sV2) )
+      else if ( isNaN (sV2) )
          res = fv_nanbox (extend (pack ( sV1 )));
       else if ( rs1IsNeg0 && rs2IsPos0 )
          res = fv_nanbox (extend (pack ( sV2 )));
@@ -886,6 +1060,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
          v = (1<<31) - 1;
 
       Bit #(64) res = signExtend(pack (v));
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -903,13 +1078,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
 
       // Extra work if the operand is negative. The original convert function
       // prioritizes the sign of the operand before inexact checks
-      if (f.sign) begin
-         // Result is zero
+      if (f.sign && !isNaN (f) && !isZero (f)) begin
+         // Result is zero: NX only if the value rounds to 0 under rm, otherwise out of range (NV only)
          v = 0;
-         // No exceptions were signalled, signal invalid exception, otherwise
-         // let original exception remain
-         if (pack (e) == 0)
-            e.invalid_op = True;
+         e = defaultValue;
+         if (fv_negRoundsToZero (f, rm)) e.inexact = True;
+         else                            e.invalid_op = True;
       end
 
       // Handle infinity and NaNs
@@ -920,6 +1094,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
       // This is meant for the GPR. If the GPR is 64-bit, the 32-bit result is
       // stored, sign-extended as per the v2.2 of the spec
       Bit #(64) res = signExtend(pack(v));
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -960,6 +1135,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
          v = (1<<63) - 1;
 
       Bit #(64) res = pack (v);
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -977,13 +1153,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
 
       // Extra work if the operand is negative. The original convert function
       // prioritizes the sign of the operand before inexact checks
-      if (f.sign) begin
-         // Result is zero
+      if (f.sign && !isNaN (f) && !isZero (f)) begin
+         // Result is zero: NX only if the value rounds to 0 under rm, otherwise out of range (NV only)
          v = 0;
-         // No exceptions were signalled, signal invalid exception, otherwise
-         // let original exception remain
-         if (pack (e) == 0)
-            e.invalid_op = True;
+         e = defaultValue;
+         if (fv_negRoundsToZero (f, rm)) e.inexact = True;
+         else                            e.invalid_op = True;
       end
 
       // Handle infinity and NaNs
@@ -992,6 +1167,7 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
          v = 64'hffffffffffffffff;
 
       Bit #(64) res = pack (v);
+      if (e.invalid_op) e.inexact = False;   // an invalid FCVT to integer raises NV only
       let fcsr    = exception_to_fcsr(e);
       resultR     <= tagged Valid (tuple2 (res, fcsr));
       stateR      <= FBOX_RSP;
@@ -1046,17 +1222,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
       let rs1IsNeg0 = isNegativeZero (dV1);
       let rs2IsNeg0 = isNegativeZero (dV2);
 
-      if ( isSNaN (dV1) && isSNaN (dV2) )
+      // Both NaN -> canonical NaN; one NaN -> the other operand (F/D 2.2+, Sail)
+      if ( isNaN (dV1) && isNaN (dV2) )
          res = pack (canonicalNaN64);
-      else if ( isSNaN (dV1) )
+      else if ( isNaN (dV1) )
          res = pack ( dV2 );
-      else if ( isSNaN (dV2) )
-         res = pack ( dV1 );
-      else if ( isQNaN (dV1) && isQNaN (dV2) )
-         res = pack (canonicalNaN64);
-      else if ( isQNaN (dV1) )
-         res = pack ( dV2 );
-      else if ( isQNaN (dV2) )
+      else if ( isNaN (dV2) )
          res = pack ( dV1 );
       else if ( rs1IsNeg0 && rs2IsPos0 )
          res = pack ( dV1 );
@@ -1084,17 +1255,12 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
       let rs1IsNeg0 = isNegativeZero (dV1);
       let rs2IsNeg0 = isNegativeZero (dV2);
 
-      if ( isSNaN (dV1) && isSNaN (dV2) )
+      // Both NaN -> canonical NaN; one NaN -> the other operand (F/D 2.2+, Sail)
+      if ( isNaN (dV1) && isNaN (dV2) )
          res = pack ( canonicalNaN64 );
-      else if ( isSNaN (dV1) )
+      else if ( isNaN (dV1) )
          res = pack ( dV2 );
-      else if ( isSNaN (dV2) )
-         res = pack ( dV1 );
-      else if ( isQNaN (dV1) && isQNaN (dV2) )
-         res = pack ( canonicalNaN64 );
-      else if ( isQNaN (dV1) )
-         res = pack ( dV2 );
-      else if ( isQNaN (dV2) )
+      else if ( isNaN (dV2) )
          res = pack ( dV1 );
       else if ( rs1IsNeg0 && rs2IsPos0 )
          res = pack ( dV2 );
@@ -1219,6 +1385,13 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
    endrule
 `endif
 
+`ifdef RVFI_ALTOPS
+   rule doALTOPS ( validReq && alt_hit );
+      resultR     <= tagged Valid (tuple2 (alt_value, alt_flags));
+      stateR      <= FBOX_RSP;
+   endrule
+`endif
+
    // =============================================================
 
    // This rule collects the response from FPU for compute opcodes
@@ -1239,6 +1412,17 @@ module mkFBox_Core #(Bit #(4) verbosity) (FBox_Core_IFC);
             res = extend (pack (out));
       else
          res = 0;  // note: just ain't possible
+
+      // FMA: inf * 0 is invalid even when the addend is a quiet NaN (the FloatingPoint library
+      // checks the qNaN addend first and returns it without NV)
+      Bool fmaS = isFMADD_S || isFMSUB_S || isFNMADD_S || isFNMSUB_S;
+      Bool infZeroS = (isInfinity (sV1) && isZero (sV2)) || (isZero (sV1) && isInfinity (sV2));
+      if (fmaS && infZeroS) e.invalid_op = True;
+`ifdef ISA_D
+      Bool fmaD = isFMADD_D || isFMSUB_D || isFNMADD_D || isFNMSUB_D;
+      Bool infZeroD = (isInfinity (dV1) && isZero (dV2)) || (isZero (dV1) && isInfinity (dV2));
+      if (fmaD && infZeroD) e.invalid_op = True;
+`endif
 
       let fcsr    = exception_to_fcsr( e );
       fa_driveResponse (res, fcsr);

@@ -206,6 +206,11 @@ module mkCPU_Stage1 #(Bit #(4)         verbosity,
 					       instr_C        : rg_stage_input.instr_C,
 					       rs1_val        : rs1_val_bypassed,
 					       rs2_val        : rs2_val_bypassed,
+`ifdef ISA_F
+					       rvfi_frs1_val  : frs1_val_bypassed,
+					       rvfi_frs2_val  : frs2_val_bypassed,
+					       rvfi_frs3_val  : frs3_val_bypassed,
+`endif
 `endif
 `ifdef ISA_F
 					       fval1         : alu_outputs.fval1,
@@ -253,6 +258,11 @@ module mkCPU_Stage1 #(Bit #(4)         verbosity,
 						     instr_C:   ?,
 						     rs1_val:   ?,
 						     rs2_val:   ?,
+`ifdef ISA_F
+						     rvfi_frs1_val: ?,
+						     rvfi_frs2_val: ?,
+						     rvfi_frs3_val: ?,
+`endif
 `endif
 `ifdef ISA_F
 						     fval1           : ?,

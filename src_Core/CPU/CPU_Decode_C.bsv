@@ -241,7 +241,8 @@ function Tuple2 #(Bool, Instr) fv_decode_C_FLWSP (MISA  misa, Bit #(2)  xl, Inst
       Bool is_legal = ((misa.c == 1'b1)
 		       && (op == opcode_C2)
 		       && (funct3 == funct3_C_FLWSP)
-		       && (misa.f == 1'b1));
+		       && (misa.f == 1'b1)
+		       && (xl == misa_mxl_32));    // RV32 only: on RV64 this encoding is C.LD/C.SD/C.LDSP/C.SDSP
 
       RegName rs1   = reg_sp;
       let     instr = mkInstr_I_type (zeroExtend (offset),  rs1,  f3_FLW,  rd,  op_LOAD_FP);
@@ -262,7 +263,7 @@ function Tuple2 #(Bool, Instr) fv_decode_C_FLDSP (MISA  misa,  Bit #(2) xl, Inst
       Bool is_legal = ((misa.c == 1'b1)
 		       && (op == opcode_C2)
 		       && (funct3 == funct3_C_FLDSP)
-		       && (misa.d == 1'b1));
+		       && (misa.d == 1'b1));    // RV32 and RV64 (Sail: C.FLD* need D, any XLEN)
 
       RegName rs1   = reg_sp;
       let     instr = mkInstr_I_type (zeroExtend (offset),  rs1,  f3_FLD,  rd,  op_LOAD_FP);
@@ -346,7 +347,9 @@ function Tuple2 #(Bool, Instr) fv_decode_C_FSWSP (MISA  misa,  Bit #(2)  xl, Ins
 
       Bool is_legal = ((misa.c == 1'b1)
 		       && (op == opcode_C2)
-		       && (funct3 == funct3_C_FSWSP));
+		       && (funct3 == funct3_C_FSWSP)
+		       && (misa.f == 1'b1)
+		       && (xl == misa_mxl_32));    // RV32 only: on RV64 this encoding is C.LD/C.SD/C.LDSP/C.SDSP
 
       RegName   rs1   = reg_sp;
       let       instr = mkInstr_S_type (zeroExtend (offset), rs2, rs1, f3_FSW, op_STORE_FP);
@@ -366,7 +369,8 @@ function Tuple2 #(Bool, Instr) fv_decode_C_FSDSP (MISA  misa,  Bit #(2)  xl, Ins
 
       Bool is_legal = ((misa.c == 1'b1)
 		       && (op == opcode_C2)
-		       && (funct3 == funct3_C_FSDSP));
+		       && (funct3 == funct3_C_FSDSP)
+		       && (misa.d == 1'b1));    // RV32 and RV64 (Sail: C.FLD* need D, any XLEN)
 
       RegName   rs1   = reg_sp;
       let       instr = mkInstr_S_type (zeroExtend (offset), rs2, rs1, f3_FSD, op_STORE_FP);
@@ -447,7 +451,9 @@ function Tuple2 #(Bool, Instr) fv_decode_C_FLW (MISA  misa,  Bit #(2)  xl,  Inst
 
       Bool is_legal = ((misa.c == 1'b1)
 		       && (op == opcode_C0)
-		       && (funct3 == funct3_C_FLW));
+		       && (funct3 == funct3_C_FLW)
+		       && (misa.f == 1'b1)
+		       && (xl == misa_mxl_32));    // RV32 only: on RV64 this encoding is C.LD/C.SD/C.LDSP/C.SDSP
 
       let     instr = mkInstr_I_type (zeroExtend (offset),  rs1,  f3_FLW,  rd,  op_LOAD_FP);
 
@@ -467,8 +473,7 @@ function Tuple2 #(Bool, Instr) fv_decode_C_FLD (MISA  misa,  Bit #(2)  xl,  Inst
       Bool is_legal = ((misa.c == 1'b1)
 		       && (op == opcode_C0)
 		       && (funct3 == funct3_C_FLD)
-		       && (   (xl == misa_mxl_64)
-			   || (xl == misa_mxl_128)));
+		       && (misa.d == 1'b1));    // RV32 and RV64 (Sail: C.FLD* need D, any XLEN)
 
       let     instr = mkInstr_I_type (zeroExtend (offset),  rs1,  f3_FLD,  rd,  op_LOAD_FP);
 
@@ -545,7 +550,9 @@ function Tuple2 #(Bool, Instr) fv_decode_C_FSW (MISA  misa,  Bit #(2)  xl,  Inst
 
       Bool is_legal = ((misa.c == 1'b1)
 		       && (op == opcode_C0)
-		       && (funct3 == funct3_C_FSW));
+		       && (funct3 == funct3_C_FSW)
+		       && (misa.f == 1'b1)
+		       && (xl == misa_mxl_32));    // RV32 only: on RV64 this encoding is C.LD/C.SD/C.LDSP/C.SDSP
 
       let instr = mkInstr_S_type (zeroExtend (offset), rs2, rs1, f3_FSW, op_STORE_FP);
       
@@ -564,7 +571,8 @@ function Tuple2 #(Bool, Instr) fv_decode_C_FSD (MISA  misa,  Bit #(2)  xl,  Inst
 
       Bool is_legal = ((misa.c == 1'b1)
 		       && (op == opcode_C0)
-		       && (funct3 == funct3_C_FSD));
+		       && (funct3 == funct3_C_FSD)
+		       && (misa.d == 1'b1));    // RV32 and RV64 (Sail: C.FLD* need D, any XLEN)
 
       let instr = mkInstr_S_type (zeroExtend (offset), rs2, rs1, f3_FSD, op_STORE_FP);
       

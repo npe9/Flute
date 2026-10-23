@@ -1022,7 +1022,8 @@ function ALU_Outputs fv_FP (ALU_Inputs inputs, Bit #(3) rm);
    alu_outputs.fval2     = inputs.frs2_val;
    alu_outputs.fval3     = inputs.frs3_val;
 
-   alu_outputs.rd_in_fpr = !fv_is_rd_in_GPR (funct7, rs2);
+   // R4 (FMADD/FMSUB/FNMSUB/FNMADD) funct7 is {rs3, fmt}: only op_FP can target a GPR
+   alu_outputs.rd_in_fpr = !((opcode == op_FP) && fv_is_rd_in_GPR (funct7, rs2));
 
 `ifdef INCLUDE_TANDEM_VERIF
    // Normal trace output (if no trap)
@@ -1238,8 +1239,11 @@ function ALU_Outputs fv_ALU (ALU_Inputs inputs);
 
    else if (   fp_insts_are_legal
 	    && rm_is_legal
+	    // the encoding's funct3, not the DYN-resolved rm: funct3 selects FSGNJ*/FMIN/FMAX/FEQ/FLT/FLE/
+	    // FCLASS/FMV, so e.g. FSGNJ.S with funct3 = 111 is reserved whatever frm holds
+	    // (was: rm, so frm = 0 made it FSGNJ.S; found by riscv-formal-fp legal_ch0)
 	    && fv_is_fp_instr_legal (inputs.decoded_instr.funct7,
-				     rm,
+				     inputs.decoded_instr.funct3,
 				     inputs.decoded_instr.rs2,
 				     inputs.decoded_instr.opcode))
       alu_outputs = fv_FP (inputs, rm);

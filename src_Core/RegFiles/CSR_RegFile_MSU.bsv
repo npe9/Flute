@@ -1127,7 +1127,17 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
       // (no mseccfg, so SSEED/USEED are effectively 0)
       Bool seed_fault = ((csr_addr == csr_addr_seed) && (read_not_write || (priv != m_Priv_Mode)));
 
-      return (exists && priv_ok && (! tvm_fault) && rw_ok && (! seed_fault));
+      // F/D: fflags / frm / fcsr are illegal while mstatus.FS == Off
+      // (Sail ext_is_CSR_defined (0x001..0x003) = haveFExt (); found by riscv-formal-fp fcsr_ch0)
+`ifdef ISA_F
+      Bool fs_fault = (   (   (csr_addr == csr_addr_fflags) || (csr_addr == csr_addr_frm)
+			   || (csr_addr == csr_addr_fcsr))
+		       && (fv_mstatus_fs (csr_mstatus.mv_read) == fs_xs_off));
+`else
+      Bool fs_fault = False;
+`endif
+
+      return (exists && priv_ok && (! tvm_fault) && rw_ok && (! seed_fault) && (! fs_fault));
    endfunction: fv_access_permitted
 
    // ================================================================

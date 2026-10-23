@@ -860,6 +860,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    Reg #(Bool)        rg_udtlb_ctx_seen <- mkReg (False);
    Reg #(Bool)        rg_udtlb_pmp_seen <- mkReg (False);
    Reg #(Bool)        rg_udtlb_tlb_seen <- mkReg (False);
+   Reg #(Bool)        rg_udtlb_bypass   <- mkReg (False);    // this req: use rg_pa (partial memory page)
 
    Bool udtlb_fresh = (   (rg_udtlb_ctx_seq == rg_udtlb_ctx_seen)
 		       && (rg_udtlb_pmp_seq == rg_udtlb_pmp_seen)
@@ -875,12 +876,12 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    endfunction
 
    Vector #(UDTLB_Size, Bool) udtlb_matches = map (fn_udtlb_match, readVReg (vrg_udtlb));
-   Bool udtlb_hit = (udtlb_fresh && any (id, udtlb_matches));
+   Bool udtlb_hit = ((udtlb_fresh && any (id, udtlb_matches)) || rg_udtlb_bypass);
 
    UDTLB_PPN udtlb_ppn = 0;
    for (Integer i = 0; i < valueOf (UDTLB_Size); i = i + 1)
       udtlb_ppn = udtlb_ppn | (udtlb_matches [i] ? vrg_udtlb [i].ppn : 0);
-   PA        udtlb_pa  = { udtlb_ppn, rg_addr [11:0] };
+   PA        udtlb_pa  = (rg_udtlb_bypass ? rg_pa : { udtlb_ppn, rg_addr [11:0] });
 
    // ----------------------------------------------------------------
    // Functions to drive read-responses (outputs)
@@ -1383,9 +1384,24 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	 Bool pa_hi_ok    = ((pa >> 32) == 0);    // the fabric is 32-bit
 	 Bool pmp_ok      = fv_pmp_ok (rg_pmp, page, rg_priv, pmp_acc);
 
+	 // An entry covers the whole 4 KiB page, so the page must be memory
+	 // end to end (the TestRIG map has RAM up to 0xFFFF_FFC0 and a vacant
+	 // top line inside the last page).  PMP is page-uniform (G = 10).
+	 PA   pa_pg_lo    = (pa & (~ 'hFFF));
+	 PA   pa_pg_hi    = (pa | 'hFFF);
+	 Bool is_mem_page = (   soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (pa_pg_lo))
+			     && soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (pa_pg_hi)));
+
 	 // ---- Memory page and this access passes: fill, then re-probe.
 	 // (The SC reservation check happens in the probe, as before.)
-	 if (pa_hi_ok && pmp_ok && (is_mem_addr || (! dmem_not_imem))) begin
+	 if (pa_hi_ok && pmp_ok && is_mem_addr && dmem_not_imem && (! is_mem_page)) begin
+	    // Memory, but the page is not memory end to end: no entry; this
+	    // request alone re-probes with rg_pa (cleared by the next req).
+	    rg_udtlb_bypass <= True;
+	    rg_state <= MODULE_RUNNING;
+	 end
+
+	 else if (pa_hi_ok && pmp_ok && (is_mem_page || (! dmem_not_imem))) begin
 	    // Per-kind verdicts for this page under the current context
 	    Bool pte_ld = True;
 	    Bool pte_st = True;
@@ -2369,6 +2385,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       rg_addr        <= addr;
       rg_st_amo_val  <= st_value;
       rg_kill_echo   <= False;    // RLD-4: this req supersedes any stale echo
+      rg_udtlb_bypass <= False;
 
       // uDTLB: entries are valid only for the context they were filled in
       if (   (priv != rg_priv) || (sstatus_SUM != rg_sstatus_SUM)

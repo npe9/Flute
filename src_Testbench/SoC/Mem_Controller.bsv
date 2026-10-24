@@ -3,39 +3,31 @@
 package Mem_Controller;
 
 // ================================================================
-// This module is a slave on the interconnect Fabric.
+// This module is a slave on the interconnect Fabric (FABRIC64 only).
 //
-// On the back side of the Mem_Controller is a ``raw'' memory
-// interface, a simple, wide, R/W interface,
-// which is connected to real memory in hardware (BRAM, DRAM, ...)
-// and to a model thereof in simulation.
+// On the back side is a streaming "raw" memory port (Sdram_Controller
+// on the ULX3S).  A raw request names one 64-byte line and a range of
+// its four 16-byte bursts; reads come back as 64-bit chunks in address
+// order, writes carry one 32-byte half of a line with byte enables and
+// are fire-and-forget.  The raw port executes requests in order.
 //
-// The raw mem interface data width is typically one or two cache lines.
-// Note: raw mem write requests are 'fire and forget'; there is no ack
-
-// ----------------
-// This slave IP can be attached to fabrics with 32b- or 64b-wide data channels.
-//    (NOTE: this is the width of the fabric, which can be chosen
-//      independently of the native width of a CPU master on the
-//      fabric (such as RV32/RV64 for a RISC-V CPU).
-// When attached to 32b-wide fabric, 64-bit locations must be
-// read/written in two 32b transaction, once for the lower 32b and
-// once for the upper 32b.
-
-// When fabric data is 64b wide, fabric addresses must be 8B-aligned
-//    - Reads always return 64b data
-//    - Write data should be 64b wide with an 8b byte-strobe indicating
-//        which bytes are to be written. Strobes should be for aligned
-//        1B, 2B, 4B or 8B chunks.
-
-// When fabric data is 32b wide, fabric addresses must be 4B-aligned
-//    - Reads always return 32b data
-//    - Write data should be 32b wide with a 4b byte-strobe indicating
-//        which bytes are to be written. Strobes should for aligned
-//        1B, 2B, or 4B chunks.
-
-// Some of the 'truncate()'s and 'zeroExtend()'s below are no-ops but
-// necessary to satisfy type-checking.
+// AXI4 bursts are accepted directly (no Deburster): INCR bursts of
+// 64-bit beats, single beats of any size.
+//
+// Reads stream: an AR becomes one raw read per line it touches, and
+// each 64-bit chunk goes out on R as it arrives (an L1 line refill is
+// one raw read; its first beat leaves after the first chunk).
+//
+// Writes are combined in a one-granule (32-byte) write buffer with a
+// per-byte dirty mask.  A write to another granule first writes the
+// buffer back (its dirty bytes only); a read whose range overlaps a
+// dirty byte also writes it back first, so the in-order raw port makes
+// every read see every earlier write.  The buffer is written back when
+// the controller has been idle for idle_wb_cycles (so the memory, and
+// the sim harness's tohost / signature taps on it, catch up).
+//
+// Write responses (B) are sent when the write enters the buffer.
+// Reads and writes are kept in one queue, in arrival order.
 // ================================================================
 
 export
@@ -45,6 +37,10 @@ Raw_Mem_Addr,
 
 Bits_per_Raw_Mem_Word,
 Raw_Mem_Word,
+
+Raw_Mem_Line,
+Raw_Mem_Req (..),
+Raw_Mem_Chunk,
 
 Mem_Controller_IFC (..),
 mkMem_Controller,
@@ -59,7 +55,6 @@ import  FIFOF        :: *;
 import  SpecialFIFOs :: *;
 import  GetPut       :: *;
 import  ClientServer :: *;
-import  Memory       :: *;
 import  ConfigReg    :: *;
 
 // ----------------
@@ -78,50 +73,32 @@ import SoC_Map     :: *;
 import AXI4_Types  :: *;
 
 // ================================================================
-// Raw mem data width:    256 (bits/ 32 x Byte/ 8 x Word32/ 4 x Word64)
-// Raw mem address width: 64  (arbitrarily chosen generously large)
+// Raw memory port
 
+typedef Bit #(19) Raw_Mem_Line;     // 64-byte line number (32 MB)
+
+typedef struct {
+   Bool          write;
+   Raw_Mem_Line  line;
+   Bit #(2)      b_first;   // read: 16-byte bursts b_first .. b_last of the line
+   Bit #(2)      b_last;
+   Bit #(256)    wdata;     // write: half b_first[1] of the line
+   Bit #(32)     wbe;
+   } Raw_Mem_Req
+deriving (Bits, FShow);
+
+typedef Bit #(64) Raw_Mem_Chunk;
+
+// The 256-bit word view (= one half line) is kept for the Sdram_Controller
+// unit test's adapter.
 typedef 256  Bits_per_Raw_Mem_Word;
 typedef Bit #(Bits_per_Raw_Mem_Word)  Raw_Mem_Word;
 
 typedef 64  Bits_per_Raw_Mem_Addr;
 typedef Bit #(Bits_per_Raw_Mem_Addr)  Raw_Mem_Addr;
 
-// ----------------
-// Views of raw mem word as bytes, word32s and word64s
-// Example values on the right based on 256b raw mem data width
-typedef TDiv #(Bits_per_Raw_Mem_Word,  8)              Bytes_per_Raw_Mem_Word;             // 32 bytes
-Integer bytes_per_raw_mem_word = valueOf (Bytes_per_Raw_Mem_Word);
-
-// # of addr lsbs to index a byte in a Raw_Mem_Word
-typedef TLog #(Bytes_per_Raw_Mem_Word)                 Bits_per_Byte_in_Raw_Mem_Word;      //  5
-Integer bits_per_byte_in_raw_mem_word = valueOf (Bits_per_Byte_in_Raw_Mem_Word);
-Integer hi_byte_in_raw_mem_word = bits_per_byte_in_raw_mem_word - 1;                       //  4
-
-typedef TDiv #(Bits_per_Raw_Mem_Word, 32)              Word32s_per_Raw_Mem_Word;           //  8 x 32b words
-Integer word32s_per_raw_mem_word = valueOf (Word32s_per_Raw_Mem_Word);
-// # of addr lsbs to index a Word32 in a Raw_Mem_Word seen as a vector of Word32s
-typedef TLog #(Word32s_per_Raw_Mem_Word)               Bits_per_Word32_in_Raw_Mem_Word;    //  3
-// Type of index of a Word32 in a Raw_Mem_Word seen as a vector of Word32s
-typedef Bit #(Bits_per_Word32_in_Raw_Mem_Word)         Word32_in_Raw_Mem_Word;
-
-typedef TDiv #(Bits_per_Raw_Mem_Word, 64)              Word64s_per_Raw_Mem_Word;           //  4 x 64b words
-Integer word64s_per_raw_mem_word = valueOf (Word64s_per_Raw_Mem_Word);
-// # of addr lsbs to index a Word64 in a Raw_Mem_Word seen as a vector of Word64s
-typedef TLog #(Word64s_per_Raw_Mem_Word)               Bits_per_Word64_in_Raw_Mem_Word;    //  2
-// Type of index of a Word64 in a Raw_Mem_Word seen as a vector of Word64s
-typedef Bit #(Bits_per_Word64_in_Raw_Mem_Word)         Word64_in_Raw_Mem_Word;
-
-typedef TDiv #(Bytes_per_Raw_Mem_Word, Bytes_per_Fabric_Data)  Fabric_Data_per_Raw_Mem_Word;
-
-// Index of bit that selects a fabric data word in an address
-`ifdef FABRIC32
-Integer  lo_fabric_data = 2;
-`endif
-
-`ifdef FABRIC64
-Integer  lo_fabric_data = 3;
-`endif
+// Idle cycles before the write buffer is written back
+Integer idle_wb_cycles = 32;
 
 // ================================================================
 
@@ -129,59 +106,9 @@ function Bool fn_addr_is_aligned (Fabric_Addr  addr, AXI4_Size  size);
    Bool is_aligned = (   (size == axsize_1)
 		      || ((size == axsize_2)    && (addr [0]   == 1'h0))
 		      || ((size == axsize_4)    && (addr [1:0] == 2'h0))
-		      || ((size == axsize_8)    && (addr [2:0] == 3'h0))
-		      || ((size == axsize_16)   && (addr [3:0] == 4'h0))
-		      || ((size == axsize_32)   && (addr [4:0] == 5'h0))
-		      || ((size == axsize_64)   && (addr [5:0] == 6'h0))
-		      || ((size == axsize_128)  && (addr [6:0] == 7'h0)));
+		      || ((size == axsize_8)    && (addr [2:0] == 3'h0)));
    return is_aligned;
 endfunction
-
-function Bool fn_addr_is_in_range (Fabric_Addr addr_base, Fabric_Addr addr, Fabric_Addr addr_lim);
-   // Note: 'in_range' is redundant if the fabric only delivers
-   // relevant addresses to this module so this is just a bit of
-   // defensive programming.
-
-   return ((addr_base <= addr) && (addr < addr_lim));
-endfunction
-
-function Bool fn_addr_is_ok (Fabric_Addr addr_base, Fabric_Addr addr, Fabric_Addr addr_lim, AXI4_Size  size);
-   return (   fn_addr_is_aligned (addr, size)
-	   && fn_addr_is_in_range (addr_base, addr, addr_lim));
-endfunction
-
-// Compute raw mem addr that holds a given fabric addr
-function Raw_Mem_Addr fn_addr_to_raw_mem_addr (Fabric_Addr addr);
-   Fabric_Addr a1 = addr >> log2 (bytes_per_raw_mem_word);
-   return extend (a1);
-endfunction
-
-// Compute # of raw mem words from base to lim fabric addrs
-function Raw_Mem_Addr fn_raw_mem_words_per_mem (Fabric_Addr base, Fabric_Addr lim);
-   return fn_addr_to_raw_mem_addr (lim - base);
-endfunction
-
-// Byte enables -> bit mask
-function Bit #(Bits_per_Raw_Mem_Word) fn_byteen_to_mask (Bit #(Bytes_per_Raw_Mem_Word) be);
-   Vector #(Bytes_per_Raw_Mem_Word, Bit #(8)) v = replicate (0);
-   for (Integer j = 0; j < valueOf (Bytes_per_Raw_Mem_Word); j = j + 1)
-      v [j] = signExtend (be [j]);
-   return pack (v);
-endfunction
-
-// ================================================================
-// Local constants and types
-
-// Module state
-typedef enum {STATE_POWER_ON_RESET,
-`ifdef INCLUDE_INITIAL_MEMZERO
-	      STATE_ZEROING_MEM,           // while zero-ing out memory
-`endif
-	      STATE_RESET_RELOAD_CACHE,    // on reset, start reload on reset
-	      STATE_RELOADING,             // while reloading the raw-mem word cache
-	      STATE_READY                  // while handling requests
-   } State
-deriving (Bits, Eq, FShow);
 
 // ================================================================
 // Catch-all status
@@ -202,7 +129,7 @@ interface Mem_Controller_IFC;
    interface AXI4_Slave_IFC #(Wd_Id, Wd_Addr, Wd_Data, Wd_User) slave;
 
    // To raw memory (outside the SoC)
-   interface MemoryClient #(Bits_per_Raw_Mem_Addr, Bits_per_Raw_Mem_Word)  to_raw_mem;
+   interface Client #(Raw_Mem_Req, Raw_Mem_Chunk)  to_raw_mem;
 
    // Catch-all status; return-value can identify the origin (0 = none)
    (* always_ready *)
@@ -215,38 +142,35 @@ interface Mem_Controller_IFC;
 endinterface
 
 // ================================================================
-// AXI4 has independent read and write channels and does not specify
-// which one should be prioritized if requests are available on both
-// channels.  We merge them into a single queue.
+// One queue for both channels.  A write burst becomes one Req per beat
+// (wr_last on the final one, which carries the B response).
 
 typedef enum { REQ_OP_RD, REQ_OP_WR } Req_Op
 deriving (Bits, Eq, FShow);
 
 typedef struct {Req_Op                     req_op;
-
-		// AW and AR channel info
 		Fabric_Id                  id;
 		Fabric_Addr                addr;
-		AXI4_Len                   len;
-		AXI4_Size                  size;
-		AXI4_Burst                 burst;
-		AXI4_Lock                  lock;
-		AXI4_Cache                 cache;
-		AXI4_Prot                  prot;
-		AXI4_QoS                   qos;
-		AXI4_Region                region;
+		AXI4_Len                   len;       // read: beats - 1
 		Bit #(Wd_User)             user;
-
-		// Write data info
 		Bit #(TDiv #(Wd_Data, 8))  wstrb;
 		Fabric_Data                data;
-
-		// E15: computed when the request is merged (registered in f_reqs),
-		// not from f_reqs.first in every rule guard (addr - base subtract and
-		// the range compares were a 22 ns critical path)
+		Bool                       wr_last;
+		// Computed when the request is merged (registered in f_reqs), not
+		// from f_reqs.first in rule guards (E15: 22 ns path)
 		Bool                       addr_ok;
-		Raw_Mem_Addr               raw_addr;
+		Bit #(25)                  off;       // byte offset from addr_base
    } Req
+deriving (Bits, FShow);
+
+// A raw read in flight: which of its chunks go out on R
+typedef struct {Fabric_Id       id;
+		Bit #(Wd_User)  user;
+		Bool            skip_first;  // the burst's first dword precedes the request
+		Bit #(4)        n_chunks;
+		Bit #(4)        n_beats;
+		Bool            is_final;    // last raw read of the AR: rlast on its last beat
+   } Rd_Pend
 deriving (Bits, FShow);
 
 // ================================================================
@@ -257,10 +181,9 @@ module mkMem_Controller (Mem_Controller_IFC);
    // verbosity 0: quiet
    // verbosity 1: reset, initialized
    // verbosity 2: reads, writes
-   // verbosity 3: more detail of local raw_mem interactions
    Reg #(Bit #(4)) cfg_verbosity <- mkConfigReg (0);
 
-   Reg #(State)       rg_state     <- mkReg (STATE_POWER_ON_RESET);
+   Reg #(Bool)        rg_ready     <- mkReg (False);
    // E15: ConfigRegs: the merge rules read these (set once by set_addr_map at init)
    Reg #(Fabric_Addr) rg_addr_base <- mkConfigRegU;
    Reg #(Fabric_Addr) rg_addr_lim  <- mkConfigRegU;
@@ -274,27 +197,39 @@ module mkMem_Controller (Mem_Controller_IFC);
    // Requests merged from the (WrA, WrD) and RdA channels
    FIFOF #(Req) f_reqs <- mkPipelineFIFOF;
 
-   // FIFOFs for requests/responses to raw memory
-   FIFOF #(MemoryRequest  #(Bits_per_Raw_Mem_Addr, Bits_per_Raw_Mem_Word))
-       f_raw_mem_reqs <- mkPipelineFIFOF;
-   FIFOF #(MemoryResponse #(Bits_per_Raw_Mem_Word))
-       f_raw_mem_rsps <- mkPipelineFIFOF;
+   // Write burst in progress (beats after the first)
+   Reg #(AXI4_Len)       rg_wr_left <- mkReg (0);
+   Reg #(Fabric_Addr)    rg_wr_addr <- mkRegU;
+   Reg #(Fabric_Id)      rg_wr_id   <- mkRegU;
+   Reg #(Bit #(Wd_User)) rg_wr_user <- mkRegU;
+   Reg #(Bool)           rg_wr_ok   <- mkRegU;
 
-   // We maintain a 1-raw_mem_word cache
-   // Per-byte dirty mask (instead of a clean bit): writeback sends only the
-   // dirty bytes, and Sdram_Controller skips bursts with none.
-   Reg #(Bit #(TDiv #(Bits_per_Raw_Mem_Word, 8))) rg_dirty_be <- mkReg (0);
-   // A write miss takes over the word without reading it (no read-allocate):
-   // only its dirty bytes are meaningful until a read reloads the word and
-   // merges the dirty bytes over the reloaded ones.
-   Reg #(Bool)          rg_cached_valid        <- mkReg (False);
-   Reg #(Raw_Mem_Addr)  rg_cached_raw_mem_addr <- mkRegU;
-   Reg #(Raw_Mem_Word)  rg_cached_raw_mem_word <- mkRegU;
+   // Raw memory
+   FIFOF #(Raw_Mem_Req)   f_raw_reqs <- mkPipelineFIFOF;
+   FIFOF #(Raw_Mem_Chunk) f_raw_rsps <- mkPipelineFIFOF;
+   FIFOF #(Rd_Pend)       f_rd_pend  <- mkSizedFIFOF (2);
+
+   // Read at the head of f_reqs, split at a line boundary: rest still to issue
+   Reg #(Bool)       rg_seg_on   <- mkReg (False);
+   Reg #(Bit #(25))  rg_seg_off  <- mkRegU;
+   Reg #(Bit #(9))   rg_seg_left <- mkRegU;     // beats
+
+   // Streaming R: chunk / forwarded-beat counters of f_rd_pend.first
+   Reg #(Bit #(4))   rg_ck  <- mkReg (0);
+   Reg #(Bit #(4))   rg_fwd <- mkReg (0);
+
+   // Bad-address read: beats answered so far
+   Reg #(AXI4_Len)   rg_err_beat <- mkReg (0);
+
+   // Write buffer: one 32-byte granule (offset >> 5), per-byte dirty mask
+   Reg #(Bit #(20))  rg_buf_gran  <- mkRegU;
+   Reg #(Bit #(256)) rg_buf_data  <- mkRegU;
+   Reg #(Bit #(32))  rg_buf_dirty <- mkReg (0);
+
+   Reg #(Bit #(6))   rg_idle <- mkReg (0);
 
 `ifdef WATCH_TOHOST
    // Ad hoc ISA-test simulation support: watch <tohost> and stop on non-zero write.
-   // The default tohost_addr here is fragile (may change on recompilation of tests).
-   // Proper value can be provided with 'set_watch_tohost' method from symbol table
    Reg #(Bool)        rg_watch_tohost <- mkReg (False);
    Reg #(Fabric_Addr) rg_tohost_addr  <- mkReg ('h_8000_1000);
 `endif
@@ -306,376 +241,296 @@ module mkMem_Controller (Mem_Controller_IFC);
    // BEHAVIOR
 
    // ----------------------------------------------------------------
-   // Reset
+   // Reset (boot only: raw reads still in flight are not drained)
 
    function Action fa_reset_actions;
       action
 	 slave_xactor.reset;
-	 f_raw_mem_reqs.clear;
-	 f_raw_mem_rsps.clear;
-	 rg_status <= 0;
+	 f_reqs.clear;
+	 f_raw_reqs.clear;
+	 f_raw_rsps.clear;
+	 f_rd_pend.clear;
+	 rg_wr_left   <= 0;
+	 rg_seg_on    <= False;
+	 rg_ck        <= 0;
+	 rg_fwd       <= 0;
+	 rg_err_beat  <= 0;
+	 rg_buf_dirty <= 0;
+	 rg_status    <= 0;
       endaction
    endfunction
 
-   rule rl_power_on_reset (rg_state == STATE_POWER_ON_RESET);
-      if (cfg_verbosity > 1)
-	 $display ("%0d: Mem_Controller.rl_power_on_reset", cur_cycle);
+   rule rl_power_on_reset (! rg_ready);
       fa_reset_actions ();
-      rg_state <= STATE_RESET_RELOAD_CACHE;
+      rg_ready <= True;
    endrule
 
-   rule rl_external_reset (rg_state == STATE_READY);
-      if (cfg_verbosity > 1)
-	 $display ("%0d: Mem_Controller.rl_external_reset => STATE_RESET_RELOAD_CACHE", cur_cycle);
-
+   rule rl_external_reset (rg_ready);
       f_reset_reqs.deq;
       fa_reset_actions ();
-      rg_state <= STATE_RESET_RELOAD_CACHE;
       f_reset_rsps.enq (?);
-   endrule
-
-   // On reset, we initialize the local cache with contents of raw_mem_addr 0
-   rule rl_reset_reload_cache (rg_state == STATE_RESET_RELOAD_CACHE);
-      let raw_mem_req = MemoryRequest {write:   False,
-				       byteen:  '1,
-				       address: 0,
-				       data:    ?};
-      f_raw_mem_reqs.enq (raw_mem_req);
-      rg_cached_raw_mem_addr <= 0;
-      rg_dirty_be <= 0;
-      rg_state <= STATE_RELOADING;
       if (cfg_verbosity > 1)
-	 $display ("%0d: Mem_Controller.rl_reset_reload_cache => STATE_RELOADING", cur_cycle);
+	 $display ("%0d: Mem_Controller.rl_external_reset", cur_cycle);
    endrule
 
    // ----------------------------------------------------------------
    // Merge requests into a single queue, prioritizing reads over writes
 
+   function Bool fn_in_range (Fabric_Addr a);
+      return ((rg_addr_base <= a) && (a < rg_addr_lim));
+   endfunction
+
    rule rl_merge_rd_req;
       let rda <- pop_o (slave_xactor.o_rd_addr);
-      let req = Req {req_op:     REQ_OP_RD,
-		     id:         rda.arid,
-		     addr:       rda.araddr,
-		     len:        rda.arlen,
-		     size:       rda.arsize,
-		     burst:      rda.arburst,
-		     lock:       rda.arlock,
-		     cache:      rda.arcache,
-		     prot:       rda.arprot,
-		     qos:        rda.arqos,
-		     region:     rda.arregion,
-		     user:       rda.aruser,
-		     wstrb:      ?,
-		     data:       ?,
-		     addr_ok:    fn_addr_is_ok (rg_addr_base, rda.araddr, rg_addr_lim, rda.arsize),
-		     raw_addr:   fn_addr_to_raw_mem_addr (rda.araddr - rg_addr_base)};
+      // A burst must be INCR of 64-bit beats; its last byte must be in range too
+      Fabric_Addr last = rda.araddr + ((zeroExtend (rda.arlen) << 3) | 7);
+      Bool ok = (   fn_addr_is_aligned (rda.araddr, rda.arsize)
+		 && fn_in_range (rda.araddr)
+		 && (   (rda.arlen == 0)
+		     || ((rda.arsize == axsize_8) && (rda.arburst == axburst_incr) && fn_in_range (last))));
+      let req = Req {req_op:   REQ_OP_RD,
+		     id:       rda.arid,
+		     addr:     rda.araddr,
+		     len:      rda.arlen,
+		     user:     rda.aruser,
+		     wstrb:    ?,
+		     data:     ?,
+		     wr_last:  ?,
+		     addr_ok:  ok,
+		     off:      truncate (rda.araddr - rg_addr_base)};
       f_reqs.enq (req);
 
-      if (cfg_verbosity > 2) begin
-	 $display ("%0d: Mem_Controller.rl_merge_rd_req", cur_cycle);
-	 $display ("        ", fshow (rda));
-      end
+      if (cfg_verbosity > 2)
+	 $display ("%0d: Mem_Controller.rl_merge_rd_req ", cur_cycle, fshow (rda));
    endrule
 
    (* descending_urgency = "rl_merge_rd_req, rl_merge_wr_req" *)
-   rule rl_merge_wr_req;
+   rule rl_merge_wr_req (rg_wr_left == 0);
       let wra <- pop_o (slave_xactor.o_wr_addr);
       let wrd <- pop_o (slave_xactor.o_wr_data);
-      let req = Req {req_op:     REQ_OP_WR,
-		     id:         wra.awid,
-		     addr:       wra.awaddr,
-		     len:        wra.awlen,
-		     size:       wra.awsize,
-		     burst:      wra.awburst,
-		     lock:       wra.awlock,
-		     cache:      wra.awcache,
-		     prot:       wra.awprot,
-		     qos:        wra.awqos,
-		     region:     wra.awregion,
-		     user:       wra.awuser,
-		     wstrb:      wrd.wstrb,
-		     data:       wrd.wdata,
-		     addr_ok:    fn_addr_is_ok (rg_addr_base, wra.awaddr, rg_addr_lim, wra.awsize),
-		     raw_addr:   fn_addr_to_raw_mem_addr (wra.awaddr - rg_addr_base)};
+      Fabric_Addr last = wra.awaddr + ((zeroExtend (wra.awlen) << 3) | 7);
+      Bool ok = (   fn_addr_is_aligned (wra.awaddr, wra.awsize)
+		 && fn_in_range (wra.awaddr)
+		 && (   (wra.awlen == 0)
+		     || ((wra.awsize == axsize_8) && (wra.awburst == axburst_incr) && fn_in_range (last))));
+      let req = Req {req_op:   REQ_OP_WR,
+		     id:       wra.awid,
+		     addr:     wra.awaddr,
+		     len:      0,
+		     user:     wra.awuser,
+		     wstrb:    wrd.wstrb,
+		     data:     wrd.wdata,
+		     wr_last:  (wra.awlen == 0),
+		     addr_ok:  ok,
+		     off:      truncate (wra.awaddr - rg_addr_base)};
       f_reqs.enq (req);
+      rg_wr_left <= wra.awlen;
+      rg_wr_addr <= wra.awaddr + 8;
+      rg_wr_id   <= wra.awid;
+      rg_wr_user <= wra.awuser;
+      rg_wr_ok   <= ok;
 
-      if (cfg_verbosity > 2) begin
-	 $display ("%0d: Mem_Controller.rl_merge_wr_req", cur_cycle);
-	 $display ("        ", fshow (wra));
-	 $display ("        ", fshow (wrd));
-      end
+      if (cfg_verbosity > 2)
+	 $display ("%0d: Mem_Controller.rl_merge_wr_req ", cur_cycle, fshow (wra), " ", fshow (wrd));
+   endrule
+
+   // Remaining beats of a write burst
+   (* descending_urgency = "rl_merge_rd_req, rl_merge_wr_beat" *)
+   rule rl_merge_wr_beat (rg_wr_left != 0);
+      let wrd <- pop_o (slave_xactor.o_wr_data);
+      let req = Req {req_op:   REQ_OP_WR,
+		     id:       rg_wr_id,
+		     addr:     rg_wr_addr,
+		     len:      0,
+		     user:     rg_wr_user,
+		     wstrb:    wrd.wstrb,
+		     data:     wrd.wdata,
+		     wr_last:  (rg_wr_left == 1),
+		     addr_ok:  rg_wr_ok,
+		     off:      truncate (rg_wr_addr - rg_addr_base)};
+      f_reqs.enq (req);
+      rg_wr_left <= rg_wr_left - 1;
+      rg_wr_addr <= rg_wr_addr + 8;
    endrule
 
    // ----------------------------------------------------------------
-   // Handle request from fabric
+   // Write buffer
 
-   let req_raw_mem_addr = f_reqs.first.raw_addr;    // E15: precomputed at merge
+   let head      = f_reqs.first;
+   Bit #(20) head_gran = truncate (head.off >> 5);
 
-   // ----------------
-   // This rule fires when there's no fabric req and the cached raw_mem_word is dirty;
-   // it writes back the dirty raw_mem_word; the cached raw_mem_word becomes clean
+   function Action fa_writeback;
+      action
+	 f_raw_reqs.enq (Raw_Mem_Req {write:   True,
+				      line:    truncate (rg_buf_gran >> 1),
+				      b_first: { rg_buf_gran [0], 1'b0 },
+				      b_last:  { rg_buf_gran [0], 1'b1 },
+				      wdata:   rg_buf_data,
+				      wbe:     rg_buf_dirty});
+	 rg_buf_dirty <= 0;
+	 if (cfg_verbosity > 2)
+	    $display ("%0d: Mem_Controller: writeback granule 0x%0h dirty %h",
+		      cur_cycle, rg_buf_gran, rg_buf_dirty);
+      endaction
+   endfunction
 
-   rule rl_writeback_dirty_idle (   (rg_state == STATE_READY)
-				 && (! f_reqs.notEmpty)           // Idle
-				 && (rg_dirty_be != 0));
-      let raw_mem_req = MemoryRequest {write:   True,
-				       byteen:  rg_dirty_be,
-				       address: rg_cached_raw_mem_addr,
-				       data:    rg_cached_raw_mem_word};
-      f_raw_mem_reqs.enq (raw_mem_req);
-      rg_dirty_be <= 0;
-      if (cfg_verbosity > 2)
-	 $display ("%0d: Mem_Controller.rl_writeback_dirty_idle to raw addr 0x%0h",
-		   cur_cycle, rg_cached_raw_mem_addr);
+   rule rl_idle_count;
+      if (f_reqs.notEmpty) rg_idle <= 0;
+      else if (rg_idle != '1) rg_idle <= rg_idle + 1;
    endrule
 
-   // ----------------
-   // This rule fires on a fabric req when the cached raw_mem_word has a
-   // different raw_mem_word-addr and is dirty;
-   // it writes back the dirty raw_mem_word; the cached raw_mem_word becomes clean
-
-   rule rl_writeback_dirty (   (rg_state == STATE_READY)
-			    && f_reqs.first.addr_ok
-			    && (rg_cached_raw_mem_addr != req_raw_mem_addr)
-			    && (rg_dirty_be != 0));
-      let raw_mem_req = MemoryRequest {write:   True,
-				       byteen:  rg_dirty_be,
-				       address: rg_cached_raw_mem_addr,
-				       data:    rg_cached_raw_mem_word};
-      f_raw_mem_reqs.enq (raw_mem_req);
-      rg_dirty_be <= 0;
-      if (cfg_verbosity > 2)
-	 $display ("%0d: Mem_Controller.rl_writeback_dirty to raw addr 0x%0h",
-		   cur_cycle, rg_cached_raw_mem_addr);
+   rule rl_writeback_idle (   rg_ready
+			   && (! f_reqs.notEmpty)
+			   && (rg_buf_dirty != 0)
+			   && (rg_idle >= fromInteger (idle_wb_cycles)));
+      fa_writeback;
    endrule
 
-   // ----------------
-   // This rule fires on a fabric req when the cached raw_mem_word has a
-   // different addr and is clean; we overwrite with the correct raw_mem_word
-   // by reloading from memory; the new cached raw_mem_word is clean.
+   // ----------------------------------------------------------------
+   // Writes: into the buffer (taken over without reading memory when
+   // nothing in it is dirty); another granule first writes it back.
 
-   // Reads only: a write miss is taken over without a reload (rl_process_wr_req).
-   // Also fires on a read of the cached word while only its dirty bytes are
-   // valid; the reload then keeps those bytes (rl_reload).
-   rule rl_miss_clean_req (   (rg_state == STATE_READY)
-			   && f_reqs.first.addr_ok
-			   && (f_reqs.first.req_op == REQ_OP_RD)
-			   && (  ((rg_cached_raw_mem_addr != req_raw_mem_addr) && (rg_dirty_be == 0))
-			      || ((rg_cached_raw_mem_addr == req_raw_mem_addr) && (! rg_cached_valid))));
-      let raw_mem_req = MemoryRequest {write:   False,
-				       byteen:  '1,
-				       address: req_raw_mem_addr,
-				       data:    ?};
-      f_raw_mem_reqs.enq (raw_mem_req);
-      rg_cached_raw_mem_addr <= req_raw_mem_addr;
-      rg_state <= STATE_RELOADING;
+   Bool wr_head    = rg_ready && f_reqs.notEmpty && (head.req_op == REQ_OP_WR) && head.addr_ok;
+   Bool buf_match  = (rg_buf_gran == head_gran);
 
-      if (cfg_verbosity > 2)
-	 $display ("%0d: Mem_Controller.rl_miss_clean_req: read raw addr 0x%0h",
-		   cur_cycle, req_raw_mem_addr);
+   rule rl_wr_evict (wr_head && (! buf_match) && (rg_buf_dirty != 0));
+      fa_writeback;
    endrule
 
-   rule rl_reload (rg_state == STATE_RELOADING);
-      let raw_mem_rsp <- pop (f_raw_mem_rsps);
-      // Bytes written since a no-read write miss took the word over stay
-      // (rg_dirty_be is 0 for an ordinary miss: the old word was written back)
-      Bit #(Bits_per_Raw_Mem_Word) dmask = fn_byteen_to_mask (rg_dirty_be);
-      Raw_Mem_Word raw_mem_word = (unpack (raw_mem_rsp.data) & (~ dmask)) | (rg_cached_raw_mem_word & dmask);
-      rg_cached_raw_mem_word <= raw_mem_word;
-      rg_state <= STATE_READY;
-      rg_cached_valid <= True;
-
-      if (cfg_verbosity > 2) begin
-	 $display ("%0d: Mem_Controller.rl_reload: raw addr 0x%0h", cur_cycle, rg_cached_raw_mem_addr);
-	 $display ("        ", fshow (raw_mem_word));
-      end
-   endrule
-
-   // ----------------
-   // This rule fires on a fabric read request when the cached raw_mem_word has the
-   // same addr ('hit'), whether clean or dirty.
-   // Returns the full Wd_Data-wide word containing the byte specified by the address.
-   // i.e., we do not extract relevant bytes here, leaving that to the requestor.
-
-   rule rl_process_rd_req  (   (rg_state == STATE_READY)
-			    && f_reqs.first.addr_ok
-			    && (rg_cached_raw_mem_addr == req_raw_mem_addr)
-			    && rg_cached_valid
-			    && (f_reqs.first.req_op == REQ_OP_RD));
-
-      // ----------------
-      // We need to select the fabric data word from the raw mem word that contains the target address.
-
-      // View the raw mem word as a vector of fabric data words (Wd_Data width words)
-      Vector #(Fabric_Data_per_Raw_Mem_Word, Bit #(Wd_Data)) raw_mem_word_V_fabric_data = unpack (rg_cached_raw_mem_word);
-
-      // Get the index into this vector of the fabric word containing the target address.
-      // For this index, use a generous size (here Bit #(16)), and let zeroExtend pad it automaticallly.
-      Fabric_Addr addr = f_reqs.first.addr;
-      Bit #(Bits_per_Byte_in_Raw_Mem_Word) n = addr [hi_byte_in_raw_mem_word : 0];
-      n = (n >> lo_fabric_data);
-
-      // Select the fabric data word of interest
-      Bit #(Wd_Data) rdata = raw_mem_word_V_fabric_data [n];
-
-      let rdr = AXI4_Rd_Data {rid:   f_reqs.first.id,
-			      rdata: rdata,
-			      rresp: axi4_resp_okay,
-			      rlast: True,
-			      ruser: f_reqs.first.user};
-      slave_xactor.i_rd_data.enq (rdr);
+   rule rl_wr (wr_head && (buf_match || (rg_buf_dirty == 0)));
+      Bit #(2) lane = head.off [4:3];
+      Vector #(4, Bit #(64)) v = unpack (rg_buf_data);
+      Bit #(64) mask = fn_strobe_to_mask (head.wstrb);
+      v [lane] = (v [lane] & (~ mask)) | (head.data & mask);
+      rg_buf_data <= pack (v);
+      Bit #(32) be = zeroExtend (head.wstrb);
+      rg_buf_dirty <= (buf_match ? rg_buf_dirty : 0) | (be << { lane, 3'b0 });
+      rg_buf_gran  <= head_gran;
       f_reqs.deq;
-
-      if (cfg_verbosity > 1) begin
-	 $display ("%0d: Mem_Controller.rl_process_rd_req: ", cur_cycle);
-	 $display ("        ", fshow (f_reqs.first));
-	 $display ("     => ", fshow (rdr));
-      end
-   endrule
-
-   // ----------------
-   // This rule fires on a fabric write request when the cached raw_mem_word has the
-   // same addr ('hit'), whether clean or dirty.
-
-   // Also a write miss once the old word is clean: the word is taken over
-   // without reading it (only the written bytes become valid, as dirty bytes).
-   rule rl_process_wr_req  (   (rg_state == STATE_READY)
-			    && f_reqs.first.addr_ok
-			    && ((rg_cached_raw_mem_addr == req_raw_mem_addr) || (rg_dirty_be == 0))
-			    && (f_reqs.first.req_op == REQ_OP_WR));
-      Bool miss = (rg_cached_raw_mem_addr != req_raw_mem_addr);
-      // Get the old (cached) value of the word64
-      Word64_in_Raw_Mem_Word word64_in_raw_mem_word = f_reqs.first.addr [hi_byte_in_raw_mem_word : 3];
-      Vector #(Word64s_per_Raw_Mem_Word, Bit #(64)) raw_mem_word_V_Word64 = unpack (rg_cached_raw_mem_word);
-      Bit #(64) word64_old = raw_mem_word_V_Word64 [word64_in_raw_mem_word];
-
-      // Lane-adjust the new word64
-      Bit #(64) word64_new = zeroExtend (f_reqs.first.data);
-      Bit #(8)  strobe     = zeroExtend (f_reqs.first.wstrb);
-      if ((valueOf (Wd_Data) == 32) && (f_reqs.first.addr [2] == 1'b1)) begin
-	 // Upper 32b only
-	 word64_new = { word64_new [31:0], 0 };
-	 strobe     = { strobe     [3:0],  0 };
-      end
-      Bit #(64) mask     = fn_strobe_to_mask (strobe);
-      let updated_word64 = ((word64_old & (~ mask)) | (word64_new & mask));
-
-      // Write it back into the cached raw_mem_word
-      raw_mem_word_V_Word64 [word64_in_raw_mem_word] = updated_word64;
-      rg_cached_raw_mem_word <= pack (raw_mem_word_V_Word64);
-      Bit #(TDiv #(Bits_per_Raw_Mem_Word, 8)) be_word = zeroExtend (strobe);
-      rg_dirty_be <= (miss ? 0 : rg_dirty_be) | (be_word << { word64_in_raw_mem_word, 3'b0 });
-      if (miss) begin
-	 rg_cached_raw_mem_addr <= req_raw_mem_addr;
-	 rg_cached_valid        <= False;
-      end
-
-      let wrr = AXI4_Wr_Resp {bid:   f_reqs.first.id,
-			      bresp: axi4_resp_okay,
-			      buser: f_reqs.first.user};
-      slave_xactor.i_wr_resp.enq (wrr);
-      f_reqs.deq;
-
-      if (cfg_verbosity > 1) begin
-	 $display ("%0d: Mem_Controller.rl_process_wr_req: ", cur_cycle);
-	 $display ("        ", fshow (f_reqs.first));
-	 $display ("     => ", fshow (wrr));
-      end
+      if (head.wr_last)
+	 slave_xactor.i_wr_resp.enq (AXI4_Wr_Resp {bid:   head.id,
+						   bresp: axi4_resp_okay,
+						   buser: head.user});
+      if (cfg_verbosity > 1)
+	 $display ("%0d: Mem_Controller.rl_wr: ", cur_cycle, fshow (head));
 
 `ifdef WATCH_TOHOST
       // For simulation testing of riscv-tests/isa only:
-      if ((rg_watch_tohost)
-	  && (f_reqs.first.addr == rg_tohost_addr)
-	  && (word64_new != 0))
-	 begin
-
-	    $display ("%0d: Mem_Controller.rl_process_wr_req: addr 0x%0h (<tohost>) data 0x%0h",
-		      cur_cycle, f_reqs.first.addr, word64_new);
-	    let exit_value = (word64_new >> 1);
-	    if (exit_value == 0)
-	       $display ("PASS");
-	    else
-	       $display ("FAIL %0d", exit_value);
-	    rg_status <= fromInteger (status_mem_controller_terminated);
-	 end
+      if (rg_watch_tohost && (head.addr == rg_tohost_addr) && (head.data != 0)) begin
+	 let exit_value = (head.data >> 1);
+	 if (exit_value == 0)
+	    $display ("PASS");
+	 else
+	    $display ("FAIL %0d", exit_value);
+	 rg_status <= fromInteger (status_mem_controller_terminated);
+      end
 `endif
    endrule
 
+   // ----------------------------------------------------------------
+   // Reads: one raw read per line touched; a dirty buffer byte in the
+   // range is written back first.
+
+   Bool rd_head = rg_ready && f_reqs.notEmpty && (head.req_op == REQ_OP_RD) && head.addr_ok;
+   Bit #(20) rd_gran_hi = truncate ((head.off + (zeroExtend (head.len) << 3)) >> 5);
+   Bool rd_overlap = (   (rg_buf_dirty != 0)
+		      && (head_gran <= rg_buf_gran) && (rg_buf_gran <= rd_gran_hi));
+
+   rule rl_rd_evict (rd_head && (! rg_seg_on) && rd_overlap);
+      fa_writeback;
+   endrule
+
+   rule rl_rd_issue (rd_head && (rg_seg_on || (! rd_overlap)));
+      Bit #(25) o    = rg_seg_on ? rg_seg_off  : head.off;
+      Bit #(9)  left = rg_seg_on ? rg_seg_left : (zeroExtend (head.len) + 1);
+      Bit #(3)  d0   = o [5:3];                       // first dword in the line
+      Bit #(4)  room = 8 - zeroExtend (d0);
+      Bit #(4)  n    = (left < zeroExtend (room)) ? truncate (left) : room;
+      Bit #(3)  d1   = truncate (zeroExtend (d0) + n - 1);
+      Bit #(2)  b0   = d0 [2:1];
+      Bit #(2)  b1   = d1 [2:1];
+      Bool      fin  = (zeroExtend (n) == left);
+      f_raw_reqs.enq (Raw_Mem_Req {write: False, line: truncate (o >> 6),
+				   b_first: b0, b_last: b1, wdata: ?, wbe: ?});
+      f_rd_pend.enq (Rd_Pend {id:         head.id,
+			      user:       head.user,
+			      skip_first: (d0 [0] == 1),
+			      n_chunks:   (zeroExtend (b1 - b0) + 1) << 1,
+			      n_beats:    n,
+			      is_final:   fin});
+      if (fin) begin
+	 f_reqs.deq;
+	 rg_seg_on <= False;
+      end
+      else begin
+	 rg_seg_on   <= True;
+	 rg_seg_off  <= o + (zeroExtend (n) << 3);
+	 rg_seg_left <= left - zeroExtend (n);
+      end
+      if (cfg_verbosity > 1)
+	 $display ("%0d: Mem_Controller.rl_rd_issue: off 0x%0h beats %0d (line 0x%0h bursts %0d..%0d)",
+		   cur_cycle, o, n, o >> 6, b0, b1);
+   endrule
+
+   // Raw chunks -> R beats (dwords outside the request are dropped)
+   (* descending_urgency = "rl_rd_stream, rl_invalid_rd_address" *)
+   rule rl_rd_stream;
+      let c = f_raw_rsps.first;
+      let p = f_rd_pend.first;
+      Bool fwd = (! (p.skip_first && (rg_ck == 0))) && (rg_fwd < p.n_beats);
+      if (fwd)
+	 slave_xactor.i_rd_data.enq (AXI4_Rd_Data {rid:   p.id,
+						   rdata: c,
+						   rresp: axi4_resp_okay,
+						   rlast: p.is_final && (rg_fwd + 1 == p.n_beats),
+						   ruser: p.user});
+      f_raw_rsps.deq;
+      if (rg_ck + 1 == p.n_chunks) begin
+	 f_rd_pend.deq;
+	 rg_ck  <= 0;
+	 rg_fwd <= 0;
+      end
+      else begin
+	 rg_ck <= rg_ck + 1;
+	 if (fwd) rg_fwd <= rg_fwd + 1;
+      end
+   endrule
+
    // ================================================================
-   // Zero-memory FSM: zero out memory.
-   // If needed, we must provide a way to enable it from the debug_module
-   // This rule should be enabled with:
-   //     rg_cached_raw_mem_addr <= 0;
-   //     rg_state               <= STATE_ZEROING_MEM;
+   // Invalid address: SLVERR (every read beat)
 
-`ifdef INCLUDE_INITIAL_MEMZERO
-   rule rl_zero_mem (rg_state == STATE_ZEROING_MEM);
-      let raw_mem_req = MemoryRequest {write:   True,
-				       byteen:  '1,
-				       address: rg_cached_raw_mem_addr,
-				       data:    0};
-      f_raw_mem_reqs.enq (raw_mem_req);
-
-      // Last write
-      let raw_mem_words_per_mem = fn_raw_mem_words_per_mem (rg_addr_base, rg_addr_lim);
-      if (rg_cached_raw_mem_addr == (raw_mem_words_per_mem - 1)) begin
-	 rg_cached_raw_mem_addr <= rg_cached_raw_mem_addr;
-	 rg_cached_raw_mem_word <= unpack (0);
-	 rg_dirty_be            <= 0;
-	 rg_cached_valid        <= True;
-	 rg_state <= STATE_READY;
-
-	 // if (cfg_verbosity != 0)
-	    $display ("%0d: Mem_Controller: zeroed %0d raw-memory locations (%0d-bit words)",
-		      cur_cycle, raw_mem_words_per_mem, valueOf (Bits_per_Raw_Mem_Word));
+   // Only once earlier reads have streamed out (R stays in order)
+   rule rl_invalid_rd_address (   rg_ready && f_reqs.notEmpty
+			       && (! head.addr_ok)
+			       && (head.req_op == REQ_OP_RD)
+			       && (! f_rd_pend.notEmpty));
+      Bool last = (rg_err_beat == head.len);
+      slave_xactor.i_rd_data.enq (AXI4_Rd_Data {rid:   head.id,
+						rdata: zeroExtend (head.addr),   // for debugging only
+						rresp: axi4_resp_slverr,
+						rlast: last,
+						ruser: head.user});
+      if (last) begin
+	 f_reqs.deq;
+	 rg_err_beat <= 0;
+	 $display ("%0d: ERROR: Mem_Controller: bad read ", cur_cycle, fshow (head));
+	 $display ("        rg_addr_base 0x%0h  rg_addr_lim 0x%0h", rg_addr_base, rg_addr_lim);
       end
       else
-	 rg_cached_raw_mem_addr <= rg_cached_raw_mem_addr + 1;
-   endrule
-`endif
-
-   // ================================================================
-   // Invalid address
-
-   rule rl_invalid_rd_address (   (rg_state == STATE_READY)
-			       && (! f_reqs.first.addr_ok)
-			       && (f_reqs.first.req_op == REQ_OP_RD));
-      Fabric_Data rdata = zeroExtend (f_reqs.first.addr);
-      let rdr = AXI4_Rd_Data {rid:   f_reqs.first.id,
-			      rdata: rdata,                 // for debugging only
-			      rresp: axi4_resp_slverr,
-			      rlast: True,
-			      ruser: f_reqs.first.user};
-      slave_xactor.i_rd_data.enq (rdr);
-      f_reqs.deq;
-
-      $write ("%0d: ERROR: Mem_Controller:", cur_cycle);
-      if (! fn_addr_is_aligned (f_reqs.first.addr, f_reqs.first.size))
-	 $display (" read-addr is misaligned");
-      else
-	 $display (" read-addr is out of bounds");
-      $display ("        rg_addr_base 0x%0h  rg_addr_lim 0x%0h", rg_addr_base, rg_addr_lim);
-      $display ("        ", fshow (f_reqs.first));
-      $display ("     => ", fshow (rdr));
+	 rg_err_beat <= rg_err_beat + 1;
    endrule
 
-   rule rl_invalid_wr_address (   (rg_state == STATE_READY)
-			       && (! f_reqs.first.addr_ok)
-			       && (f_reqs.first.req_op == REQ_OP_WR));
-      let wrr = AXI4_Wr_Resp {bid:   f_reqs.first.id,
-			      bresp: axi4_resp_slverr,
-			      buser: f_reqs.first.user};
-      slave_xactor.i_wr_resp.enq (wrr);
+   rule rl_invalid_wr_address (   rg_ready && f_reqs.notEmpty
+			       && (! head.addr_ok)
+			       && (head.req_op == REQ_OP_WR));
       f_reqs.deq;
-
-      $write ("%0d: ERROR: Mem_Controller:", cur_cycle);
-      if (! fn_addr_is_aligned (f_reqs.first.addr, f_reqs.first.size))
-	 $display (" write-addr is misaligned");
-      else
-	 $display (" write-addr is out of bounds");
-      $display ("        rg_addr_base 0x%0h  rg_addr_lim 0x%0h", rg_addr_base, rg_addr_lim);
-      $display ("        ", fshow (f_reqs.first));
-      $display ("     => ", fshow (wrr));
+      if (head.wr_last) begin
+	 slave_xactor.i_wr_resp.enq (AXI4_Wr_Resp {bid:   head.id,
+						   bresp: axi4_resp_slverr,
+						   buser: head.user});
+	 $display ("%0d: ERROR: Mem_Controller: bad write ", cur_cycle, fshow (head));
+	 $display ("        rg_addr_base 0x%0h  rg_addr_lim 0x%0h", rg_addr_base, rg_addr_lim);
+      end
    endrule
 
    // ================================================================
@@ -685,25 +540,18 @@ module mkMem_Controller (Mem_Controller_IFC);
    interface  server_reset = toGPServer (f_reset_reqs, f_reset_rsps);
 
    // set_addr_map should be called after this module's reset
-   method Action  set_addr_map (Fabric_Addr addr_base, Fabric_Addr addr_lim) if (rg_state == STATE_READY);
+   method Action  set_addr_map (Fabric_Addr addr_base, Fabric_Addr addr_lim) if (rg_ready);
       rg_addr_base <= addr_base;
       rg_addr_lim  <= addr_lim;
       $display ("%0d: Mem_Controller.set_addr_map: addr_base 0x%0h addr_lim 0x%0h",
 		cur_cycle, addr_base, addr_lim);
-
-`ifdef INCLUDE_INITIAL_MEMZERO
-      rg_cached_raw_mem_addr <= 0;
-      rg_state               <= STATE_ZEROING_MEM;
-      $display ("%0d: Mem_Controller.set_addr_map: zeroing memory from 0x%0h to 0x%0h",
-		cur_cycle, addr_base, addr_lim);
-`endif
    endmethod
 
    // Main Fabric Reqs/Rsps
    interface  slave = slave_xactor.axi_side;
 
    // To raw memory (outside the SoC)
-   interface  to_raw_mem = toGPClient (f_raw_mem_reqs, f_raw_mem_rsps);
+   interface  to_raw_mem = toGPClient (f_raw_reqs, f_raw_rsps);
 
    // Catch-all status; return-value can identify the origin (0 = none)
    method Bit #(8) status;

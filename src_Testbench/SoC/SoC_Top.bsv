@@ -89,7 +89,7 @@ interface SoC_Top_IFC;
 `endif
 
    // External real memory
-   interface MemoryClient #(Bits_per_Raw_Mem_Addr, Bits_per_Raw_Mem_Word)  to_raw_mem;
+   interface Client #(Raw_Mem_Req, Raw_Mem_Chunk)  to_raw_mem;
 
    // UART0 to external console
    interface Get #(Bit #(8)) get_to_console;
@@ -169,13 +169,8 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 			Wd_Data,
 			Wd_User)  boot_rom_axi4_deburster <- mkAXI4_Deburster_A;
 
-   // SoC Memory
+   // SoC Memory (takes AXI4 bursts directly: line refills stream)
    Mem_Controller_IFC  mem0_controller <- mkMem_Controller;
-   // AXI4 Deburster in front of SoC Memory
-   AXI4_Deburster_IFC #(Wd_Id,
-			Wd_Addr,
-			Wd_Data,
-			Wd_User)  mem0_controller_axi4_deburster <- mkAXI4_Deburster_A;
 
    // SoC IPs
    UART_IFC   uart0  <- mkUART;
@@ -216,9 +211,8 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
    mkConnection (fabric.v_to_slaves [boot_rom_slave_num], boot_rom_axi4_deburster.from_master);
    mkConnection (boot_rom_axi4_deburster.to_slave,        boot_rom.slave);
 
-   // Fabric to Deburster to Mem Controller
-   mkConnection (fabric.v_to_slaves [mem0_controller_slave_num], mem0_controller_axi4_deburster.from_master);
-   mkConnection (mem0_controller_axi4_deburster.to_slave,        mem0_controller.slave);
+   // Fabric to Mem Controller
+   mkConnection (fabric.v_to_slaves [mem0_controller_slave_num], mem0_controller.slave);
 
    // Fabric to UART0
    mkConnection (fabric.v_to_slaves [uart0_slave_num],  uart0.slave);

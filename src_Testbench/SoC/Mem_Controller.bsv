@@ -24,7 +24,9 @@ package Mem_Controller;
 // dirty byte also writes it back first, so the in-order raw port makes
 // every read see every earlier write.  The buffer is written back when
 // the controller has been idle for idle_wb_cycles (so the memory, and
-// the sim harness's tohost / signature taps on it, catch up).
+// the sim harness's tohost / signature taps on it, catch up), and at the
+// latest max_dirty_cycles after it became dirty: a granule written over
+// and over (a store spin loop) would otherwise never reach the memory.
 //
 // Write responses (B) are sent when the write enters the buffer.
 // Reads and writes are kept in one queue, in arrival order.
@@ -99,6 +101,8 @@ typedef Bit #(Bits_per_Raw_Mem_Addr)  Raw_Mem_Addr;
 
 // Idle cycles before the write buffer is written back
 Integer idle_wb_cycles = 32;
+// Cycles a buffer may stay dirty (rg_age saturates here) before it is written back
+Integer max_dirty_cycles = 255;
 
 // ================================================================
 
@@ -227,6 +231,7 @@ module mkMem_Controller (Mem_Controller_IFC);
    Reg #(Bit #(32))  rg_buf_dirty <- mkReg (0);
 
    Reg #(Bit #(6))   rg_idle <- mkReg (0);
+   Reg #(Bit #(8))   rg_age  <- mkConfigReg (0);   // cycles dirty (saturating); ConfigReg: no rule order vs rg_buf_dirty writers
 
 `ifdef WATCH_TOHOST
    // Ad hoc ISA-test simulation support: watch <tohost> and stop on non-zero write.
@@ -379,10 +384,17 @@ module mkMem_Controller (Mem_Controller_IFC);
       else if (rg_idle != '1) rg_idle <= rg_idle + 1;
    endrule
 
+   rule rl_age_count;
+      if (rg_buf_dirty == 0) rg_age <= 0;
+      else if (rg_age != '1) rg_age <= rg_age + 1;
+   endrule
+
+   Bool age_out = (rg_age >= fromInteger (max_dirty_cycles));
+
    rule rl_writeback_idle (   rg_ready
-			   && (! f_reqs.notEmpty)
 			   && (rg_buf_dirty != 0)
-			   && (rg_idle >= fromInteger (idle_wb_cycles)));
+			   && (   ((! f_reqs.notEmpty) && (rg_idle >= fromInteger (idle_wb_cycles)))
+			       || age_out));
       fa_writeback;
    endrule
 
@@ -397,7 +409,8 @@ module mkMem_Controller (Mem_Controller_IFC);
       fa_writeback;
    endrule
 
-   rule rl_wr (wr_head && (buf_match || (rg_buf_dirty == 0)));
+   // (an aged-out buffer is written back first, rl_writeback_idle)
+   rule rl_wr (wr_head && ((buf_match && (! age_out)) || (rg_buf_dirty == 0)));
       Bit #(2) lane = head.off [4:3];
       Vector #(4, Bit #(64)) v = unpack (rg_buf_data);
       Bit #(64) mask = fn_strobe_to_mask (head.wstrb);
@@ -440,6 +453,7 @@ module mkMem_Controller (Mem_Controller_IFC);
       fa_writeback;
    endrule
 
+   (* descending_urgency = "rl_writeback_idle, rl_wr_evict, rl_rd_evict, rl_rd_issue" *)
    rule rl_rd_issue (rd_head && (rg_seg_on || (! rd_overlap)));
       Bit #(25) o    = rg_seg_on ? rg_seg_off  : head.off;
       Bit #(9)  left = rg_seg_on ? rg_seg_left : (zeroExtend (head.len) + 1);

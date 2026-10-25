@@ -209,8 +209,9 @@ module mkMem_Controller (Mem_Controller_IFC);
    Reg #(Bool)           rg_wr_ok   <- mkRegU;
 
    // Raw memory
-   FIFOF #(Raw_Mem_Req)   f_raw_reqs <- mkPipelineFIFOF;
-   FIFOF #(Raw_Mem_Chunk) f_raw_rsps <- mkPipelineFIFOF;
+   // Bypass: the Sdram side is registered (its f_reqs / f_rsps), so these add no cycle
+   FIFOF #(Raw_Mem_Req)   f_raw_reqs <- mkBypassFIFOF;
+   FIFOF #(Raw_Mem_Chunk) f_raw_rsps <- mkBypassFIFOF;
    FIFOF #(Rd_Pend)       f_rd_pend  <- mkSizedFIFOF (2);
 
    // Read at the head of f_reqs, split at a line boundary: rest still to issue

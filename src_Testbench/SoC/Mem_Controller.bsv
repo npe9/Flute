@@ -100,9 +100,18 @@ typedef 64  Bits_per_Raw_Mem_Addr;
 typedef Bit #(Bits_per_Raw_Mem_Addr)  Raw_Mem_Addr;
 
 // Idle cycles before the write buffer is written back
+// (both overridable at compile time: the formal build shrinks them so BMC reaches them)
+`ifdef MC_IDLE_WB_CYCLES
+Integer idle_wb_cycles = `MC_IDLE_WB_CYCLES;
+`else
 Integer idle_wb_cycles = 32;
+`endif
 // Cycles a buffer may stay dirty (rg_age saturates here) before it is written back
+`ifdef MC_MAX_DIRTY_CYCLES
+Integer max_dirty_cycles = `MC_MAX_DIRTY_CYCLES;
+`else
 Integer max_dirty_cycles = 255;
+`endif
 
 // ================================================================
 
@@ -138,6 +147,12 @@ interface Mem_Controller_IFC;
    // Catch-all status; return-value can identify the origin (0 = none)
    (* always_ready *)
    method Bit #(8) status;
+
+`ifdef MC_FORMAL_PROBES
+   // Formal-only: the dirty buffer has aged out (age-out write-back is enabled this cycle)
+   (* always_ready *)
+   method Bool dbg_age_out;
+`endif
 
 `ifdef WATCH_TOHOST
    // For ISA tests: watch memory writes to <tohost> addr
@@ -572,6 +587,10 @@ module mkMem_Controller (Mem_Controller_IFC);
    method Bit #(8) status;
       return rg_status;
    endmethod
+
+`ifdef MC_FORMAL_PROBES
+   method Bool dbg_age_out = age_out;
+`endif
 
 `ifdef WATCH_TOHOST
    // For ISA tests: watch memory writes to <tohost> addr

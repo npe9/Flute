@@ -34,6 +34,11 @@ package ICache_Pipe;
 // queue is dropped and the request waits; anything else is a redirect
 // (queue + pipe dropped, stream restarts at the wanted cword).
 //
+// Early restart (m7): refill beats from the missed cword on are also
+// enqueued as they arrive (the stream's next cword, while the queue has
+// room); the first beat not forwarded is replayed from the BRAM after the
+// refill, as before.
+//
 // Refills and device reads are never abandoned (E5 root cause: an
 // abandoned burst filled the NEXT request): a redirect during one marks
 // it stale; it completes, and the stream then restarts at the new target.
@@ -268,6 +273,7 @@ module mkICache_Pipe (ICache_Pipe_IFC);
    Reg #(Way_in_CSet)    rg_victim     <- mkReg (0);
    Reg #(CWord_in_CLine) rg_beat       <- mkReg (0);
    Reg #(Bool)           rg_refill_err <- mkReg (False);
+   Reg #(Bool)           rg_fwd        <- mkReg (False);    // early restart: previous beat was forwarded
    Reg #(Bool)           rg_stale      <- mkReg (False);
 
    // Flush / reset loop
@@ -438,9 +444,21 @@ module mkICache_Pipe (ICache_Pipe_IFC);
          st_next = ST_RUN;
       end
 
+      Bool fwd_next = rg_fwd;
       if ((rg_st == ST_REFILL) && rd_rsp_avail) begin
          f_rd.deq;
          Bool err = rg_refill_err || (! rd_ok);
+         // Early restart: forward from the missed cword while contiguous (rg_pf is then the
+         // beat's cword: no issue runs during a refill, and a redirect makes it stale)
+         CWord_in_CLine miss_off = truncate (rg_miss_a);
+         Bool fwd = (! err) && (! drop) && (! qn [3].v) && ((rg_beat == miss_off) || rg_fwd);
+         fwd_next = fwd;
+         if (fwd) begin
+            if (rg_pf != { truncateLSB (rg_miss_a), rg_beat })
+               $display ("%0d: ASSERT FAIL ICache_Pipe: forwarded beat %0d is not the stream's next cword", cur_cycle, rg_beat);
+            m_enq   = tagged Valid (QEnt { v: True, a: rg_pf, exc: False, pf: False, d: zeroExtend (rd_rsp.rdata) });
+            pf_next = rg_pf + 1;
+         end
          CSet_in_Cache cset = fn_Addr_to_CSet_in_Cache (fn_cw_to_addr (rg_miss_a));
          CSet_CWord_in_Cache wa = { cset, rg_beat };
          if (rd_ok) begin
@@ -457,9 +475,10 @@ module mkICache_Pipe (ICache_Pipe_IFC);
                ram_state_and_ctag_cset.a.put (True, cset, t);
             end
             else if (! drop) begin
-               m_enq = tagged Valid (QEnt { v: True, a: rg_miss_a, exc: True, pf: False, d: 0 });
+               // the first cword not forwarded (rg_miss_a when nothing was)
+               m_enq = tagged Valid (QEnt { v: True, a: rg_pf, exc: True, pf: False, d: 0 });
                halt_exc_next = True;
-               pf_next = rg_miss_a + 1;
+               pf_next = rg_pf + 1;
             end
             st_next = ST_RUN;
          end
@@ -651,7 +670,9 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       rg_s2_data <= dv;
 
       // ---- Fabric requests
-      if ((rg_st == ST_REFILL_REQ) && rg_ddr4_ready && f_ar.notFull) begin
+      // (! kill): a redirect in this cycle cancels the refill above; sending the AR anyway would
+      // start an un-stale refill whose beats early restart would forward at the redirect target
+      if ((rg_st == ST_REFILL_REQ) && rg_ddr4_ready && f_ar.notFull && (! kill)) begin
          PA line = fn_align_Addr_to_CLine (fn_pa (rg_miss_ppn, rg_miss_a));
          let ar = AXI4_Rd_Addr { arid:     fabric_default_id,
                                  araddr:   fn_PA_to_Fabric_Addr (line),
@@ -667,11 +688,12 @@ module mkICache_Pipe (ICache_Pipe_IFC);
          f_ar.enq (ar);
          rg_beat       <= 0;
          rg_refill_err <= False;
+         fwd_next = False;
          st_next = ST_REFILL;
          pw_perf_miss.send;
       end
 
-      if ((rg_st == ST_IO_REQ) && rg_ddr4_ready && f_ar.notFull) begin
+      if ((rg_st == ST_IO_REQ) && rg_ddr4_ready && f_ar.notFull && (! kill)) begin    // as for refills
          let ar = AXI4_Rd_Addr { arid:     fabric_default_id,
                                  araddr:   fn_PA_to_Fabric_Addr (fn_pa (rg_io_ppn, rg_pf)),
                                  arlen:    0,
@@ -709,6 +731,7 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       end
 
       rg_pf       <= pf_next;
+      rg_fwd      <= fwd_next;
       rg_halt_io  <= halt_io_next;
       rg_halt_exc <= halt_exc_next;
       rg_halt_walk <= halt_walk_next;

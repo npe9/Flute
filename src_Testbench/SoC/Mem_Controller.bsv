@@ -203,6 +203,8 @@ module mkMem_Controller (Mem_Controller_IFC);
    Reg #(Bit #(4)) cfg_verbosity <- mkConfigReg (0);
 
    Reg #(Bool)        rg_ready     <- mkReg (False);
+   // External reset in progress: discarding raw chunks still owed by memory (rg_ready is False)
+   Reg #(Bool)        rg_draining  <- mkReg (False);
    // E15: ConfigRegs: the merge rules read these (set once by set_addr_map at init)
    Reg #(Fabric_Addr) rg_addr_base <- mkConfigRegU;
    Reg #(Fabric_Addr) rg_addr_lim  <- mkConfigRegU;
@@ -228,6 +230,11 @@ module mkMem_Controller (Mem_Controller_IFC);
    FIFOF #(Raw_Mem_Req)   f_raw_reqs <- mkBypassFIFOF;
    FIFOF #(Raw_Mem_Chunk) f_raw_rsps <- mkBypassFIFOF;
    FIFOF #(Rd_Pend)       f_rd_pend  <- mkSizedFIFOF (2);
+
+   // Raw chunks owed by memory: reads it has taken (to_raw_mem.request.get) minus chunks returned
+   Reg #(Bit #(5))  rg_owed     <- mkReg (0);
+   Wire #(Bit #(5)) w_owed_inc  <- mkDWire (0);
+   PulseWire        pw_owed_dec <- mkPulseWire;
 
    // Read at the head of f_reqs, split at a line boundary: rest still to issue
    Reg #(Bool)       rg_seg_on   <- mkReg (False);
@@ -262,14 +269,16 @@ module mkMem_Controller (Mem_Controller_IFC);
    // BEHAVIOR
 
    // ----------------------------------------------------------------
-   // Reset (boot only: raw reads still in flight are not drained)
+   // Reset. An external reset (SoC ndmreset) first drains the raw chunks memory still owes for
+   // reads it has taken (the Sdram_Controller is not reset with the SoC), so none of them is
+   // delivered as data of a later read. The write buffer is dropped.
 
    function Action fa_reset_actions;
       action
 	 slave_xactor.reset;
 	 f_reqs.clear;
 	 f_raw_reqs.clear;
-	 f_raw_rsps.clear;
+	 // f_raw_rsps is emptied by rl_drain (chunks may still be arriving)
 	 f_rd_pend.clear;
 	 rg_wr_left   <= 0;
 	 rg_seg_on    <= False;
@@ -281,17 +290,43 @@ module mkMem_Controller (Mem_Controller_IFC);
       endaction
    endfunction
 
-   rule rl_power_on_reset (! rg_ready);
-      fa_reset_actions ();
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_owed;
+      rg_owed <= rg_owed + w_owed_inc - (pw_owed_dec ? 1 : 0);
+   endrule
+
+   // Every register and FIFO already holds its reset value: clearing the slave transactor here
+   // would drop an AXI handshake taken in this cycle (READY is high).
+   rule rl_power_on_reset ((! rg_ready) && (! rg_draining));
       rg_ready <= True;
    endrule
 
+   // rg_ready and rg_draining are never both True
+   (* mutually_exclusive = "rl_external_reset, rl_drain_done" *)
    rule rl_external_reset (rg_ready);
       f_reset_reqs.deq;
       fa_reset_actions ();
-      f_reset_rsps.enq (?);
+      rg_ready    <= False;
+      rg_draining <= True;
       if (cfg_verbosity > 1)
 	 $display ("%0d: Mem_Controller.rl_external_reset", cur_cycle);
+   endrule
+
+   // Done when nothing is owed and nothing is queued (the last chunk's put lands in f_raw_rsps
+   // in the cycle it decrements rg_owed)
+   rule rl_drain_discard (rg_draining);
+      f_raw_rsps.deq;
+   endrule
+
+   rule rl_drain_done (rg_draining && (! f_raw_rsps.notEmpty) && (rg_owed == 0));
+      begin
+	 fa_reset_actions ();
+	 rg_draining <= False;
+	 rg_ready    <= True;
+	 f_reset_rsps.enq (?);
+	 if (cfg_verbosity > 1)
+	    $display ("%0d: Mem_Controller.rl_drain_done: reset complete", cur_cycle);
+      end
    endrule
 
    // ----------------------------------------------------------------
@@ -504,7 +539,7 @@ module mkMem_Controller (Mem_Controller_IFC);
 
    // Raw chunks -> R beats (dwords outside the request are dropped)
    (* descending_urgency = "rl_rd_stream, rl_invalid_rd_address" *)
-   rule rl_rd_stream;
+   rule rl_rd_stream (! rg_draining);
       let c = f_raw_rsps.first;
       let p = f_rd_pend.first;
       Bool fwd = (! (p.skip_first && (rg_ck == 0))) && (rg_fwd < p.n_beats);
@@ -581,7 +616,23 @@ module mkMem_Controller (Mem_Controller_IFC);
    interface  slave = slave_xactor.axi_side;
 
    // To raw memory (outside the SoC)
-   interface  to_raw_mem = toGPClient (f_raw_reqs, f_raw_rsps);
+   interface Client to_raw_mem;
+      interface Get request;
+	 method ActionValue #(Raw_Mem_Req) get;
+	    let r = f_raw_reqs.first;
+	    f_raw_reqs.deq;
+	    if (! r.write)
+	       w_owed_inc <= { 2'b0, (zeroExtend (r.b_last) - zeroExtend (r.b_first) + 3'd1) } << 1;
+	    return r;
+	 endmethod
+      endinterface
+      interface Put response;
+	 method Action put (Raw_Mem_Chunk c);
+	    f_raw_rsps.enq (c);
+	    pw_owed_dec.send;
+	 endmethod
+      endinterface
+   endinterface
 
    // Catch-all status; return-value can identify the origin (0 = none)
    method Bit #(8) status;

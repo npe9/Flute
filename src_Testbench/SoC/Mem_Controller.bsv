@@ -318,9 +318,13 @@ module mkMem_Controller (Mem_Controller_IFC);
       f_raw_rsps.deq;
    endrule
 
+   // No second fa_reset_actions here: the fabric is reset with this controller and may already
+   // have forwarded new requests (taken into f_reqs during the drain, served once rg_ready is
+   // set).  Dropping them would leave the fabric's in-order R/B routing entries without a
+   // response, and the next real response would go to the wrong master.  Nothing else changes
+   // during the drain (rl_rd_stream and the request rules wait for rg_ready / ! rg_draining).
    rule rl_drain_done (rg_draining && (! f_raw_rsps.notEmpty) && (rg_owed == 0));
       begin
-	 fa_reset_actions ();
 	 rg_draining <= False;
 	 rg_ready    <= True;
 	 f_reset_rsps.enq (?);

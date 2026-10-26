@@ -297,6 +297,9 @@ module mkMem_Controller (Mem_Controller_IFC);
    function Action fa_reset_actions;
       action
 	 slave_xactor.reset;
+	 // A request taken before an external (ndm) reset must not be answered after it: the
+	 // fabric's in-order R/B routing would hand the response to a later request.
+	 f_reqs.clear;
 	 f_raw_mem_reqs.clear;
 	 f_raw_mem_rsps.clear;
 	 rg_status <= 0;

@@ -203,6 +203,13 @@ module mkICache_Pipe (ICache_Pipe_IFC);
    Reg #(CSet_in_Cache)  rg_flush_set   <- mkReg (0);
    Reg #(Bool)           rg_flush_reset <- mkReg (False);
 
+   // Reset epoch, sent as ARID and bumped by every reset.  A reset abandons any refill or device
+   // read in flight (as MMU_Cache does): the SoC resets the fabric and the memory controller in
+   // the same cycle, so the beats may never come.  If they do (an AR still queued here, or one the
+   // fabric accepted after its reset), their old RID marks them and they are discarded.  Every
+   // slave on the I-side path echoes ARID; the fabric routes R in order.
+   Reg #(Bit #(2))       rg_epoch       <- mkReg (0);
+
    // ================================================================
    // Presentation (pure function of registers; shared by the response
    // methods and rl_main)
@@ -264,8 +271,10 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       Bool q_clear  = rg_want && (! pres.base_hit) && (rg_st != ST_FLUSH);    // pending or redirect
       Bool q_pop1   = rg_want && pres.pop1;
 
-      // ---- Flush / reset start (only from RUN: refills/device reads finish first)
-      Bool flush_start = run && (f_reset_reqs.notEmpty || f_flush_reqs.notEmpty);
+      // ---- Flush / reset start.  A flush (FENCE.I) waits for RUN: refills/device reads finish
+      // first.  A reset starts from any state but ST_FLUSH and abandons the fabric work in flight.
+      Bool reset_start = f_reset_reqs.notEmpty && (rg_st != ST_FLUSH);
+      Bool flush_start = reset_start || (run && f_flush_reqs.notEmpty);
 
       // ---- S2: hit test (current stream only)
       PA       s2_pa  = fn_WordXL_to_PA (fn_cw_to_addr (rg_s2_a));
@@ -305,8 +314,10 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       Bool    halt_exc_next = rg_halt_exc;
       IState  st_next = rg_st;
 
-      Bool rd_rsp_avail = f_rd.notEmpty;
       let  rd_rsp       = f_rd.first;
+      Bool rd_cur       = (rd_rsp.rid [1:0] == rg_epoch);
+      Bool rd_rsp_avail = f_rd.notEmpty && rd_cur;
+      if (f_rd.notEmpty && (! rd_cur)) f_rd.deq;    // beat of a request abandoned by a reset
       Bool rd_ok        = (rd_rsp.rresp == axi4_resp_okay);
 
       if ((rg_st == ST_IO_RSP) && rd_rsp_avail) begin
@@ -429,7 +440,7 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       // ---- Fabric requests
       if ((rg_st == ST_REFILL_REQ) && rg_ddr4_ready && f_ar.notFull) begin
          WordXL line = fn_align_Addr_to_CLine (fn_cw_to_addr (rg_miss_a));
-         let ar = AXI4_Rd_Addr { arid:     fabric_default_id,
+         let ar = AXI4_Rd_Addr { arid:     zeroExtend (rg_epoch),
                                  araddr:   fn_PA_to_Fabric_Addr (fn_WordXL_to_PA (line)),
                                  arlen:    fromInteger (cwords_per_cline - 1),
                                  arsize:   axsize_8,
@@ -448,7 +459,7 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       end
 
       if ((rg_st == ST_IO_REQ) && rg_ddr4_ready && f_ar.notFull) begin
-         let ar = AXI4_Rd_Addr { arid:     fabric_default_id,
+         let ar = AXI4_Rd_Addr { arid:     zeroExtend (rg_epoch),
                                  araddr:   fn_PA_to_Fabric_Addr (fn_WordXL_to_PA (fn_cw_to_addr (rg_pf))),
                                  arlen:    0,
                                  arsize:   axsize_8,
@@ -467,6 +478,7 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       if (flush_start) begin
          rg_flush_set   <= 0;
          rg_flush_reset <= f_reset_reqs.notEmpty;
+         if (reset_start) rg_epoch <= rg_epoch + 1;
          halt_io_next   = False;
          halt_exc_next  = False;
          st_next = ST_FLUSH;

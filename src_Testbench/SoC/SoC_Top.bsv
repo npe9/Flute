@@ -325,6 +325,7 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 	 // slaves without a reset handshake: drop their in-flight transactions with the fabric's
 	 boot_rom.reset;
 	 boot_rom_axi4_deburster.reset;
+	 mem0_controller_axi4_deburster.reset;
 `ifdef INCLUDE_ACCEL0
 	 accel0.reset;
 `endif

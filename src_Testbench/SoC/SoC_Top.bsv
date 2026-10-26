@@ -137,6 +137,8 @@ typedef enum {SOC_START,
 	      SOC_RESETTING,
 `ifdef INCLUDE_GDB_CONTROL
 	      SOC_RESETTING_NDM,
+	      SOC_NDM_SETTLE,
+	      SOC_RESETTING_NDM2,
 `endif
 	      SOC_IDLE} SoC_State
 deriving (Bits, Eq, FShow);
@@ -320,6 +322,13 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 	 mem0_controller.server_reset.request.put (?);
 	 uart0.server_reset.request.put (?);
 	 fabric.reset;
+	 // slaves without a reset handshake: drop their in-flight transactions with the fabric's
+	 boot_rom.reset;
+	 boot_rom_axi4_deburster.reset;
+`ifdef INCLUDE_ACCEL0
+	 accel0.reset;
+`endif
+	 soc_info.reset;
       endaction
    endfunction
 
@@ -387,18 +396,40 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 `ifdef INCLUDE_GDB_CONTROL
    Reg #(Bool) rg_running <- mkRegU;
 
+   // Two passes.  The masters (I$, D$, debug-module bus) reset a few cycles after the fabrics
+   // and slaves, so a reset with traffic in flight can leave behind a write address whose data
+   // was dropped (or data whose address was), or a response the fabric's in-order routing will
+   // hand to the wrong request.  The first pass brings the hart up halted, so once it completes
+   // no master issues anything; after a short settle the second pass resets everything again
+   // with nothing in flight and brings the hart up as requested.
+   Reg #(Bit #(4)) rg_ndm_settle <- mkReg (0);
+
    rule rl_ndm_reset_start (rg_state == SOC_IDLE);
       let running <- core.ndm_reset_client.request.get;
       rg_running <= running;
 
-      fa_reset_start_actions (running);
+      fa_reset_start_actions (False);
       rg_state <= SOC_RESETTING_NDM;
 
       $display ("%0d:%m.rl_ndm_reset_start (non-debug-module) running = ",
 		cur_cycle, fshow (running));
    endrule
 
-   rule rl_ndm_reset_complete (rg_state == SOC_RESETTING_NDM);
+   rule rl_ndm_reset_quiet (rg_state == SOC_RESETTING_NDM);
+      fa_reset_complete_actions;
+      rg_ndm_settle <= 0;
+      rg_state <= SOC_NDM_SETTLE;
+   endrule
+
+   rule rl_ndm_reset_settle (rg_state == SOC_NDM_SETTLE);
+      if (rg_ndm_settle == '1) begin
+	 fa_reset_start_actions (rg_running);
+	 rg_state <= SOC_RESETTING_NDM2;
+      end
+      rg_ndm_settle <= rg_ndm_settle + 1;
+   endrule
+
+   rule rl_ndm_reset_complete (rg_state == SOC_RESETTING_NDM2);
       fa_reset_complete_actions;
       rg_state <= SOC_IDLE;
 

@@ -1047,6 +1047,15 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // ----------------------------------------------------------------
    // Reset
 
+   // Reset epoch, sent as the low ARID/AWID bits and bumped with every reset of the master
+   // transactor.  A reset abandons the transactions in flight, but the SoC resets the fabric
+   // a few cycles before this cache, so responses can still arrive afterwards: requests issued
+   // in that gap (or still held by a slave the SoC does not reset).  The fabric routes R and B
+   // in order, so taking one of them as the answer to a new request would shift every later
+   // response.  mem_master drops R/B beats whose ID carries an older epoch.  Every slave on
+   // the D-side path echoes ARID/AWID.
+   Reg #(Bit #(2)) rg_epoch <- mkReg (0);
+
    rule rl_start_reset ((f_reset_reqs.notEmpty) && (rg_state != MODULE_RESETTING));
       rg_state             <= MODULE_RESETTING;
       rg_cset_in_cache     <= 0;
@@ -1064,6 +1073,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       if (f_reset_reqs.first == REQUESTOR_RESET_IFC) begin
 	 master_xactor.reset;
 	 ctr_wr_rsps_pending.clear;
+	 rg_epoch <= rg_epoch + 1;
       end
 
       $display ("%0d: %s: cache size %0d KB, associativity %0d, line size %0d bytes (= %0d XLEN words)",
@@ -2477,8 +2487,54 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 `endif
    endmethod
 
-   // Fabric master interface
-   interface mem_master = master_xactor.axi_side;
+   // Fabric master interface: master_xactor's, with the reset epoch in the IDs (see rg_epoch)
+   interface AXI4_Master_IFC mem_master;
+      let m = master_xactor.axi_side;
+      method Bool           m_awvalid  = m.m_awvalid;
+      method Bit #(Wd_Id)   m_awid     = zeroExtend (rg_epoch);
+      method Bit #(Wd_Addr) m_awaddr   = m.m_awaddr;
+      method Bit #(8)       m_awlen    = m.m_awlen;
+      method AXI4_Size      m_awsize   = m.m_awsize;
+      method Bit #(2)       m_awburst  = m.m_awburst;
+      method Bit #(1)       m_awlock   = m.m_awlock;
+      method Bit #(4)       m_awcache  = m.m_awcache;
+      method Bit #(3)       m_awprot   = m.m_awprot;
+      method Bit #(4)       m_awqos    = m.m_awqos;
+      method Bit #(4)       m_awregion = m.m_awregion;
+      method Bit #(Wd_User) m_awuser   = m.m_awuser;
+      method Action m_awready (Bool awready) = m.m_awready (awready);
+
+      method Bool                      m_wvalid = m.m_wvalid;
+      method Bit #(Wd_Data)            m_wdata  = m.m_wdata;
+      method Bit #(TDiv #(Wd_Data, 8)) m_wstrb  = m.m_wstrb;
+      method Bool                      m_wlast  = m.m_wlast;
+      method Bit #(Wd_User)            m_wuser  = m.m_wuser;
+      method Action m_wready (Bool wready) = m.m_wready (wready);
+
+      method Action m_bvalid (Bool bvalid, Bit #(Wd_Id) bid, Bit #(2) bresp, Bit #(Wd_User) buser);
+         m.m_bvalid (bvalid && (bid [1:0] == rg_epoch), bid, bresp, buser);    // stale B: dropped
+      endmethod
+      method Bool m_bready = m.m_bready;
+
+      method Bool           m_arvalid  = m.m_arvalid;
+      method Bit #(Wd_Id)   m_arid     = zeroExtend (rg_epoch);
+      method Bit #(Wd_Addr) m_araddr   = m.m_araddr;
+      method Bit #(8)       m_arlen    = m.m_arlen;
+      method AXI4_Size      m_arsize   = m.m_arsize;
+      method Bit #(2)       m_arburst  = m.m_arburst;
+      method Bit #(1)       m_arlock   = m.m_arlock;
+      method Bit #(4)       m_arcache  = m.m_arcache;
+      method Bit #(3)       m_arprot   = m.m_arprot;
+      method Bit #(4)       m_arqos    = m.m_arqos;
+      method Bit #(4)       m_arregion = m.m_arregion;
+      method Bit #(Wd_User) m_aruser   = m.m_aruser;
+      method Action m_arready (Bool arready) = m.m_arready (arready);
+
+      method Action m_rvalid (Bool rvalid, Bit #(Wd_Id) rid, Bit #(Wd_Data) rdata, Bit #(2) rresp, Bool rlast, Bit #(Wd_User) ruser);
+         m.m_rvalid (rvalid && (rid [1:0] == rg_epoch), rid, rdata, rresp, rlast, ruser);    // stale R: dropped
+      endmethod
+      method Bool m_rready = m.m_rready;
+   endinterface
 
    // ----------------------------------------------------------------
    // Misc. control and status

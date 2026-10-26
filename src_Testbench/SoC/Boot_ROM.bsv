@@ -48,6 +48,10 @@ interface Boot_ROM_IFC;
    // set_addr_map should be called after this module's reset
    method Action set_addr_map (Fabric_Addr addr_base, Fabric_Addr addr_lim);
 
+   // SoC soft reset (ndmreset): drop transactions in flight with the fabric that is reset with
+   // this slave (the fabric routes responses in order; a stale one would go to the wrong request)
+   method Action reset;
+
    // Main Fabric Reqs/Rsps
    interface AXI4_Slave_IFC #(Wd_Id, Wd_Addr, Wd_Data, Wd_User) slave;
 endinterface
@@ -197,6 +201,10 @@ module mkBoot_ROM (Boot_ROM_IFC);
    endmethod
 
    // Main Fabric Reqs/Rsps
+   method Action reset;
+      slave_xactor.reset;
+   endmethod
+
    interface  slave = slave_xactor.axi_side;
 endmodule
 

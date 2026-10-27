@@ -128,6 +128,15 @@ module mkNear_Mem_IO_AXI4 (Near_Mem_IO_AXI4_IFC);
    Reg #(Bit #(64)) crg_time [2]    <- mkCReg (2, 0);
    Reg #(Bit #(64)) crg_timecmp [2] <- mkCReg (2, '1);
 
+`ifdef SYS_CLK_HZ
+   // mtime advances at MTIME_HZ (the DTB timebase-frequency, 25 MHz) whatever
+   // the system clock: Bresenham accumulator, one tick per SYS_CLK_HZ worth
+   // of MTIME_HZ.  Without it a SYS_PLL build (32.14 MHz) ran Linux time
+   // 1.286x fast against the shared DTB.
+   Integer mtime_hz = 25_000_000;
+   Reg #(Bit #(32)) rg_mtime_acc <- mkReg (0);
+`endif
+
    Reg #(Bool) rg_mtip      <- mkReg (False);
    Reg #(Bool) rg_mtip_prev <- mkReg (False);
 
@@ -192,7 +201,17 @@ module mkNear_Mem_IO_AXI4 (Near_Mem_IO_AXI4_IFC);
 		       && (crg_time [0] != '1)
 		       && (! f_reset_reqs.notEmpty));
 
+`ifdef SYS_CLK_HZ
+      Bit #(32) acc = rg_mtime_acc + fromInteger (mtime_hz);
+      if (acc >= fromInteger (`SYS_CLK_HZ)) begin
+	 rg_mtime_acc <= acc - fromInteger (`SYS_CLK_HZ);
+	 crg_time [0] <= crg_time [0] + 1;
+      end
+      else
+	 rg_mtime_acc <= acc;
+`else
       crg_time [0] <= crg_time [0] + 1;
+`endif
    endrule
 
    // Compare and generate timer interrupt request

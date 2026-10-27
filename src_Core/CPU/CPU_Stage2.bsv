@@ -158,6 +158,23 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
    // pending.  See rl_launch_dmem_req for the orphan (kill) handling.
    FIFOF #(DReq_Sample) f_dreq_pending <- mkSizedFIFOF (2);
 
+   // M13: deferred functional-box launches (shifter, MBox, XBox, FBox), the
+   // RLD-4 pattern.  fa_enq of a box op enqueues a token; rl_launch_box_req
+   // calls the box's req the next cycle from the registered stage2 contents.
+   // A box req's enable gates the box's operand and datapath registers
+   // (~300 FFs in the FPU); called from fa_enq it depended on the stage2
+   // advance, i.e. on the dcache hit of the op ahead (m12p PLL critical
+   // path: dcache -> fbox.rg_x CE; with only the FBox deferred, m13p's
+   // moved to dcache -> xbox.rg_op).
+   // A FIFO, not a register: written by both enq and the rule, a register
+   // would make bsc gate the rule on enq again.  In the launch cycle the
+   // box's valid can still show the previous op's result (FBox, XBox):
+   // pw_box_launch holds the op BUSY for that cycle.  rl_pipe must not read
+   // f_box_pending (notEmpty-before-deq vs. rg_stage2-read-before-enq is a
+   // cycle, and bsc then blocks the launch rule whenever rl_pipe fires).
+   FIFOF #(Token) f_box_pending <- mkSizedFIFOF (2);
+   PulseWire      pw_box_launch <- mkPulseWire;
+
    Reg #(Bool)                  rg_resetting  <- mkReg (False);
    // E14: ConfigRegs so CPU.rl_front can read out.redirect (registers only)
    // in the same cycle rl_pipe rewrites them; hardware is unchanged.
@@ -264,6 +281,7 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
       rg_full <= False;
       rg_resetting <= True;
       f_dreq_pending.clear;
+      f_box_pending.clear;
 `ifdef ISA_F
       fbox.server_reset.request.put (?);
 `endif
@@ -504,7 +522,7 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
       // ----------------
       // Path: Serial shifter
       else if (rg_stage2.op_stage2 == OP_Stage2_SH) begin
-	 let ostatus = ((! shifter_box.valid) ? OSTATUS_BUSY : OSTATUS_PIPE);
+	 let ostatus = (((! shifter_box.valid) || pw_box_launch) ? OSTATUS_BUSY : OSTATUS_PIPE);
 
 	 let result = shifter_box.word;
 
@@ -542,7 +560,7 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
       // ----------------
       // Path: integer multiply/divide
       else if (rg_stage2.op_stage2 == OP_Stage2_M) begin
-	 let ostatus = ((! mbox.valid) ? OSTATUS_BUSY : OSTATUS_PIPE);
+	 let ostatus = (((! mbox.valid) || pw_box_launch) ? OSTATUS_BUSY : OSTATUS_PIPE);
 
 	 let result = mbox.word;
 
@@ -580,7 +598,7 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
       // ----------------
       // Path: bitmanip / scalar crypto (same contract as the MBox path)
       else if (rg_stage2.op_stage2 == OP_Stage2_X) begin
-	 let ostatus = ((! xbox.valid) ? OSTATUS_BUSY : OSTATUS_PIPE);
+	 let ostatus = (((! xbox.valid) || pw_box_launch) ? OSTATUS_BUSY : OSTATUS_PIPE);
 	 let result  = xbox.word;
 
 	 let data_to_stage3 = data_to_stage3_base;
@@ -612,7 +630,7 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
       // ----------------
       // Path: floating point op
       else if (rg_stage2.op_stage2 == OP_Stage2_FD) begin
-	 let ostatus = ((! fbox.valid) ? OSTATUS_BUSY : OSTATUS_PIPE);
+	 let ostatus = (((! fbox.valid) || pw_box_launch) ? OSTATUS_BUSY : OSTATUS_PIPE);
 
          // Extract fields from FBOX result
 	 match {.value, .fflags} = fbox.word;
@@ -698,6 +716,24 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
    // ----------------
    // Initiate DM, Shifter box, MBox or FBox op
 
+   // M13: ops whose execution unit is launched by rl_launch_box_req
+   function Bool fv_is_box_op (Op_Stage2 op);
+      Bool b = False;
+`ifdef SHIFT_SERIAL
+      if (op == OP_Stage2_SH) b = True;
+`endif
+`ifdef ISA_M
+      if (op == OP_Stage2_M)  b = True;
+`endif
+`ifdef ISA_XBOX
+      if (op == OP_Stage2_X)  b = True;
+`endif
+`ifdef ISA_F
+      if (op == OP_Stage2_FD) b = True;
+`endif
+      return b;
+   endfunction
+
    function Action fa_enq (Data_Stage1_to_Stage2 x);
       action
 	 rg_stage2  <= x;
@@ -747,47 +783,57 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 					  satp:        csr_regfile.read_satp});
 	 end
 
-`ifdef SHIFT_SERIAL
-	 // If Shifter box op, initiate it
-	 else if (x.op_stage2 == OP_Stage2_SH)
-	    shifter_box.req (unpack (funct3 [2]), x.val1, x.val2);
-`endif
-
-`ifdef ISA_M
-	 // If MBox op, initiate it
-	 else if (x.op_stage2 == OP_Stage2_M) begin
-            // Instr fields required for decode for F/D opcodes
-	    Bool is_OP_not_OP_32 = (x.instr [3] == 1'b0);
-            mbox.req (is_OP_not_OP_32, funct3, x.val1, x.val2);
-	 end
-`endif
-
-`ifdef ISA_XBOX
-	 else if (x.op_stage2 == OP_Stage2_X)
-	    xbox.req (x.instr, x.val1, x.val2);
-`endif
-
-`ifdef ISA_F
-	 // If FBox op, initiate it
-	 else if (x.op_stage2 == OP_Stage2_FD) begin
-	    // Instr fields required for decode for F/D opcodes
-            let opcode = instr_opcode (x.instr);
-	    let funct7 = instr_funct7 (x.instr);
-            let rs2    = instr_rs2    (x.instr);
-            Bit #(64) val1 = x.val1_frm_gpr ? extend (x.val1)
-                                            : extend (x.fval1);
-
-	    fbox.req (opcode,
-		      funct7,
-		      x.rounding_mode,   // rm
-		      rs2,
-		      val1,
-		      extend (x.fval2),
-		      extend (x.fval3));
-         end
-`endif
+	 // M13: shifter / MBox / XBox / FBox ops: rl_launch_box_req issues
+	 // the box req next cycle
+	 else if (fv_is_box_op (x.op_stage2))
+	    f_box_pending.enq (?);
       endaction
    endfunction
+
+   // M13: deferred box launch from the registered stage2 op.  A kill that
+   // emptied stage2 in between leaves a token for a dead op: launching it
+   // anyway is harmless (the result has no consumer, and the next box op's
+   // req restarts the box).  A non-box op in stage2 by then launches nothing.
+   rule rl_launch_box_req (f_box_pending.notEmpty);
+      f_box_pending.deq;
+      let x = rg_stage2;
+      let funct3 = instr_funct3 (x.instr);
+      if (fv_is_box_op (x.op_stage2)) pw_box_launch.send;
+
+      if (False) noAction;
+`ifdef SHIFT_SERIAL
+      else if (x.op_stage2 == OP_Stage2_SH)
+	 shifter_box.req (unpack (funct3 [2]), x.val1, x.val2);
+`endif
+`ifdef ISA_M
+      else if (x.op_stage2 == OP_Stage2_M) begin
+	 Bool is_OP_not_OP_32 = (x.instr [3] == 1'b0);
+	 mbox.req (is_OP_not_OP_32, funct3, x.val1, x.val2);
+      end
+`endif
+`ifdef ISA_XBOX
+      else if (x.op_stage2 == OP_Stage2_X)
+	 xbox.req (x.instr, x.val1, x.val2);
+`endif
+`ifdef ISA_F
+      else if (x.op_stage2 == OP_Stage2_FD) begin
+	 // Instr fields required for decode for F/D opcodes
+	 let opcode = instr_opcode (x.instr);
+	 let funct7 = instr_funct7 (x.instr);
+	 let rs2    = instr_rs2    (x.instr);
+	 Bit #(64) val1 = x.val1_frm_gpr ? extend (x.val1)
+					 : extend (x.fval1);
+
+	 fbox.req (opcode,
+		   funct7,
+		   x.rounding_mode,   // rm
+		   rs2,
+		   val1,
+		   extend (x.fval2),
+		   extend (x.fval3));
+      end
+`endif
+   endrule
 
    // ----------------------------------------------------------------
    // RLD-4: deferred dcache request launch.  Fires the cycle after a dmem

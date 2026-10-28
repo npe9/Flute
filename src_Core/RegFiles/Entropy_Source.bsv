@@ -53,6 +53,18 @@ interface RO_TRNG_IFC;
    (* always_ready *) method Bit #(1) raw_bit;
 endinterface
 
+`ifdef BSIM_TRNG
+// Bluesim cannot instantiate imported Verilog: the same 32-bit Galois LFSR RO_TRNG.v uses under
+// Verilator, in BSV (Makefile SIM_DEFINES sets BSIM_TRNG for the Bluesim testbenches).
+module mkRO_TRNG (RO_TRNG_IFC);
+   Reg #(Bit #(32)) lfsr <- mkReg (32'hACE1_2468);
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_shift;
+      lfsr <= {1'b0, lfsr [31:1]} ^ ((lfsr [0] == 1) ? 32'hA300_0001 : 32'h0);
+   endrule
+   method Bit #(1) raw_bit = lfsr [0];
+endmodule
+`else
 import "BVI" RO_TRNG =
 module mkRO_TRNG (RO_TRNG_IFC);
    default_clock clk (CLK);
@@ -60,6 +72,7 @@ module mkRO_TRNG (RO_TRNG_IFC);
    method BIT raw_bit;
    schedule (raw_bit) CF (raw_bit);
 endmodule
+`endif
 
 typedef 41  RCT_Cutoff;
 typedef 793 APT_Cutoff;

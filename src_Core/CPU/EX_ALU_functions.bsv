@@ -366,7 +366,9 @@ function ALU_Outputs fv_JALR (ALU_Inputs inputs);
    alu_outputs.control   = ((misaligned_target || funct3_is_not_zero)
 			    ? CONTROL_TRAP
 			    : CONTROL_BRANCH);
-   alu_outputs.exc_code  = exc_code_INSTR_ADDR_MISALIGNED;
+   // A reserved funct3 is an illegal instruction, not a misaligned target (Sail; found by the
+   // Sail-derived riscv-formal trap check: JALR funct3=001 trapped with mcause 0)
+   alu_outputs.exc_code  = (funct3_is_not_zero ? exc_code_ILLEGAL_INSTRUCTION : exc_code_INSTR_ADDR_MISALIGNED);
    alu_outputs.op_stage2 = OP_Stage2_ALU;
    alu_outputs.rd        = inputs.decoded_instr.rd;
    alu_outputs.addr      = next_pc;
@@ -434,14 +436,17 @@ function ALU_Outputs fv_OP_and_OP_IMM_shifts (ALU_Inputs inputs);
    end
 `endif
 
-   // Trap assertion:
-   //     instr [31] and [29:26] Must Be Zero;;
-   //     For RV32 with immediate shamt, [25] Must Be Zero (shamt <= 31)
-   Bool trap = (   (inputs.instr [31]    != 1'b0)
-		|| (inputs.instr [29:26] != 4'b0)
-		|| (   (rv_version == RV32)
-		    && (inputs.decoded_instr.opcode == op_OP_IMM)
-		    && (inputs.instr [25] != 1'b0)));
+   // Trap assertion (Sail: SHIFTIOP / RTYPE decode): funct7 (OP), imm[11:5] (RV32 OP_IMM) or
+   // imm[11:6] (RV64 OP_IMM) must be all zero, or 0100000 / 010000 for SRA/SRAI only.
+   // Stock Flute accepted bit 30 on SLL/SLLI and ignored bit 25 on OP shifts.
+   Bit #(7) f7    = inputs.instr [31:25];
+   Bool     is_sr = (funct3 == f3_SRxI);
+   Bool     f7_ok = ((f7 == 7'b0) || (is_sr && (f7 == 7'b0100000)));
+`ifdef RV64
+   if (inputs.decoded_instr.opcode == op_OP_IMM)
+      f7_ok = ((f7 [6:1] == 6'b0) || (is_sr && (f7 [6:1] == 6'b010000)));
+`endif
+   Bool trap = (! f7_ok);
 
    let alu_outputs       = alu_outputs_base;
    alu_outputs.control   = (trap ? CONTROL_TRAP : CONTROL_STRAIGHT);
@@ -497,10 +502,10 @@ function ALU_Outputs fv_OP_and_OP_IMM (ALU_Inputs inputs);
       rs2_val_local   = pack (s_rs2_val_local);
    end
    else begin
-      // For op_OP, check Must Be Zero bits in funct7
-      trap = (   (inputs.instr [31] != 1'b0)
-	      && ((funct3 != f3_ADDI) && (instr_b30 != 1'b0))
-	      && (inputs.instr [29:25] != 5'b0));
+      // For op_OP, funct7 must be 0000000, or 0100000 for SUB (Sail: RTYPE decode).  Stock
+      // Flute ANDed the three Must-Be-Zero tests, so e.g. funct7 0010000 executed as ADD.
+      Bit #(7) f7 = inputs.instr [31:25];
+      trap = (! ((f7 == 7'b0) || ((f7 == 7'b0100000) && (funct3 == f3_ADDI))));
    end
 
    WordXL rd_val = ?;
@@ -837,17 +842,13 @@ endfunction
 // No-ops, for now
 
 function ALU_Outputs fv_MISC_MEM (ALU_Inputs inputs);
-   Bool is_FENCE_I = (   (inputs.decoded_instr.funct3  == f3_FENCE_I)
-		      && (inputs.decoded_instr.rd      == 0)
-		      && (inputs.decoded_instr.rs1     == 0)
-		      && (inputs.decoded_instr.imm12_I == 0));
-
-   Bit #(4) fence_fm = fv_instr_to_fence_fm (inputs.instr);
-   Bool is_FENCE   = (   (inputs.decoded_instr.funct3  == f3_FENCE)
-		      && (inputs.decoded_instr.rd      == 0)
-		      && (inputs.decoded_instr.rs1     == 0)
-		      && (   (fence_fm == fence_fm_none)
-			  || (fence_fm == fence_fm_TSO)));
+   // The unused fields (FENCE: fm other than none/TSO, rs1, rd; FENCE.I: imm12, rs1, rd)
+   // are reserved and "base implementations shall ignore these fields" (RISC-V unpriv.
+   // spec, FENCE and Zifencei).  Sail decodes them as FENCE_RESERVED / FENCEI_RESERVED and
+   // retires them as plain fences; Flute used to raise illegal-instruction (found by the
+   // Sail-derived riscv-formal insn_fence / insn_fence_i checks).
+   Bool is_FENCE_I = (inputs.decoded_instr.funct3 == f3_FENCE_I);
+   Bool is_FENCE   = (inputs.decoded_instr.funct3 == f3_FENCE);
 
    let alu_outputs = alu_outputs_base;
    alu_outputs.control  = (  is_FENCE_I

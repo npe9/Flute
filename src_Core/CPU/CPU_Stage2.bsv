@@ -341,9 +341,35 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 	    data_to_stage3.rvfi_mem_rdata = fn_rvfi_lanes (funct3, rg_stage2.addr [1:0], result);
 `ifdef ISA_A
 	    if (rg_stage2.op_stage2 == OP_Stage2_AMO) begin
-	       // approximation: rs2 value, not the AMO result (no riscv-formal AMO checks)
-	       data_to_stage3.rvfi_mem_wmask = fn_rvfi_mask  (funct3, rg_stage2.addr [1:0]);
-	       data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (funct3, rg_stage2.addr [1:0], rg_stage2.val2);
+	       // RVFI per the Sail model (riscv_insts_aext.sail) and the RVFI spec:
+	       // LR reads only; SC writes rs2 iff it succeeds (dcache returns 0) and reads
+	       // nothing; other AMOs read and write the op(old, rs2) result.
+	       Bit #(5) f5 = rg_stage2.instr [31:27];
+	       if (f5 == f5_AMO_SC) begin
+		  data_to_stage3.rvfi_mem_rmask = 0;
+		  data_to_stage3.rvfi_mem_rdata = 0;
+		  if (result == 0) begin
+		     data_to_stage3.rvfi_mem_wmask = fn_rvfi_mask  (funct3, rg_stage2.addr [1:0]);
+		     data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (funct3, rg_stage2.addr [1:0], rg_stage2.val2);
+		  end
+	       end
+	       else if (f5 != f5_AMO_LR) begin
+		  WordXL old = result;
+		  WordXL v2  = rg_stage2.val2;
+		  WordXL amo = case (f5)
+				  f5_AMO_SWAP: v2;
+				  f5_AMO_ADD:  old + v2;
+				  f5_AMO_XOR:  old ^ v2;
+				  f5_AMO_AND:  old & v2;
+				  f5_AMO_OR:   old | v2;
+				  f5_AMO_MIN:  ((signedLT (old, v2)) ? old : v2);
+				  f5_AMO_MAX:  ((signedLT (old, v2)) ? v2 : old);
+				  f5_AMO_MINU: ((old < v2) ? old : v2);
+				  default:     ((old < v2) ? v2 : old);    // MAXU
+			       endcase;
+		  data_to_stage3.rvfi_mem_wmask = fn_rvfi_mask  (funct3, rg_stage2.addr [1:0]);
+		  data_to_stage3.rvfi_mem_wdata = fn_rvfi_lanes (funct3, rg_stage2.addr [1:0], amo);
+	       end
 	    end
 `endif
 `endif

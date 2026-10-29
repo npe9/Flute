@@ -2178,7 +2178,10 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       if (! fn_is_aligned (f3, addr)) begin
 	 // We detect misaligned accesses and trap on them
 	 rg_state    <= MODULE_EXCEPTION_RSP;
-	 rg_exc_code <= ((op == CACHE_LD) ? exc_code_LOAD_ADDR_MISALIGNED : exc_code_STORE_AMO_ADDR_MISALIGNED);
+	 // LR is a load: misaligned LR raises LOAD_ADDR_MISALIGNED (Sail, Spike), the same
+	 // load/store split the access- and page-fault codes already use (is_AMO_LR).
+	 Bool is_lr = ((op == CACHE_AMO) && (amo_funct7 [6:2] == f5_AMO_LR));
+	 rg_exc_code <= (((op == CACHE_LD) || is_lr) ? exc_code_LOAD_ADDR_MISALIGNED : exc_code_STORE_AMO_ADDR_MISALIGNED);
       end
       else begin
 	 rg_state <= MODULE_RUNNING;

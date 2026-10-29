@@ -100,6 +100,7 @@ typedef enum {CPU_RESET1,
 	      CPU_START_TRAP_HANDLER,
 	      CPU_CSRRW_2,
 	      CPU_CSRR_S_or_C_2,
+	      CPU_CSRRX_3,          // E21: CSR write + GPR write + retire, from registered values
 	      CPU_CSRRX_RESTART,    // Restart pipe after a CSRRX instruction
 	      CPU_FENCE_I,          // While waiting for FENCE.I to complete in Near_Mem
 	      CPU_FENCE,            // While waiting for FENCE to complete in Near_Mem
@@ -197,6 +198,11 @@ module mkCPU (CPU_IFC);
    // Save CSR info in CSRRx istrs to handle in separate rules
    Reg #(WordXL) rg_csr_pc   <- mkRegU;
    Reg #(WordXL) rg_csr_val1 <- mkRegU;
+   // E21: the _2 rules check permission and read the CSR; CPU_CSRRX_3 writes from these
+   Reg #(CSR_Addr) rg_csr_waddr  <- mkRegU;
+   Reg #(Bool)     rg_csr_wen    <- mkRegU;
+   Reg #(WordXL)   rg_csr_wval   <- mkRegU;
+   Reg #(WordXL)   rg_csr_rd_val <- mkRegU;
 
 `ifdef RVFI
    // ================================================================
@@ -230,6 +236,20 @@ module mkCPU (CPU_IFC);
    Reg #(WordXL) rg_rvfi_trap_rs1_val <- mkRegU;   // rs values of a trapping op (riscv-formal judges misaligned-address traps from rs1)
    Reg #(WordXL) rg_rvfi_trap_rs2_val <- mkRegU;
    Reg #(Instr_C)   rg_rvfi_trap_instr_C <- mkRegU;
+   // CSR side of a retirement; rg_rvfi_csr_kind is a DReg like rg_rvfi_valid, so every
+   // retirement that does not set it reports "no CSR access"
+   Reg #(Bit #(2))  rg_rvfi_csr_kind  <- mkDReg (0);
+   Reg #(Bit #(12)) rg_rvfi_csr_addr  <- mkRegU;
+   Reg #(Bool)      rg_rvfi_csr_rd    <- mkRegU;
+   Reg #(Bool)      rg_rvfi_csr_wen   <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_csr_rdata <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_csr_wdata <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_mstatus_r <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_mstatus_w <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_mepc      <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_mcause    <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_mtval     <- mkRegU;
+   Reg #(WordXL)    rg_rvfi_mtvec     <- mkRegU;
 
    // Which source registers an (expanded) instruction actually reads, so the
    // riscv-formal reg check does not compare immediate bits as rs fields.
@@ -1058,6 +1078,13 @@ module mkCPU (CPU_IFC);
 	    match { .t_rs1, .t_rs2 } = fn_rvfi_rs_addrs (instr);
 	    fa_rvfi (True, True, rg_rvfi_trap_is_i32, instr, rg_rvfi_trap_instr_C,
 		     t_rs1, t_rs2, rg_rvfi_trap_rs1_val, rg_rvfi_trap_rs2_val, 0, 0, epc, next_pc, 0, 0, 0, 0, 0);
+	    rg_rvfi_csr_kind  <= 2;
+	    rg_rvfi_mstatus_r <= csr_regfile.read_mstatus;
+	    rg_rvfi_mstatus_w <= new_mstatus;
+	    rg_rvfi_mepc      <= epc;
+	    rg_rvfi_mcause    <= mcause;
+	    rg_rvfi_mtval     <= tval;
+	    rg_rvfi_mtvec     <= fromMaybe (0, csr_regfile.read_csr_port2 (csr_addr_mtvec));
 	 end
 `endif
 
@@ -1148,8 +1175,8 @@ module mkCPU (CPU_IFC);
 
    // ----------------
 
-   // E13: Stage3 writeback (only fires with Stage3 full; this rule runs with it empty)
-   (* descending_urgency = "stage3_rl_writeback, rl_stage1_CSRR_W_2" *)
+   // E21: permission check and CSR read only; the CSR write (whose address decode fans out
+   // to every CSR's clock enable) runs in CPU_CSRRX_3 from registered address/value.
    rule rl_stage1_CSRR_W_2 (rg_state == CPU_CSRRW_2);
       if (cur_verbosity > 1) $display ("%0d: %m.rl_stage1_CSRR_W_2", mcycle);
 
@@ -1179,56 +1206,16 @@ module mkCPU (CPU_IFC);
 	 // Read the CSR only if Rd is not 0
 	 WordXL csr_val = ?;
 	 if (rd != 0) begin
-	    begin
-	       // Note: csr_regfile.read should become ActionValue if it acquires side effects
-	       let m_csr_val = csr_regfile.read_csr (csr_addr);
-	       csr_val   = fromMaybe (?, m_csr_val);
-	    end
+	    // Note: csr_regfile.read should become ActionValue if it acquires side effects
+	    let m_csr_val = csr_regfile.read_csr (csr_addr);
+	    csr_val   = fromMaybe (?, m_csr_val);
 	 end
 
-	 // Writeback to GPR file
-	 let new_rd_val = csr_val;
-	 gpr_regfile.write_rd (rd, new_rd_val);
-
-	 // Writeback to CSR file
-	 let csr_write_result <- csr_regfile.mav_csr_write (csr_addr, rs1_val);
-	 let new_csr_val       = csr_write_result.new_csr_value;
-	 let m_new_mstatus     = csr_write_result.m_new_csr_value2;
-
-	 // Accounting
-	 csr_regfile.csr_minstret_incr;
-
-	 // Restart the pipe
-	 rg_state   <= CPU_CSRRX_RESTART;
-`ifdef RVFI
-	 Bool rvfi_rs1_used = (funct3 [2] == 1'b0);    // register (not immediate) forms
-	 fa_rvfi (False, False, rg_rvfi_trap_is_i32, instr, rg_rvfi_trap_instr_C,
-		  (rvfi_rs1_used ? rs1 : 0), 0, (rvfi_rs1_used ? rg_csr_val1 : 0), 0,
-		  rd, new_rd_val,
-		  rg_csr_pc, rg_csr_pc + (rg_rvfi_trap_is_i32 ? 4 : 2), 0, 0, 0, 0, 0);
-`endif
-
-`ifdef INCLUDE_TANDEM_VERIF
-	 // Trace data
-	 let trace_data = mkTrace_CSRRX (rg_trap_trace_data.pc,
-					 rg_trap_trace_data.instr_sz,
-					 rg_trap_trace_data.instr,
-					 rd,
-					 new_rd_val,
-					 True,    // updated-CSR info is valid
-					 csr_addr,
-					 new_csr_val,
-					 isValid (m_new_mstatus),
-					 fromMaybe (?, m_new_mstatus));
-	 f_trace_data.enq (trace_data);
-`endif
-
-	 // Debug
-	 fa_emit_instr_trace (minstret, rg_csr_pc, instr, rg_cur_priv);
-	 if (cur_verbosity > 1) begin
-	    $display ("    S1: write CSRRW/CSRRWI Rs1 %0d Rs1_val 0x%0h csr 0x%0h csr_val 0x%0h Rd %0d",
-		      rs1, rs1_val, csr_addr, csr_val, rd);
-	 end
+	 rg_csr_waddr  <= csr_addr;
+	 rg_csr_wen    <= True;
+	 rg_csr_wval   <= rs1_val;
+	 rg_csr_rd_val <= csr_val;
+	 rg_state      <= CPU_CSRRX_3;
       end
    endrule: rl_stage1_CSRR_W_2
 
@@ -1277,8 +1264,7 @@ module mkCPU (CPU_IFC);
 
    // ----------------
 
-   // E13: Stage3 writeback (only fires with Stage3 full; this rule runs with it empty)
-   (* descending_urgency = "stage3_rl_writeback, rl_stage1_CSRR_S_or_C_2" *)
+   // E21: permission check, CSR read and the set/clear value; the write runs in CPU_CSRRX_3.
    rule rl_stage1_CSRR_S_or_C_2 (rg_state == CPU_CSRR_S_or_C_2);
       if (cur_verbosity > 1) $display ("%0d: %m.rl_stage1_CSRR_S_or_C_2", mcycle);
 
@@ -1292,7 +1278,9 @@ module mkCPU (CPU_IFC);
 		      ? rg_csr_val1                      // CSRRS,  CSRRC
 		      : extend (rs1));                   // CSRRSI, CSRRCI
 
-      Bool read_not_write = (rs1_val == 0);    // CSRR_S_or_C only reads, does not write CSR, if rs1_val == 0
+      // Spec / Sail: CSRRS/C write the CSR iff the rs1 FIELD is not x0 (CSRRSI/CI: uimm != 0), whatever
+      // the register holds; a write attempt to a read-only CSR is illegal (found by riscv-formal csrw_mcycle)
+      Bool read_not_write = (rs1 == 0);
       Bool permitted = csr_regfile.access_permitted_2 (rg_cur_priv, csr_addr, read_not_write);
 
       if (! permitted) begin
@@ -1306,66 +1294,90 @@ module mkCPU (CPU_IFC);
       end
       else begin
 	 // Read the CSR
-	 WordXL csr_val = ?;
-	 begin
-	    // Note: csr_regfile.read should become ActionValue if it acquires side effects
-	    let m_csr_val  = csr_regfile.read_csr (csr_addr);
-	    csr_val = fromMaybe (?, m_csr_val);
-	 end
+	 // Note: csr_regfile.read should become ActionValue if it acquires side effects
+	 let m_csr_val  = csr_regfile.read_csr (csr_addr);
+	 WordXL csr_val = fromMaybe (?, m_csr_val);
 
-	 // Writeback to GPR file
-	 let new_rd_val = csr_val;
-	 gpr_regfile.write_rd (rd, new_rd_val);
+	 // Write the CSR (next cycle), but only if rs1 != 0
+	 let x = (  ((funct3 == f3_CSRRS) || (funct3 == f3_CSRRSI))
+		  ? (csr_val | rs1_val)                // CSRRS, CSRRSI
+		  : csr_val & (~ rs1_val));            // CSRRC, CSRRCI
 
-	 // Writeback to CSR file, but only if rs1 != 0
-	 WordXL          new_csr_val = ?;
-	 Maybe #(WordXL) m_new_mstatus = tagged Invalid;
-	 if (rs1 != 0) begin
-	    let x = (  ((funct3 == f3_CSRRS) || (funct3 == f3_CSRRSI))
-		     ? (csr_val | rs1_val)                // CSRRS, CSRRSI
-		     : csr_val & (~ rs1_val));            // CSRRC, CSRRCI
+	 rg_csr_waddr  <= csr_addr;
+	 rg_csr_wen    <= (rs1 != 0);
+	 rg_csr_wval   <= x;
+	 rg_csr_rd_val <= csr_val;
+	 rg_state      <= CPU_CSRRX_3;
+      end
+   endrule: rl_stage1_CSRR_S_or_C_2
 
-	    let csr_write_result <- csr_regfile.mav_csr_write (csr_addr, x);
-	    new_csr_val           = csr_write_result.new_csr_value;
-	    m_new_mstatus         = csr_write_result.m_new_csr_value2;
-	 end
+   // ----------------
+   // E21: second half of every CSRRx: GPR write, CSR write, retire.
 
-	 // Accounting
-	 csr_regfile.csr_minstret_incr;
+   // E13: Stage3 writeback (only fires with Stage3 full; this rule runs with it empty)
+   (* descending_urgency = "stage3_rl_writeback, rl_stage1_CSRRX_3" *)
+   rule rl_stage1_CSRRX_3 (rg_state == CPU_CSRRX_3);
+      if (cur_verbosity > 1) $display ("%0d: %m.rl_stage1_CSRRX_3", mcycle);
 
-	 // Restart the pipe
-	 rg_state   <= CPU_CSRRX_RESTART;
+      let instr      = rg_trap_instr;
+      let rs1        = instr_rs1    (instr);
+      let funct3     = instr_funct3 (instr);
+      let rd         = instr_rd     (instr);
+      let new_rd_val = rg_csr_rd_val;
+
+      // Writeback to GPR file
+      gpr_regfile.write_rd (rd, new_rd_val);
+
+      // Writeback to CSR file
+      WordXL          new_csr_val   = ?;
+      Maybe #(WordXL) m_new_mstatus = tagged Invalid;
+      if (rg_csr_wen) begin
+	 let csr_write_result <- csr_regfile.mav_csr_write (rg_csr_waddr, rg_csr_wval);
+	 new_csr_val           = csr_write_result.new_csr_value;
+	 m_new_mstatus         = csr_write_result.m_new_csr_value2;
+      end
+
+      // Accounting
+      csr_regfile.csr_minstret_incr;
+
+      // Restart the pipe
+      rg_state   <= CPU_CSRRX_RESTART;
 `ifdef RVFI
-	 Bool rvfi_rs1_used = (funct3 [2] == 1'b0);    // register (not immediate) forms
-	 fa_rvfi (False, False, rg_rvfi_trap_is_i32, instr, rg_rvfi_trap_instr_C,
-		  (rvfi_rs1_used ? rs1 : 0), 0, (rvfi_rs1_used ? rg_csr_val1 : 0), 0,
-		  rd, new_rd_val,
-		  rg_csr_pc, rg_csr_pc + (rg_rvfi_trap_is_i32 ? 4 : 2), 0, 0, 0, 0, 0);
+      Bool rvfi_rs1_used = (funct3 [2] == 1'b0);    // register (not immediate) forms
+      fa_rvfi (False, False, rg_rvfi_trap_is_i32, instr, rg_rvfi_trap_instr_C,
+	       (rvfi_rs1_used ? rs1 : 0), 0, (rvfi_rs1_used ? rg_csr_val1 : 0), 0,
+	       rd, new_rd_val,
+	       rg_csr_pc, rg_csr_pc + (rg_rvfi_trap_is_i32 ? 4 : 2), 0, 0, 0, 0, 0);
+      rg_rvfi_csr_kind  <= 1;
+      rg_rvfi_csr_addr  <= rg_csr_waddr;
+      rg_rvfi_csr_rd    <= ! ((funct3 [1:0] == 2'b01) && (rd == 0));    // CSRRW/CSRRWI with rd = x0 does not read
+      rg_rvfi_csr_wen   <= rg_csr_wen;
+      rg_rvfi_csr_rdata <= rg_csr_rd_val;
+      rg_rvfi_csr_wdata <= rg_csr_wval;
 `endif
 
 `ifdef INCLUDE_TANDEM_VERIF
-	 // Trace data
-	 let trace_data = mkTrace_CSRRX (rg_trap_trace_data.pc,
-					 rg_trap_trace_data.instr_sz,
-					 rg_trap_trace_data.instr,
-					 rd,
-					 new_rd_val,
-					 (rs1 != 0),    // whether we've written csr or not
-					 csr_addr,
-					 new_csr_val,
-					 isValid (m_new_mstatus),
-					 fromMaybe (?, m_new_mstatus));
-	 f_trace_data.enq (trace_data);
+      // Trace data
+      let trace_data = mkTrace_CSRRX (rg_trap_trace_data.pc,
+				      rg_trap_trace_data.instr_sz,
+				      rg_trap_trace_data.instr,
+				      rd,
+				      new_rd_val,
+				      rg_csr_wen,    // whether we've written csr or not
+				      rg_csr_waddr,
+				      new_csr_val,
+				      isValid (m_new_mstatus),
+				      fromMaybe (?, m_new_mstatus));
+      f_trace_data.enq (trace_data);
 `endif
 
-	 // Debug
-	 fa_emit_instr_trace (minstret, rg_csr_pc, instr, rg_cur_priv);
-	 if (cur_verbosity > 1) begin
-	    $display ("    S1: write CSRR_S_or_C: Rs1 %0d Rs1_val 0x%0h csr 0x%0h csr_val 0x%0h Rd %0d",
-		      rs1, rs1_val, csr_addr, csr_val, rd);
-	 end
+      // Debug
+      fa_emit_instr_trace (minstret, rg_csr_pc, instr, rg_cur_priv);
+      if (cur_verbosity > 1) begin
+	 $display ("    S1: CSRRX_3: csr 0x%0h wen %0d wval 0x%0h Rd %0d rd_val 0x%0h",
+		   rg_csr_waddr, rg_csr_wen, rg_csr_wval, rd, new_rd_val);
       end
-   endrule: rl_stage1_CSRR_S_or_C_2
+   endrule: rl_stage1_CSRRX_3
 
    // ================================================================
    // Restart the pipe after a CSRRX stall
@@ -1421,6 +1433,12 @@ module mkCPU (CPU_IFC);
       let rvfi_d2 = stage1.out.data_to_stage2;
       fa_rvfi (False, False, rvfi_d2.is_i32_not_i16, rvfi_d2.instr, rvfi_d2.instr_C, 0, 0, 0, 0, 0, 0,
 	       rvfi_d2.pc, next_pc, 0, 0, 0, 0, 0);
+      if (from_priv == m_Priv_Mode) begin
+	 rg_rvfi_csr_kind  <= 3;
+	 rg_rvfi_mstatus_r <= csr_regfile.read_mstatus;
+	 rg_rvfi_mstatus_w <= new_mstatus;
+	 rg_rvfi_mepc      <= fromMaybe (0, csr_regfile.read_csr_port2 (csr_addr_mepc));
+      end
 `endif
 
 `ifdef INCLUDE_TANDEM_VERIF
@@ -1887,6 +1905,7 @@ module mkCPU (CPU_IFC);
    (* descending_urgency = "rl_reset_from_Debug_Module, rl_reset_complete" *)
    (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_CSRR_S_or_C_2" *)
    (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_CSRR_W_2" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_CSRRX_3" *)
    (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_FENCE_I" *)
    (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_FENCE" *)
    (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_interrupt" *)
@@ -2234,6 +2253,18 @@ module mkCPU (CPU_IFC);
    method Bit #(4)    mv_rvfi_mem_wmask = rg_rvfi_mem_wmask;
    method WordXL      mv_rvfi_mem_rdata = rg_rvfi_mem_rdata;
    method WordXL      mv_rvfi_mem_wdata = rg_rvfi_mem_wdata;
+   method Bit #(2)    mv_rvfi_csr_kind  = rg_rvfi_csr_kind;
+   method Bit #(12)   mv_rvfi_csr_addr  = rg_rvfi_csr_addr;
+   method Bool        mv_rvfi_csr_rd    = rg_rvfi_csr_rd;
+   method Bool        mv_rvfi_csr_wen   = rg_rvfi_csr_wen;
+   method WordXL      mv_rvfi_csr_rdata = rg_rvfi_csr_rdata;
+   method WordXL      mv_rvfi_csr_wdata = rg_rvfi_csr_wdata;
+   method WordXL      mv_rvfi_mstatus_r = rg_rvfi_mstatus_r;
+   method WordXL      mv_rvfi_mstatus_w = rg_rvfi_mstatus_w;
+   method WordXL      mv_rvfi_mepc      = rg_rvfi_mepc;
+   method WordXL      mv_rvfi_mcause    = rg_rvfi_mcause;
+   method WordXL      mv_rvfi_mtval     = rg_rvfi_mtval;
+   method WordXL      mv_rvfi_mtvec     = rg_rvfi_mtvec;
 `endif
    method Bool mv_perf_retire;
       return (minstret != rg_minstret_d1);

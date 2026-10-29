@@ -745,21 +745,14 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 	 WordXL          new_csr_value  = ?;
 	 Maybe #(WordXL) m_new_csr_value2 = tagged Invalid;
 
-	 if ((csr_addr_mhpmcounter3 <= csr_addr) && (csr_addr <= csr_addr_mhpmcounter31))
-	    begin
-	       new_csr_value = 0;    // hardwired
-	    end
+	 // E21: the hardwired-zero mhpm ranges are disjoint from every case label, so they are
+	 // tested in 'default' (was an if/else-if chain ahead of the case: three range-compare
+	 // carry chains in series with every CSR's write enable).
+	 Bool is_hpm = (   ((csr_addr_mhpmcounter3 <= csr_addr) && (csr_addr <= csr_addr_mhpmcounter31))
 `ifdef RV32
-	 else if ((csr_addr_mhpmcounter3h <= csr_addr) && (csr_addr <= csr_addr_mhpmcounter31h))
-	    begin
-	       new_csr_value = 0;    // hardwired
-	    end
+			|| ((csr_addr_mhpmcounter3h <= csr_addr) && (csr_addr <= csr_addr_mhpmcounter31h))
 `endif
-	 else if ((csr_addr_mhpmevent3 <= csr_addr) && (csr_addr <= csr_addr_mhpmevent31))
-	    begin
-	       new_csr_value = 0;    // hardwired
-	    end
-	 else
+			|| ((csr_addr_mhpmevent3 <= csr_addr) && (csr_addr <= csr_addr_mhpmevent31)));
 	    case (csr_addr)
 	       // User mode csrs
 `ifdef ISA_F
@@ -1011,7 +1004,10 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 				    end
 `endif
 
-	       default: success = False;
+	       default: begin
+			   new_csr_value = 0;    // mhpm*: hardwired
+			   success = is_hpm;
+			end
 	    endcase
 
 	 if ((! success) && (cfg_verbosity > 1))
@@ -1321,6 +1317,12 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 	      && (   ((csr_addr == csr_addr_cycle)   && (rg_mcounteren.cy == 0))
 		  || ((csr_addr == csr_addr_time)    && (rg_mcounteren.tm == 0))
 		  || ((csr_addr == csr_addr_instret) && (rg_mcounteren.ir == 0))
+`ifdef RV32
+		  // the h halves follow the same mcounteren bits (stock Flute checked only the low halves)
+		  || ((csr_addr == csr_addr_cycleh)   && (rg_mcounteren.cy == 0))
+		  || ((csr_addr == csr_addr_timeh)    && (rg_mcounteren.tm == 0))
+		  || ((csr_addr == csr_addr_instreth) && (rg_mcounteren.ir == 0))
+`endif
 		  || ((csr_addr_hpmcounter3  <= csr_addr) && (csr_addr <= csr_addr_hpmcounter31))
 `ifdef RV32
 		  || ((csr_addr_hpmcounter3h <= csr_addr) && (csr_addr <= csr_addr_hpmcounter31h))

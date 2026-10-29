@@ -142,6 +142,14 @@ module mkNear_Mem_IO_AXI4 (Near_Mem_IO_AXI4_IFC);
    // Software interrupt queue
    FIFOF #(Bool) f_sw_interrupt_req <- mkFIFOF;
 
+   // ----------------
+   // E22: two-stage read/write.  The *_decode rules do the base subtract and the
+   // register-select compares into a FIFO; the second rules act on the registered
+   // select (the one-cycle write was a 19 ns critical path: AXI awaddr -> subtract ->
+   // compares -> mtime/mtimecmp/msip muxes, 80% routing).  The FIFOs keep AXI order.
+   FIFOF #(Tuple3 #(Bit #(3), Bit #(Wd_Id), Bit #(Wd_User))) f_rd_pending <- mkFIFOF;
+   FIFOF #(Tuple5 #(Bit #(3), Bit #(64), Bit #(8), Bit #(Wd_Id), Bit #(Wd_User))) f_wr_pending <- mkFIFOF;
+
    // ================================================================
    // BEHAVIOR
 
@@ -154,6 +162,8 @@ module mkNear_Mem_IO_AXI4 (Near_Mem_IO_AXI4_IFC);
       slave_xactor.reset;
       f_timer_interrupt_req.clear;
       f_sw_interrupt_req.clear;
+      f_rd_pending.clear;
+      f_wr_pending.clear;
 
       rg_state        <= MODULE_STATE_READY;
       crg_time [1]    <= 0;
@@ -204,6 +214,21 @@ module mkNear_Mem_IO_AXI4 (Near_Mem_IO_AXI4_IFC);
    // ----------------------------------------------------------------
    // Handle 'memory'-read requests
 
+
+   // E22 register selects (from the byte offset)
+   function Bit #(3) fn_sel (Fabric_Addr addr);
+      let byte_addr = addr - rg_addr_base;
+      Bit #(3) sel = 0;    // 0 = decode error
+      if (addr < rg_addr_base)           sel = 0;
+      else if (byte_addr == 'h_0000)     sel = 1;    // MSIP
+      else if (byte_addr == 'h_0004)     sel = 2;    // MSIPH
+      else if (byte_addr == 'h_4000)     sel = 3;    // MTIMECMP
+      else if (byte_addr == 'h_4004)     sel = 4;    // MTIMECMPH
+      else if (byte_addr == 'h_BFF8)     sel = 5;    // MTIME
+      else if (byte_addr == 'h_BFFC)     sel = 6;    // MTIMEH
+      return sel;
+   endfunction
+
    rule rl_process_rd_req (   (rg_state == MODULE_STATE_READY)
 			   && (! f_reset_reqs.notEmpty));
 
@@ -212,35 +237,40 @@ module mkNear_Mem_IO_AXI4 (Near_Mem_IO_AXI4_IFC);
 	 $display ("%0d: CLINT_AXI4.rl_process_rd_req", cur_cycle);
 	 $display ("    ", fshow (rda));
       end
+      let sel = fn_sel (rda.araddr);
+      if (sel == 0) begin
+	 $display ("%0d: ERROR: CLINT_AXI4.rl_process_rd_req: unrecognized addr", cur_cycle);
+	 $display ("    ", fshow (rda));
+      end
+      f_rd_pending.enq (tuple3 (sel, rda.arid, rda.aruser));
+   endrule
 
-      let        byte_addr = rda.araddr - rg_addr_base;
+   rule rl_rd_data (   (rg_state == MODULE_STATE_READY)
+		    && (! f_reset_reqs.notEmpty));
+      match { .sel, .arid, .aruser } = f_rd_pending.first;
+      f_rd_pending.deq;
+
       Bit #(64)  rdata = 0;
       AXI4_Resp  rresp = axi4_resp_okay;
 
-      if (rda.araddr < rg_addr_base) begin
-	 $display ("%0d: ERROR: CLINT_AXI4.rl_process_rd_req: unrecognized addr", cur_cycle);
-	 $display ("    ", fshow (rda));
-	 rresp = axi4_resp_decerr;
-      end
-
-      else if (byte_addr == 'h_0000)
+      if (sel == 1)
 	 // MSIP
 	 rdata = zeroExtend (rg_msip ? 1'b1 : 1'b0);
 
-      else if (byte_addr == 'h_4000)
+      else if (sel == 3)
 	 // MTIMECMP
 	 rdata = truncate (crg_timecmp [0]);    // truncates for 32b fabrics
 
-      else if (byte_addr == 'h_BFF8)
+      else if (sel == 5)
 	 // MTIME
 	 rdata = truncate (crg_time [0]);       // truncates for 32b fabrics
 
       // The following ALIGN4B reads are only needed for 32b fabrics
-      else if (byte_addr == 'h_0004)
+      else if (sel == 2)
 	 // MSIPH
 	 rdata = 0;
 
-      else if (byte_addr == 'h_4004) begin
+      else if (sel == 4) begin
 	 // MTIMECMPH
 	 Bit #(64) x64 = crg_timecmp [0];
 	 if (valueOf (Wd_Data) == 32)
@@ -248,7 +278,7 @@ module mkNear_Mem_IO_AXI4 (Near_Mem_IO_AXI4_IFC);
 	 rdata = zeroExtend (x64);    // extends for 64b fabrics
       end
 
-      else if (byte_addr == 'h_BFFC) begin
+      else if (sel == 6) begin
 	 // MTIMEH
 	 Bit #(64) x64 = crg_time [0];
 	 if (valueOf (Wd_Data) == 32)
@@ -259,18 +289,13 @@ module mkNear_Mem_IO_AXI4 (Near_Mem_IO_AXI4_IFC);
       else
 	 rresp = axi4_resp_decerr;
 
-      if (rresp != axi4_resp_okay) begin
-	 $display ("%0d: ERROR: CLINT_AXI4.rl_process_rd_req: unrecognized addr", cur_cycle);
-	 $display ("    ", fshow (rda));
-      end
-
       // Send read-response to bus
       Fabric_Data x = truncate (rdata);
-      let rdr = AXI4_Rd_Data {rid:   rda.arid,
+      let rdr = AXI4_Rd_Data {rid:   arid,
 			      rdata: x,
 			      rresp: rresp,
 			      rlast: True,
-			      ruser: rda.aruser};
+			      ruser: aruser};
       slave_xactor.i_rd_data.enq (rdr);
 
       if (cfg_verbosity > 1) begin
@@ -291,23 +316,28 @@ module mkNear_Mem_IO_AXI4 (Near_Mem_IO_AXI4_IFC);
 	 $display ("    ", fshow (wra));
 	 $display ("    ", fshow (wrd));
       end
-
-      Bit #(64) wdata     = zeroExtend (wrd.wdata);
-      Bit #(8)  wstrb     = zeroExtend (wrd.wstrb);
-      Bit #(8)  data_byte = wdata [7:0];
-
-      let        byte_addr = wra.awaddr - rg_addr_base;
-      AXI4_Resp  bresp     = axi4_resp_okay;
-
-      if (wra.awaddr < rg_addr_base) begin
+      let sel = fn_sel (wra.awaddr);
+      if (sel == 0) begin
 	 $display ("%0d: ERROR: CLINT_AXI4.rl_process_wr_req: unrecognized addr", cur_cycle);
 	 $display ("            ", fshow (wra));
 	 $display ("            ", fshow (wrd));
-	 bresp = axi4_resp_decerr;
       end
+      f_wr_pending.enq (tuple5 (sel, zeroExtend (wrd.wdata), zeroExtend (wrd.wstrb),
+				wra.awid, wra.awuser));
+   endrule
+
+   rule rl_wr_apply (   (rg_state == MODULE_STATE_READY)
+		     && (! f_reset_reqs.notEmpty));
+      match { .sel, .wdata, .wstrb, .awid, .awuser } = f_wr_pending.first;
+      f_wr_pending.deq;
+
+      AXI4_Resp  bresp     = axi4_resp_okay;
+
+      if (sel == 0)
+	 bresp = axi4_resp_decerr;
 
       // MSIP
-      else if (byte_addr == 'h_0000) begin
+      else if (sel == 1) begin
 	 Bool new_msip = (wdata [0] == 1'b1);
 	 if (rg_msip != new_msip) begin
 	    rg_msip <= new_msip;
@@ -318,16 +348,16 @@ module mkNear_Mem_IO_AXI4 (Near_Mem_IO_AXI4_IFC);
       end
 
       // MSIPH
-      else if (byte_addr == 'h_0004) begin
+      else if (sel == 2) begin
 	 noAction;    // upper 32 bits wired to 0
       end
 
       // MTIMECMP and MTIMECMPH
-      else if ((byte_addr == 'h_4000) || (byte_addr == 'h_4004)) begin
+      else if ((sel == 3) || (sel == 4)) begin
 	 Bit #(64) old_timecmp = crg_timecmp [1];
 	 Bit #(64) new_timecmp = ?;
 
-	 if (byte_addr == 'h_4000) begin
+	 if (sel == 3) begin
 	    new_timecmp = fn_update_strobed_bytes (old_timecmp,
 						   zeroExtend (wdata),
 						   zeroExtend (wstrb));
@@ -359,7 +389,7 @@ module mkNear_Mem_IO_AXI4 (Near_Mem_IO_AXI4_IFC);
 		      cur_cycle, crg_time [1], new_timecmp);
       end
 
-      else if (byte_addr == 'h_BFF8) begin
+      else if (sel == 5) begin
 	 // MTIME
 	 Bit #(64) old_time = crg_time [1];
 	 Bit #(64) new_time = fn_update_strobed_bytes (old_time,
@@ -374,7 +404,7 @@ module mkNear_Mem_IO_AXI4 (Near_Mem_IO_AXI4_IFC);
 	 end
       end
 
-      else if (byte_addr == 'h_BFFC) begin
+      else if (sel == 6) begin
 	 // MTIMEH
 	 Bit #(64) old_time = crg_time [1];
 	 Bit #(64) x64      = zeroExtend (wdata);
@@ -396,16 +426,10 @@ module mkNear_Mem_IO_AXI4 (Near_Mem_IO_AXI4_IFC);
       else
 	 bresp = axi4_resp_decerr;
 
-      if (bresp != axi4_resp_okay) begin
-	 $display ("%0d: ERROR: CLINT_AXI4.rl_process_wr_req: unrecognized addr", cur_cycle);
-	 $display ("    ", fshow (wra));
-	 $display ("    ", fshow (wrd));
-      end
-
       // Send write-response to bus
-      let wrr = AXI4_Wr_Resp {bid:   wra.awid,
+      let wrr = AXI4_Wr_Resp {bid:   awid,
 			      bresp: bresp,
-			      buser: wra.awuser};
+			      buser: awuser};
       slave_xactor.i_wr_resp.enq (wrr);
 
       if (cfg_verbosity > 1) begin

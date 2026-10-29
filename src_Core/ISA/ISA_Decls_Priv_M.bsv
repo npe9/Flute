@@ -440,6 +440,11 @@ function Tuple2 #(WordXL, Priv_Mode) fv_new_mstatus_on_ret (MISA       misa,
       mstatus = fv_assign_bit (mstatus, fromInteger (mstatus_spp_bitpos), default_pp [0]);
    end
 
+   // Priv spec 1.12 / Sail: an xRET to a mode below M clears MPRV
+   // (found by the Sail-derived riscv-formal mret check)
+   if (to_y != m_Priv_Mode)
+      mstatus = fv_assign_bit (mstatus, fromInteger (mstatus_mprv_bitpos), 1'b0);
+
    return tuple2 (mstatus, to_y);
 endfunction
 

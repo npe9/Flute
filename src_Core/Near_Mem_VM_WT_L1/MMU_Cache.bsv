@@ -206,12 +206,14 @@ typedef enum {MODULE_PRERESET,              // After power on reset, before soft
               CACHE_SNAPSHOT,               // Snapshot victim line's other-way words (BRAM read-only)
               CACHE_REFILL,                 // Refill
               CACHE_REREQ,                  // After refill, redo request that missed
-              CACHE_AMO_EXEC,               // E12: AMO hit captured at probe; ALU + write here
+              CACHE_AMO_EXEC,               // E12: AMO hit captured at probe; ALU here
+              CACHE_AMO_WRITE,              // E23: cache + fabric write of the registered AMO result
               CACHE_ST_AMO_RSP,             // Provide ST/SC/AMO response
 
               IO_REQ,                       // For memory-mapped I/O requests
               IO_AWAITING_READ_RSP,         // No caching
               IO_READ_RSP,                  // Provide IO-read response
+              IO_AMO_WRITE,                 // E23: fabric write of the registered IO AMO result
 
 	      IO_AWAITING_AMO_READ_RSP
    } Module_State
@@ -1822,31 +1824,39 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // probe (no req can arrive while the AMO is outstanding).
 
    rule rl_amo_exec (rg_state == CACHE_AMO_EXEC);
-      // Do the AMO op on the loaded value and the store value
+      // Do the AMO op on the loaded value and the store value.  E23: only the ALU here; the
+      // results are registered and rl_amo_write does the cache and fabric writes next cycle
+      // (the ALU -> write-FIFO / BRAM-DI cone was main's deepest at 50 MHz).  +1 cycle per AMO.
       match {.new_ld_val,
 	     .new_st_val} = fv_amo_op_x (rg_f3, rg_amo_funct7, rg_amo_w1, rg_st_amo_val);
 
+      if (cfg_verbosity > 1)
+	 $display ("%0d: %s.rl_amo_exec: 0x%0h  op  0x%0h -> 0x%0h",
+		   cur_cycle, d_or_i, rg_amo_w1, rg_st_amo_val, new_st_val);
+
+      rg_ld_val     <= new_ld_val;
+      rg_st_amo_val <= new_st_val;
+      rg_state      <= CACHE_AMO_WRITE;
+   endrule
+
+   rule rl_amo_write (rg_state == CACHE_AMO_WRITE);
       // Update cache line in cache
-      let new_cword_set = fn_update_cword_set (rg_amo_cword_set, rg_amo_way, rg_pa, rg_f3, new_st_val);
+      let new_cword_set = fn_update_cword_set (rg_amo_cword_set, rg_amo_way, rg_pa, rg_f3, rg_st_amo_val);
       ram_cword_set.a.put (bram_cmd_write, cset_cword_in_cache, new_cword_set);
 `ifdef BRAM_HAZARD_ASSERT
       fa_haz_A_write (False, bram_cmd_write, extend (cset_cword_in_cache));
 `endif
 
       if (cfg_verbosity > 1) begin
-	 $display ("%0d: %s.rl_amo_exec: 0x%0h  op  0x%0h -> 0x%0h",
-		   cur_cycle, d_or_i, rg_amo_w1, rg_st_amo_val, new_st_val);
-	 $write   ("          New Word64_Set:");
+	 $write   ("%0d: %s.rl_amo_write: New Word64_Set:", cur_cycle, d_or_i);
 	 fa_display_cword_set (cset_in_cache, cword_in_cline, new_cword_set);
       end
 
       // Writeback data to memory (so cache remains clean)
-      fa_fabric_send_write_req (rg_f3, rg_pa, new_st_val);
+      fa_fabric_send_write_req (rg_f3, rg_pa, rg_st_amo_val);
 
       // Provide amo response after 1-cycle delay (thus locking the cset for 1 cycle),
       // in case the next incoming request tries to read from the same address.
-      rg_ld_val     <= new_ld_val;
-      rg_st_amo_val <= new_st_val;
       rg_state      <= CACHE_ST_AMO_RSP;
    endrule
 `endif
@@ -2052,16 +2062,24 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	 match {.new_ld_val,
 		.new_st_val} = fv_amo_op (rg_f3, rg_amo_funct7, rg_addr, ld_val, rg_st_amo_val);
 
-	 // Write back new st_val to fabric
-	 fa_fabric_send_write_req (rg_f3, rg_pa, new_st_val);
-
-	 fa_drive_IO_read_rsp (rg_f3, rg_addr, new_ld_val);
-	 rg_ld_val <= new_ld_val;
-	 rg_state  <= IO_READ_RSP;
+	 // E23: registered; rl_io_amo_write sends the store and the response next cycle
+	 rg_ld_val     <= new_ld_val;
+	 rg_st_amo_val <= new_st_val;
+	 rg_state      <= IO_AMO_WRITE;
 
 	 if (cfg_verbosity > 1)
 	    $display ("    => rl_ST_AMO_response");
       end
+   endrule
+
+`ifdef ISA_PRIV_S
+   (* descending_urgency = "rl_io_amo_write, rl_writeback_updated_PTE" *)
+`endif
+   rule rl_io_amo_write (rg_state == IO_AMO_WRITE);
+      // Write back new st_val to fabric
+      fa_fabric_send_write_req (rg_f3, rg_pa, rg_st_amo_val);
+      fa_drive_IO_read_rsp (rg_f3, rg_addr, rg_ld_val);
+      rg_state <= IO_READ_RSP;
    endrule
 `endif
 

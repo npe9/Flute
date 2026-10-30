@@ -128,6 +128,13 @@ module mkCPU_StageD #(Bit #(4)  verbosity, MISA misa)
 
    (* fire_when_enabled, no_implicit_conditions *)
    rule rl_update;
+      // E40: the slot write does not look at pw_clear.  Under the clear the
+      // slot at rg_wp was free anyway and every slot is dead after it, so
+      // the 112 data CEs depend on rg_cnt/rg_wp only.  (pw_clear is the
+      // stage1/2 redirect: it reached these CEs through rl_pipe, the
+      // 18.9 ns E36 s4 path.)
+      if (rg_cnt != 2)
+	 vr_data [rg_wp] <= dw_stage;
       if (pw_clear) begin
 	 rg_wp  <= 0;
 	 rg_rp  <= 0;
@@ -135,8 +142,6 @@ module mkCPU_StageD #(Bit #(4)  verbosity, MISA misa)
       end
       else begin
 	 Bit #(2) cnt = rg_cnt;
-	 if (rg_cnt != 2)
-	    vr_data [rg_wp] <= dw_stage;
 	 if (pw_enq) begin
 	    rg_wp <= rg_wp + 1;
 	    cnt = cnt + 1;

@@ -69,6 +69,10 @@ interface CPU_StageF_IFC;
 
    (* always_ready *)
    method Action set_full (Bool full);
+
+   // E29: registered "not BUSY" for the NONPIPE / halting guards in CPU.bsv.
+   (* always_ready *)
+   method Bool not_busy;
 endinterface
 
 // ================================================================
@@ -88,6 +92,22 @@ module mkCPU_StageF #(Bit #(4)  verbosity,
    Reg #(Bool)       rg_full  <- mkConfigReg (False);
    Reg #(Epoch)      rg_epoch <- mkReg (0);               // Toggles on redirections
    Reg #(Priv_Mode)  rg_priv  <- mkRegU;
+
+   // E29: rg_fetch_seen = the current imem request has presented (valid) at least
+   // once.  ICache_Pipe's valid is monotonic between requests (the queue clears
+   // only on a miss -- never while the wanted cword is present -- or on a
+   // flush/reset, which only CPU NONPIPE paths start and which re-enq StageF), so
+   // (! rg_full) || rg_fetch_seen implies "not BUSY", at most one cycle late.
+   // The NONPIPE rules' guards used out.ostatus != BUSY, i.e. the icache's
+   // combinational queue match, which then reached rg_state, CSR write enables and
+   // near_mem requests (20.8 ns at the 50 MHz constraint).
+   Reg #(Bool)       rg_fetch_seen <- mkReg (False);
+   PulseWire         pw_fetch_req  <- mkPulseWire;
+
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_fetch_seen;
+      rg_fetch_seen <= ((! pw_fetch_req) && (rg_fetch_seen || imem.valid));
+   endrule
 
    Branch_Predictor_IFC branch_predictor <- mkBranch_Predictor;
 
@@ -194,6 +214,7 @@ module mkCPU_StageF #(Bit #(4)  verbosity,
       end
 
       imem.req (f3_LW, pc, priv, sstatus_SUM, mstatus_MXR, satp);
+      pw_fetch_req.send;    // E29
       branch_predictor.predict_req (pc);    // TODO: ASID.VA vs PA?
 
       rg_epoch <= epoch;
@@ -216,6 +237,8 @@ module mkCPU_StageF #(Bit #(4)  verbosity,
    method Action set_full (Bool full);
       rg_full <= full;
    endmethod
+
+   method Bool not_busy = ((! rg_full) || rg_fetch_seen);
 endmodule
 
 // ================================================================

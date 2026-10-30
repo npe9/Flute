@@ -949,6 +949,12 @@ module mkCPU (CPU_IFC);
    // cycles and rl_front stops (no starvation); giving them priority would put
    // stage1/stage2 status back into WILL_FIRE_rl_front.  The attributes sit
    // on those rules (bsc wants them after both definitions).
+   // E28: offer StageF's output to StageD every cycle (see CPU_StageD.stage).
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_stageD_feed;
+      stageD.stage (stageF.out.data_to_stageD);
+   endrule
+
    rule rl_front (   (rg_state == CPU_RUNNING)
 		  && stageD.can_enq
 		  && (stageF.out.ostatus == OSTATUS_PIPE));

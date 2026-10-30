@@ -187,9 +187,36 @@ module mkCPU_Stage1 #(Bit #(4)         verbosity,
    ctl_inputs.rs2_val = 0;
    let ctl_outputs = fv_ALU (ctl_inputs);
    let fall_through_pc = rg_stage_input.pc + (rg_stage_input.is_i32_not_i16 ? 4 : 2);
-   let resolved_next_pc = ((alu_outputs.control == CONTROL_BRANCH)
-			   ? alu_outputs.addr
-			   : fall_through_pc);
+
+   // E42: next_pc and redirect without a compare after the operand cone.
+   // Only BRANCH (taken), JAL and JALR resolve to CONTROL_BRANCH.  Their
+   // targets are pc-relative (operand-independent) except JALR's, so the
+   // "!= pred_pc" compares run in parallel with the register read and only
+   // a late select by the (value-dependent) control remains.  For JALR,
+   // ((rs1 + imm) & ~1) == pred  <=>  pred even and rs1 is pred - imm or
+   // pred - imm + 1: equality compares of rs1 against register-only values
+   // instead of adder -> compare.  (It was regfile -> bypass -> branch
+   // compare -> addr mux -> next_pc mux -> 32-bit compare -> stage2 reg.)
+   let opcode   = decoded_instr.opcode;
+   Addr pred    = rg_stage_input.pred_pc;
+   IntXL off_b  = extend (unpack (decoded_instr.imm13_SB));
+   IntXL off_j  = extend (unpack (decoded_instr.imm21_UJ));
+   IntXL off_i  = extend (unpack (decoded_instr.imm12_I));
+   Addr br_tgt  = pack (unpack (rg_stage_input.pc) + off_b);
+   Addr jal_tgt = pack (unpack (rg_stage_input.pc) + off_j);
+   Addr jalr_tgt = pack (unpack (rs1_val_bypassed) + off_i);
+   jalr_tgt [0] = 1'b0;
+   Addr jalr_k0 = pack (unpack ({ pred [xlen-1:1], 1'b0 }) - off_i);
+   Bool jalr_hit = (pred [0] == 1'b0)
+                   && ((rs1_val_bypassed == jalr_k0) || (rs1_val_bypassed == jalr_k0 + 1));
+   Bool is_jal  = (opcode == op_JAL);
+   Bool is_jalr = (opcode == op_JALR);
+   Addr ctl_tgt = (is_jal ? jal_tgt : (is_jalr ? jalr_tgt : br_tgt));
+   Bool tgt_miss = (is_jal ? (jal_tgt != pred) : (is_jalr ? (! jalr_hit) : (br_tgt != pred)));
+   Bool ft_miss  = (fall_through_pc != pred);
+   Bool resolved_branch  = (alu_outputs.control == CONTROL_BRANCH);
+   let  resolved_next_pc = (resolved_branch ? ctl_tgt : fall_through_pc);
+   Bool resolved_redirect = (resolved_branch ? tgt_miss : ft_miss);
 
    let data_to_stage2 = Data_Stage1_to_Stage2 {pc            : rg_stage_input.pc,
 					       instr         : rg_stage_input.instr,
@@ -198,7 +225,7 @@ module mkCPU_Stage1 #(Bit #(4)         verbosity,
 					       addr          : alu_outputs.addr,
 					       val1          : alu_outputs.val1,
 					       val2          : alu_outputs.val2,
-					       redirect      : (resolved_next_pc != rg_stage_input.pred_pc),
+					       redirect      : resolved_redirect,
 					       next_pc       : resolved_next_pc,
 					       cf_info       : alu_outputs.cf_info,
 `ifdef RVFI

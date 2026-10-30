@@ -19,18 +19,24 @@ package ICache_Pipe;
 //                    Miss -> refill (the stream replays from the missed
 //                    cword); non-memory -> stream halts (device space is
 //                    fetched on demand only, never prefetched).
-//   Q   queue      : 4 cwords, contiguous, oldest at q[0].  Issue is
+//   Q   queue      : 4 cwords, contiguous, oldest at the head.  Issue is
 //                    credit-limited: queued + in flight < 4, so run-ahead
 //                    is bounded by what the CPU consumes (STEP 5c lesson:
 //                    an unbounded speculative chain amplified X-state).
+//                    E30: a ring (rg_head/rg_tail/rg_n) of {exc, data}
+//                    slots.  The candidate cword is written at rg_tail
+//                    whether or not it is kept, so the late presentation
+//                    match (clear/pop/redirect) drives only the pointers
+//                    and the two compared addresses (rg_qa0/rg_qa1), never
+//                    the data bits.  Entry j's address is rg_qa0 + j.
 //
 // CPU side (IMem_IFC, same contract as CPU_Fetch_C + shim): req(pc)
 // records the wanted pc (ConfigReg; no submodule calls -- the STEP 5
 // lesson); the response methods present the 16- or 32-bit instruction at
-// the wanted pc from q[0]/q[1] (+ the following entry for a 32-bit
+// the wanted pc from entry 0/1 (+ the following entry for a 32-bit
 // instruction straddling two cwords), combinationally from registers.
-// Consumption is inferred lazily: when the wanted pc moves into q[1],
-// q[0] is popped; when it is the next cword the stream will deliver, the
+// Consumption is inferred lazily: when the wanted pc moves into entry 1,
+// entry 0 is popped; when it is the next cword the stream will deliver, the
 // queue is dropped and the request waits; anything else is a redirect
 // (queue + pipe dropped, stream restarts at the wanted cword).
 //
@@ -98,6 +104,13 @@ deriving (Bits, FShow);
 
 QEnt qent_empty = QEnt { v: False, a: 0, exc: False, d: 0 };
 
+// A ring slot (E30): the address is implicit (contiguous stream).
+typedef struct {
+   Bool      exc;
+   Bit #(64) d;
+   } RSlot
+deriving (Bits, FShow);
+
 typedef enum { ST_RUN, ST_REFILL_REQ, ST_REFILL, ST_IO_REQ, ST_IO_RSP, ST_FLUSH } IState
 deriving (Bits, Eq, FShow);
 
@@ -107,8 +120,8 @@ typedef struct {
    Instr     instr;
    Bool      exc;
    WordXL    tval;
-   Bool      base_hit;    // wanted cword is q[0] or q[1]
-   Bool      pop1;        // wanted cword is q[1]: q[0] is consumed
+   Bool      base_hit;    // wanted cword is entry 0 or 1
+   Bool      pop1;        // wanted cword is entry 1: entry 0 is consumed
    CW_Addr   need_cw;     // when ! valid: the cword still needed
    } Present
 deriving (Bits, FShow);
@@ -177,7 +190,12 @@ module mkICache_Pipe (ICache_Pipe_IFC);
    // Everything below: sole writer rl_main.
    Reg #(IState) rg_st <- mkReg (ST_RUN);
 
-   Vector #(4, Reg #(QEnt)) q <- replicateM (mkReg (qent_empty));
+   Vector #(4, Reg #(RSlot)) ring <- replicateM (mkReg (RSlot { exc: False, d: 0 }));
+   Reg #(Bit #(2)) rg_head <- mkReg (0);
+   Reg #(Bit #(2)) rg_tail <- mkReg (0);    // == rg_head + rg_n (mod 4)
+   Reg #(Bit #(3)) rg_n    <- mkReg (0);    // entries queued, 0..4
+   Reg #(CW_Addr)  rg_qa0  <- mkReg (0);    // entry 0's cword
+   Reg #(CW_Addr)  rg_qa1  <- mkReg (1);    // rg_qa0 + 1
 
    Reg #(CW_Addr) rg_pf      <- mkReg ('h200);    // next cword the stream reads
    Reg #(Bool)    rg_halt_io  <- mkReg (False);    // stream at a non-memory cword
@@ -218,11 +236,17 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       CW_Addr  w = truncateLSB (rg_pc);
       Bit #(2) o = rg_pc [2:1];
 
-      Bool m0 = q [0].v && (q [0].a == w);
-      Bool m1 = q [1].v && (q [1].a == w);
+      Bool v1 = (rg_n >= 2);
+      Bool v2 = (rg_n >= 3);
+      Bool m0 = (rg_n != 0) && (rg_qa0 == w);
+      Bool m1 = v1 && (rg_qa1 == w);
 
-      QEnt b = (m0 ? q [0] : q [1]);    // base entry
-      QEnt n = (m0 ? q [1] : q [2]);    // following entry (contiguous)
+      RSlot e0 = ring [rg_head];
+      RSlot e1 = ring [rg_head + 1];
+      RSlot e2 = ring [rg_head + 2];
+      RSlot b  = (m0 ? e0 : e1);    // base entry (its cword is w)
+      RSlot n  = (m0 ? e1 : e2);    // following entry (contiguous: w + 1)
+      Bool  nv = (m0 ? v1 : v2);
 
       Bit #(16) p0   = fn_parcel (b.d, o);
       Bool      is32 = (p0 [1:0] == 2'b11);
@@ -241,13 +265,13 @@ module mkICache_Pipe (ICache_Pipe_IFC);
          else if (! strad) begin
             r.valid = True;  r.instr = { fn_parcel (b.d, o + 1), p0 };
          end
-         else if (n.v) begin
+         else if (nv) begin
             r.valid = True;  r.instr = { fn_parcel (n.d, 0), p0 };
             r.exc   = n.exc;
-            r.tval  = fn_cw_to_addr (b.a + 1);
+            r.tval  = fn_cw_to_addr (w + 1);
          end
          else
-            r.need_cw = b.a + 1;
+            r.need_cw = w + 1;
       end
       return r;
    endfunction
@@ -287,24 +311,23 @@ module mkICache_Pipe (ICache_Pipe_IFC);
             hit = True;  hit_way = fromInteger (wy);
          end
       Bool s2_live = rg_s2_v && run && (! redirect) && (! flush_start);
-      Bool s2_enq  = s2_live && s2_mem && hit;
       Bool s2_miss = s2_live && s2_mem && (! hit);
       Bool s2_io   = s2_live && (! s2_mem);
       Bool p2_kill = s2_miss || s2_io;
 
-      // ---- Queue next state: clear / pop, then enqueue at the tail
-      Vector #(4, QEnt) qn = readVReg (q);
-      if (flush_start || q_clear)
-         qn = replicate (qent_empty);
-      else if (q_pop1)
-         qn = shiftInAtN (qn, qent_empty);
-
-      Maybe #(QEnt) m_enq = tagged Invalid;
-      if (s2_enq) begin
+      // ---- Enqueue candidate.  Written into the ring at rg_tail whenever
+      // present (early: registers and the S2 tag compare); cand_keep, which
+      // carries the late redirect/drop decisions, only moves the pointers.
+      Bool cand_v    = False;
+      Bool cand_keep = False;
+      QEnt cand      = qent_empty;
+      if (rg_s2_v && run && s2_mem && hit) begin
          CWord d = rg_s2_data [0];
          for (Integer wy = 1; wy < ways_per_cset; wy = wy + 1)
             if (hit_way == fromInteger (wy)) d = rg_s2_data [wy];
-         m_enq = tagged Valid (QEnt { v: True, a: rg_s2_a, exc: False, d: d });
+         cand_v    = True;
+         cand_keep = s2_live;
+         cand      = QEnt { v: True, a: rg_s2_a, exc: False, d: d };
       end
 
       // ---- Device read / refill completion (may also enqueue)
@@ -322,8 +345,10 @@ module mkICache_Pipe (ICache_Pipe_IFC);
 
       if ((rg_st == ST_IO_RSP) && rd_rsp_avail) begin
          f_rd.deq;
+         cand_v = True;
+         cand   = QEnt { v: True, a: rg_pf, exc: ! rd_ok, d: zeroExtend (rd_rsp.rdata) };
          if (! drop) begin
-            m_enq = tagged Valid (QEnt { v: True, a: rg_pf, exc: ! rd_ok, d: zeroExtend (rd_rsp.rdata) });
+            cand_keep = True;
             pf_next = rg_pf + 1;
             if (! rd_ok) halt_exc_next = True;
          end
@@ -348,25 +373,51 @@ module mkICache_Pipe (ICache_Pipe_IFC);
                                         ctag:  fn_PA_to_CTag (fn_WordXL_to_PA (fn_cw_to_addr (rg_miss_a))) };
                ram_state_and_ctag_cset.a.put (True, cset, t);
             end
-            else if (! drop) begin
-               m_enq = tagged Valid (QEnt { v: True, a: rg_miss_a, exc: True, d: 0 });
-               halt_exc_next = True;
-               pf_next = rg_miss_a + 1;
+            else begin
+               cand_v = True;
+               cand   = QEnt { v: True, a: rg_miss_a, exc: True, d: 0 };
+               if (! drop) begin
+                  cand_keep = True;
+                  halt_exc_next = True;
+                  pf_next = rg_miss_a + 1;
+               end
             end
             st_next = ST_RUN;
          end
       end
 
-      // Tail enqueue (credit-limited issue guarantees a free slot)
-      if (m_enq matches tagged Valid .e) begin
-         if (qn [3].v)
-            $display ("%0d: ASSERT FAIL ICache_Pipe: enqueue into a full queue", cur_cycle);
-         if      (! qn [0].v) qn [0] = e;
-         else if (! qn [1].v) qn [1] = e;
-         else if (! qn [2].v) qn [2] = e;
-         else                 qn [3] = e;
+      // ---- Queue next state.  Clear / pop, then a kept candidate joins at
+      // the tail (credit-limited issue guarantees a free slot).  A flush
+      // or reset start empties the queue and keeps nothing.
+      Bool     q_empty = flush_start || q_clear;
+      Bool     enq     = cand_keep && (! flush_start);
+      Bit #(3) n_aft   = (q_empty ? 0 : (q_pop1 ? rg_n - 1 : rg_n));
+      Bit #(2) h_aft   = (q_empty ? rg_tail : (q_pop1 ? rg_head + 1 : rg_head));
+      CW_Addr  qa0_aft = (q_pop1 ? rg_qa1 : rg_qa0);
+
+      if (cand_v) begin
+         if ((rg_n == 4) && (! q_empty) && (! q_pop1))
+            $display ("%0d: ASSERT FAIL ICache_Pipe: ring write over a live entry", cur_cycle);
+         ring [rg_tail] <= RSlot { exc: cand.exc, d: cand.d };
       end
-      writeVReg (q, qn);
+      if (enq) begin
+         if (n_aft == 4)
+            $display ("%0d: ASSERT FAIL ICache_Pipe: enqueue into a full queue", cur_cycle);
+         if ((n_aft != 0) && (cand.a != qa0_aft + zeroExtend (n_aft)))
+            $display ("%0d: ASSERT FAIL ICache_Pipe: non-contiguous enqueue", cur_cycle);
+      end
+
+      rg_head <= h_aft;
+      rg_tail <= (enq ? rg_tail + 1 : rg_tail);
+      rg_n    <= (enq ? n_aft + 1 : n_aft);
+      if (enq && (n_aft == 0)) begin
+         rg_qa0 <= cand.a;
+         rg_qa1 <= cand.a + 1;
+      end
+      else if (q_pop1) begin
+         rg_qa0 <= rg_qa1;
+         rg_qa1 <= rg_qa1 + 1;
+      end
 
       // ---- S2 miss / device stop: stream replays from s2's cword
       if (s2_miss) begin
@@ -405,7 +456,7 @@ module mkICache_Pipe (ICache_Pipe_IFC);
 
       // ---- P0: issue.  The BRAM address/enable do not depend on the S2
       // result (a kill only drops the S1 valid bit next cycle).
-      Bit #(3) n_q  = (q [0].v ? 1 : 0) + (q [1].v ? 1 : 0) + (q [2].v ? 1 : 0) + (q [3].v ? 1 : 0);
+      Bit #(3) n_q  = rg_n;
       Bit #(3) n_fl = (rg_s1_v ? 1 : 0) + (rg_s2_v ? 1 : 0);
       Bool credit   = ((n_q + n_fl) < 4);
       Bool issue    = run && rg_want && (! flush_start)

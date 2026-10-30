@@ -130,16 +130,30 @@ module mkCPU_StageF #(Bit #(4)  verbosity,
    // side, CPU.rl_pipe) come from different rules, so they queue separately
    // and the drain merges them into one bp_train call (pc/instr 0 = no RAS
    // action, cf_info_none = no BTB action).
-   FIFOF #(Tuple3 #(WordXL, Bool, Instr)) f_ras_train <- mkUGFIFOF;
+   // E37: RAS training no longer queues.  The fetched instruction it trains
+   // from is StageF's own presentation (imem pc/size/instr), so rl_ras_capture
+   // registers it every cycle with no enable, and bp_train_ras (called from
+   // rl_front) only sets rg_ras_v.  rl_front's late firing condition (icache
+   // match -> imem.valid) then reaches one flop instead of the 2-entry FIFO's
+   // ~130 data-register enables.  A train arriving while the drain is blocked
+   // (branch-predictor reset) is dropped, as the full FIFO already did.
+   Reg #(Bool)                       rg_ras_v <- mkReg (False);
+   Reg #(Tuple3 #(WordXL, Bool, Instr)) rg_ras_d <- mkReg (tuple3 (0, True, 0));
+   PulseWire                         pw_ras   <- mkPulseWire;
 
-   rule rl_bp_train_drain (f_bp_train.notEmpty || f_ras_train.notEmpty);
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_ras_capture;
+      rg_ras_v <= pw_ras;
+      rg_ras_d <= tuple3 (imem.pc, imem.is_i32_not_i16, imem.instr);
+   endrule
+
+   rule rl_bp_train_drain (f_bp_train.notEmpty || rg_ras_v);
       WordXL  pc      = 0;
       Bool    is_i32  = True;
       Instr   instr   = 0;
       CF_Info cf_info = cf_info_none;
-      if (f_ras_train.notEmpty) begin
-	 match { .p, .i, .x } = f_ras_train.first;
-	 f_ras_train.deq;
+      if (rg_ras_v) begin
+	 match { .p, .i, .x } = rg_ras_d;
 	 pc = p; is_i32 = i; instr = x;
       end
       if (f_bp_train.notEmpty) begin
@@ -229,9 +243,10 @@ module mkCPU_StageF #(Bit #(4)  verbosity,
 	 f_bp_train.enq (tuple4 (pc, is_i32_not_i16, instr, cf_info));
    endmethod
 
+   // E37: the arguments equal StageF's presentation this cycle (rl_front
+   // passes out.data_to_stageD), which rl_ras_capture registers itself.
    method Action bp_train_ras (WordXL pc, Bool is_i32_not_i16, Instr instr);
-      if (f_ras_train.notFull)
-	 f_ras_train.enq (tuple3 (pc, is_i32_not_i16, instr));
+      pw_ras.send;
    endmethod
 
    method Action set_full (Bool full);

@@ -283,7 +283,6 @@ module mkBranch_Predictor (Branch_Predictor_IFC);
    // fall-through PC if no prediction.
 
    method WordXL  predict_rsp (Bool is_i32_not_i16, Instr instr);
-      WordXL pred_pc   = bogus_PC;    // default: no prediction, invalid PC
       let    btb_entry = btb_bramcore2.a.read;
 
       // E11: returns are recognised from the BTB entry (is_ret, learned when the JALR
@@ -292,16 +291,20 @@ module mkBranch_Predictor (Branch_Predictor_IFC);
       // (census: fetch endpoints 22.9 -> 18 LUT levels without it).  RAS push/pop
       // bookkeeping in bp_train is unchanged.
       Bool btb_hit = (btb_entry.valid) && (btb_entry.pc_tag == fn_pc_to_tag (rg_pc));
-      if (btb_hit && btb_entry.is_ret && (rg_ras [0] != bogus_PC))
-	 pred_pc = rg_ras [0];    // Top of RAS (will be popped in bp_train())
-      else if (btb_hit)
-	 pred_pc = { btb_entry.predicted_pc, 1'b0 };
+      WordXL btb_pc = (   (btb_entry.is_ret && (rg_ras [0] != bogus_PC))
+		       ? rg_ras [0]    // Top of RAS (will be popped in bp_train())
+		       : { btb_entry.predicted_pc, 1'b0 });
 
-      // Default prediction: fallthrough
-      if (pred_pc == bogus_PC)
-	 pred_pc = rg_pc + (is_i32_not_i16 ? 4 : 2);
+      // Default prediction: fallthrough.  E32: both sums come from rg_pc
+      // alone and is_i32_not_i16 (late: the fetched instruction's size)
+      // only selects; it used to feed the adder.  A BTB hit always
+      // predicts (a predicted pc is even, so never bogus_PC), so the old
+      // "pred_pc == bogus_PC" compare is just ! btb_hit.
+      WordXL pc_plus2 = rg_pc + 2;
+      WordXL pc_plus4 = rg_pc + 4;
+      WordXL fall_pc  = (is_i32_not_i16 ? pc_plus4 : pc_plus2);
 
-      return pred_pc;
+      return (btb_hit ? btb_pc : fall_pc);
    endmethod
 
    // ----------------

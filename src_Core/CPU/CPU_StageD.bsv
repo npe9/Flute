@@ -19,6 +19,7 @@ import FIFOF        :: *;
 import GetPut       :: *;
 import ClientServer :: *;
 import ConfigReg    :: *;
+import Vector       :: *;
 
 // ----------------
 // BSV additional libs
@@ -79,9 +80,23 @@ module mkCPU_StageD #(Bit #(4)  verbosity, MISA misa)
    // the dcache hit (stage2 status) through stage1/D/F into the imem request
    // and BTB address (the 22 ns E13 path).  enq -> first latency is still
    // one cycle (mkFIFOF), and two entries keep full throughput.
-   FIFOF #(Data_StageF_to_StageD) f_data <- mkUGFIFOF;
-   Bool                           rg_full = f_data.notEmpty;
-   Data_StageF_to_StageD          rg_data = f_data.first;
+   //
+   // E24: the two entries are a ring (write/read pointers + count), not mkUGFIFOF's shift pair.
+   // In the shift FIFO, data0's D input muxes on DEQ (shift data1 -> data0), so the stage1
+   // advance -- which waits on stage2's dcache hit -- reached 72 data flops (the 21 ns E23 path
+   // at the 50 MHz constraint).  Here DEQ only moves rg_rp/rg_cnt; the data flops load only on
+   // enq.  All state updates are in rl_update, from wires, so the methods keep the FIFO's
+   // read-before-write schedule.
+   Vector #(2, Reg #(Data_StageF_to_StageD)) vr_data <- replicateM (mkRegU);
+   Reg #(Bit #(1))  rg_wp  <- mkReg (0);
+   Reg #(Bit #(1))  rg_rp  <- mkReg (0);
+   Reg #(Bit #(2))  rg_cnt <- mkReg (0);
+   RWire #(Data_StageF_to_StageD) rw_enq   <- mkRWire;
+   PulseWire                      pw_deq   <- mkPulseWire;
+   PulseWire                      pw_clear <- mkPulseWire;
+
+   Bool                           rg_full = (rg_cnt != 0);
+   Data_StageF_to_StageD          rg_data = vr_data [rg_rp];
 
    Bit #(2) xl = ((xlen == 32) ? misa_mxl_32 : misa_mxl_64);
 
@@ -97,8 +112,30 @@ module mkCPU_StageD #(Bit #(4)  verbosity, MISA misa)
 
    rule rl_reset;
       f_reset_reqs.deq;
-      f_data.clear;
+      pw_clear.send;
       f_reset_rsps.enq (?);
+   endrule
+
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_update;
+      if (pw_clear) begin
+	 rg_wp  <= 0;
+	 rg_rp  <= 0;
+	 rg_cnt <= 0;
+      end
+      else begin
+	 Bit #(2) cnt = rg_cnt;
+	 if (rw_enq.wget matches tagged Valid .d) begin
+	    vr_data [rg_wp] <= d;
+	    rg_wp <= rg_wp + 1;
+	    cnt = cnt + 1;
+	 end
+	 if (pw_deq) begin
+	    rg_rp <= rg_rp + 1;
+	    cnt = cnt - 1;
+	 end
+	 rg_cnt <= cnt;
+      end
    endrule
 
    // ----------------
@@ -145,21 +182,21 @@ module mkCPU_StageD #(Bit #(4)  verbosity, MISA misa)
    endmethod
 
    method Action deq ();
-      f_data.deq;
+      pw_deq.send;
    endmethod
 
    // ---- Input
    method Action enq (Data_StageF_to_StageD  data);
-      f_data.enq (data);
+      rw_enq.wset (data);
       if (verbosity > 1)
 	 $display ("    CPU_StageD.enq (Data_StageF_to_StageD)");
    endmethod
 
    method Action set_full (Bool full);
-      if (! full) f_data.clear;
+      if (! full) pw_clear.send;
    endmethod
 
-   method Bool can_enq = f_data.notFull;
+   method Bool can_enq = (rg_cnt != 2);
 endmodule
 
 // ================================================================

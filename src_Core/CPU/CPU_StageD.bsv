@@ -56,6 +56,11 @@ interface CPU_StageD_IFC;
    (* always_ready *)
    method Action enq (Data_StageF_to_StageD  data_stageF_to_stageD);
 
+   // E28: StageF's output, offered every cycle (CPU.rl_stageD_feed).  The free
+   // ring slot loads it unconditionally; enq only advances the pointer/count.
+   (* always_ready *)
+   method Action stage (Data_StageF_to_StageD  data_stageF_to_stageD);
+
    // E14: set_full (False) flushes; set_full (True) is a no-op (occupancy is
    // the FIFO's).  can_enq is registered (the FIFO's notFull).
    (* always_ready *)
@@ -91,7 +96,12 @@ module mkCPU_StageD #(Bit #(4)  verbosity, MISA misa)
    Reg #(Bit #(1))  rg_wp  <- mkReg (0);
    Reg #(Bit #(1))  rg_rp  <- mkReg (0);
    Reg #(Bit #(2))  rg_cnt <- mkReg (0);
-   RWire #(Data_StageF_to_StageD) rw_enq   <- mkRWire;
+   PulseWire                      pw_enq   <- mkPulseWire;
+   // E28: the data flops' enable was WILL_FIRE_rl_front, i.e. the icache's
+   // combinational valid (rg_pc vs queue match) -> 73 CEs (19.4 ns at the 50 MHz
+   // constraint).  The slot at rg_wp holds nothing live while rg_cnt != 2, so it
+   // loads StageF's output every such cycle; the CE is then registers only.
+   Wire #(Data_StageF_to_StageD)  dw_stage <- mkDWire (?);
    PulseWire                      pw_deq   <- mkPulseWire;
    PulseWire                      pw_clear <- mkPulseWire;
 
@@ -125,8 +135,9 @@ module mkCPU_StageD #(Bit #(4)  verbosity, MISA misa)
       end
       else begin
 	 Bit #(2) cnt = rg_cnt;
-	 if (rw_enq.wget matches tagged Valid .d) begin
-	    vr_data [rg_wp] <= d;
+	 if (rg_cnt != 2)
+	    vr_data [rg_wp] <= dw_stage;
+	 if (pw_enq) begin
 	    rg_wp <= rg_wp + 1;
 	    cnt = cnt + 1;
 	 end
@@ -186,14 +197,19 @@ module mkCPU_StageD #(Bit #(4)  verbosity, MISA misa)
    endmethod
 
    // ---- Input
+   // E28: data arrives through stage(); this argument is the same value.
    method Action enq (Data_StageF_to_StageD  data);
-      rw_enq.wset (data);
+      pw_enq.send;
       if (verbosity > 1)
 	 $display ("    CPU_StageD.enq (Data_StageF_to_StageD)");
    endmethod
 
    method Action set_full (Bool full);
       if (! full) pw_clear.send;
+   endmethod
+
+   method Action stage (Data_StageF_to_StageD  data);
+      dw_stage <= data;
    endmethod
 
    method Bool can_enq = (rg_cnt != 2);

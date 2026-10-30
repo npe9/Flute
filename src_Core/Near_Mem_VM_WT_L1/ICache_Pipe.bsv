@@ -43,7 +43,9 @@ package ICache_Pipe;
 // Refills and device reads are never abandoned (E5 root cause: an
 // abandoned burst filled the NEXT request): a redirect during one marks
 // it stale; it completes, and the stream then restarts at the new target.
-// All registers are reset-initialized (STEP 5 X-fragility lesson).
+// Control registers are reset-initialized (STEP 5 X-fragility lesson);
+// E38b: data/address/tag registers read only under a reset valid bit,
+// count or state are not, to keep the reset net to control state.
 
 // ================================================================
 
@@ -190,7 +192,10 @@ module mkICache_Pipe (ICache_Pipe_IFC);
    // Everything below: sole writer rl_main.
    Reg #(IState) rg_st <- mkReg (ST_RUN);
 
-   Vector #(4, Reg #(RSlot)) ring <- replicateM (mkReg (RSlot { exc: False, d: 0 }));
+   // E38b: data/address/tag flops below are not reset: each is read only
+   // under a reset valid bit, count or state (rg_n, rg_s1_v, rg_s2_v, rg_st),
+   // so the reset net reaches control state only.
+   Vector #(4, Reg #(RSlot)) ring <- replicateM (mkRegU);
    Reg #(Bit #(2)) rg_head <- mkReg (0);
    Reg #(Bit #(2)) rg_tail <- mkReg (0);    // == rg_head + rg_n (mod 4)
    Reg #(Bit #(3)) rg_n    <- mkReg (0);    // entries queued, 0..4
@@ -202,15 +207,15 @@ module mkICache_Pipe (ICache_Pipe_IFC);
    Reg #(Bool)    rg_halt_exc <- mkReg (False);    // stream ended with a fault entry
 
    Reg #(Bool)    rg_s1_v <- mkReg (False);
-   Reg #(CW_Addr) rg_s1_a <- mkReg (0);
+   Reg #(CW_Addr) rg_s1_a <- mkRegU;
    Reg #(Bool)    rg_s2_v <- mkReg (False);
-   Reg #(CW_Addr) rg_s2_a <- mkReg (0);
-   Reg #(ITag_CSet)                     rg_s2_tags <- mkReg (replicate (ITag { state: CTAG_EMPTY, ctag: 0 }));
-   Reg #(Vector #(Ways_per_CSet, CWord)) rg_s2_data <- mkReg (replicate (0));
+   Reg #(CW_Addr) rg_s2_a <- mkRegU;
+   Reg #(ITag_CSet)                     rg_s2_tags <- mkRegU;
+   Reg #(Vector #(Ways_per_CSet, CWord)) rg_s2_data <- mkRegU;
 
    // Refill / device read
-   Reg #(CW_Addr)        rg_miss_a     <- mkReg (0);
-   Reg #(ITag_CSet)      rg_miss_tags  <- mkReg (replicate (ITag { state: CTAG_EMPTY, ctag: 0 }));
+   Reg #(CW_Addr)        rg_miss_a     <- mkRegU;
+   Reg #(ITag_CSet)      rg_miss_tags  <- mkRegU;
    Reg #(Way_in_CSet)    rg_miss_way   <- mkReg (0);
    Reg #(Way_in_CSet)    rg_victim     <- mkReg (0);
    Reg #(CWord_in_CLine) rg_beat       <- mkReg (0);

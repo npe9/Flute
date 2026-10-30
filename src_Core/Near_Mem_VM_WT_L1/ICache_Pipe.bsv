@@ -471,12 +471,16 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       Bool issue    = run && rg_want && (! flush_start)
                       && (redirect || ((! rg_halt_io) && (! rg_halt_exc) && credit));
       CW_Addr issue_a = (redirect ? w : rg_pf);
+      // E41: issue_a + 1 as a late select of two register increments; the
+      // adder was after the redirect decision (rg_pc -> presentation match
+      // -> redirect -> issue_a -> carry chain -> rg_pf, the E36 s3 path).
+      CW_Addr issue_a1 = (redirect ? w + 1 : rg_pf + 1);
       if (issue) begin
          WordXL ia = fn_cw_to_addr (issue_a);
          ram_state_and_ctag_cset.b.put (False, fn_Addr_to_CSet_in_Cache (ia), ?);
          ram_cword_set.b.put    (False, fn_Addr_to_CSet_CWord_in_Cache (ia), ?);
          ram_cword_set_w1.b.put (False, fn_Addr_to_CSet_CWord_in_Cache (ia), ?);
-         if (! p2_kill) pf_next = issue_a + 1;
+         if (! p2_kill) pf_next = issue_a1;
       end
 
       // ---- Device demand read: the wanted instruction needs exactly the

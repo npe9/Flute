@@ -243,6 +243,13 @@ module mkICache_Pipe (ICache_Pipe_IFC);
    Vector #(ITLB_N, Reg #(ITLBE)) vrg_itlb <- replicateM (mkReg (unpack (0)));
    Reg #(Bit #(3))   rg_itlb_rr  <- mkReg (0);
    Reg #(PA)         rg_pte_pa   <- mkReg (0);
+   // LX5: PTE reads are registered twice.  The level-1 PTE address is
+   // computed in RUN (rg_pf is stable while a walk is pending: issue is
+   // halted and S1/S2 are empty), and the PMP / PA-range verdict on
+   // rg_pte_pa is registered in the first REQ cycle (rg_pte_ok_v); the AR
+   // goes out in the second.  Was satp + va -> PMP -> f_ar in one cycle.
+   Reg #(Bool)       rg_pte_ok   <- mkRegU;
+   Reg #(Bool)       rg_pte_ok_v <- mkReg (False);
    Reg #(Bool)       rg_halt_walk <- mkReg (False);    // stream at an ITLB-miss cword
 
    // ----------------
@@ -384,9 +391,10 @@ module mkICache_Pipe (ICache_Pipe_IFC);
          else
             s1_xk = XK_MISS;
       end
-      if ((s1_xk == XK_OK) && (   (s1_ppn [21:20] != 0)
-                               || (! fv_pmp_ok (rg_pmp, s1_ppn, rg_priv, PMP_X))))
-         s1_xk = XK_AF;
+      // LX1: the PA-range and PMP checks moved to S2 (on the registered
+      // rg_s2_ppn): here they were serial after the ITLB lookup (ITLB CAM ->
+      // ppn mux -> PMP compares -> rg_s2_xk, 19.2 levels).  rg_pmp/rg_priv
+      // cannot change under S2: a PMP or priv change kills the pipe (ctx_kill).
 
       // ---- Flush / reset start.  A flush (FENCE.I) waits for RUN: refills/device reads finish
       // first.  A reset starts from any state but ST_FLUSH and abandons the fabric work in flight.
@@ -397,7 +405,9 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       PA       s2_pa  = fn_pa (rg_s2_ppn, rg_s2_a);
       CTag     s2_tag = fn_PA_to_CTag (s2_pa);
       Bool     s2_mem = soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (s2_pa));
-      Bool     s2_ok  = (rg_s2_xk == XK_OK);
+      Bool     s2_af  = (rg_s2_ppn [21:20] != 0) || (! fv_pmp_ok (rg_pmp, rg_s2_ppn, rg_priv, PMP_X));
+      XKind    s2_xk  = (((rg_s2_xk == XK_OK) && s2_af) ? XK_AF : rg_s2_xk);
+      Bool     s2_ok  = (s2_xk == XK_OK);
       Bool        hit     = False;
       Way_in_CSet hit_way = 0;
       for (Integer wy = 0; wy < ways_per_cset; wy = wy + 1)
@@ -408,8 +418,8 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       Bool s2_enq   = s2_live && s2_ok && s2_mem && hit;
       Bool s2_miss  = s2_live && s2_ok && s2_mem && (! hit);
       Bool s2_io    = s2_live && s2_ok && (! s2_mem);
-      Bool s2_walk  = s2_live && (rg_s2_xk == XK_MISS);
-      Bool s2_fault = s2_live && ((rg_s2_xk == XK_PF) || (rg_s2_xk == XK_AF));
+      Bool s2_walk  = s2_live && (s2_xk == XK_MISS);
+      Bool s2_fault = s2_live && ((s2_xk == XK_PF) || (s2_xk == XK_AF));
       Bool p2_kill  = s2_miss || s2_io || s2_walk || s2_fault;
 
       // ---- Queue next state: clear / pop, then enqueue at the tail
@@ -427,7 +437,7 @@ module mkICache_Pipe (ICache_Pipe_IFC);
          m_enq = tagged Valid (QEnt { v: True, a: rg_s2_a, exc: False, pf: False, d: d });
       end
       if (s2_fault)
-         m_enq = tagged Valid (QEnt { v: True, a: rg_s2_a, exc: True, pf: (rg_s2_xk == XK_PF), d: 0 });
+         m_enq = tagged Valid (QEnt { v: True, a: rg_s2_a, exc: True, pf: (s2_xk == XK_PF), d: 0 });
 
       // ---- Device read / refill completion (may also enqueue)
       Bool drop = rg_stale || kill;
@@ -538,11 +548,14 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       end
 
       // PTE read requests (PMP: S-mode read; PA[33:32] must be 0)
-      if (((rg_st == ST_PTW1_REQ) || (rg_st == ST_PTW0_REQ)) && rg_ddr4_ready && f_ar.notFull && (! kill)) begin
-         PA pte_pa = ((rg_st == ST_PTW1_REQ)
-                      ? ({ rg_satp [21:0], 12'b0 } + zeroExtend ({ walk_va [31:22], 2'b0 }))
-                      : rg_pte_pa);
-         if ((pte_pa [33:32] != 0) || (! fv_pmp_ok (rg_pmp, fv_pa_page (pte_pa), s_Priv_Mode, PMP_R))) begin
+      Bool pte_req = ((rg_st == ST_PTW1_REQ) || (rg_st == ST_PTW0_REQ));
+      if (rg_st == ST_RUN)
+         rg_pte_pa <= { rg_satp [21:0], 12'b0 } + zeroExtend ({ walk_va [31:22], 2'b0 });
+      rg_pte_ok   <= ((rg_pte_pa [33:32] == 0) && fv_pmp_ok (rg_pmp, fv_pa_page (rg_pte_pa), s_Priv_Mode, PMP_R));
+      rg_pte_ok_v <= pte_req;
+      if (pte_req && rg_pte_ok_v && rg_ddr4_ready && f_ar.notFull && (! kill)) begin
+         PA pte_pa = rg_pte_pa;
+         if (! rg_pte_ok) begin
             walk_fault = tagged Valid False;
             walk_done  = True;
             st_next    = ST_RUN;
@@ -560,7 +573,6 @@ module mkICache_Pipe (ICache_Pipe_IFC);
                                     arregion: fabric_default_region,
                                     aruser:   fabric_default_user };
             f_ar.enq (ar);
-            rg_pte_pa <= pte_pa;
             st_next = ((rg_st == ST_PTW1_REQ) ? ST_PTW1_RSP : ST_PTW0_RSP);
          end
       end

@@ -209,6 +209,7 @@ typedef enum {MODULE_PRERESET,              // After power on reset, before soft
               CACHE_AMO_EXEC,               // E12: AMO hit captured at probe; ALU here
               CACHE_AMO_WRITE,              // E23: cache + fabric write of the registered AMO result
               CACHE_ST_AMO_RSP,             // Provide ST/SC/AMO response
+              CACHE_LD_RSP,                 // E25: provide a hit-LD / LR / SC-fail response from registers
 
               IO_REQ,                       // For memory-mapped I/O requests
               IO_AWAITING_READ_RSP,         // No caching
@@ -609,6 +610,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 			 // the fabric there.  Counting them as busy deadlocks the
 			 // pipeline after the first store (E8a: 'T' then hang).
 			 && (rg_state != CACHE_ST_AMO_RSP)
+			 && (rg_state != CACHE_LD_RSP)    // E25: a hold state too
 			 && (rg_state != IO_READ_RSP));
    endrule
 
@@ -807,14 +809,17 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // ----------------------------------------------------------------
    // Functions to drive read-responses (outputs)
 
-   // Memory-read responses
+   // Memory-read responses (probe-cycle hits: LD, LR, SC fail).
+   // E25: registered.  The probe stores the load value and moves to CACHE_LD_RSP;
+   // rl_LD_response drives dw_valid / dw_output_* from registers next cycle, as
+   // rl_ST_AMO_response does for stores.  The hit was decided combinationally from the
+   // tag compare and fanned out through Stage2's status into every rl_pipe move (the
+   // 20-21 ns family at the 50 MHz constraint).  +1 cycle per hit load.
    function Action fa_drive_mem_rsp (Bit #(3) f3, Addr addr, Bit #(64) ld_val, Bit #(64) st_amo_val);
       action
-	 dw_valid             <= True;
-	 // Value loaded into rd (LOAD, LR, AMO, SC success/fail result)
-	 dw_output_ld_val     <= (is_AMO_SC ? ld_val : fn_extract_and_extend_bytes (f3, addr, ld_val));
-	 // Value stored into mem (STORE, SC, AMO final value stored)
-	 dw_output_st_amo_val <= st_amo_val;
+	 // Value loaded into rd (LOAD, LR, SC success/fail result)
+	 rg_ld_val <= (is_AMO_SC ? ld_val : fn_extract_and_extend_bytes (f3, addr, ld_val));
+	 rg_state  <= CACHE_LD_RSP;
 	 if (cfg_verbosity > 1)
 	    $display ("%0d: %s.drive_mem_rsp: addr 0x%0h ld_val 0x%0h st_amo_val 0x%0h",
 		      cur_cycle, d_or_i, addr, ld_val, st_amo_val);
@@ -1234,8 +1239,9 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 		     $display ("        => rl_write_response");
 	       end
 	       else begin // do_write == False
-		  // SC fail
-		  fa_drive_mem_rsp (rg_f3, rg_addr, 1, 0);
+		  // SC fail.  E25: rg_ld_val already holds the SC result (1) from above;
+		  // respond from it next cycle.
+		  rg_state <= CACHE_LD_RSP;
 		  if (cfg_verbosity > 1)
 		     $display ("        AMO SC: Fail response for addr 0x%0h", rg_addr);
 	       end
@@ -1860,6 +1866,20 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       rg_state      <= CACHE_ST_AMO_RSP;
    endrule
 `endif
+
+   // ----------------------------------------------------------------
+   // E25: provide a registered hit-LD / LR / SC-fail response.
+   // Stays in this state until the CPU's next request (same exit as rl_ST_AMO_response).
+
+   rule rl_LD_response (rg_state == CACHE_LD_RSP);
+      if (rg_kill_echo)
+	 rg_state <= MODULE_READY;
+      else begin
+	 dw_valid             <= True;
+	 dw_output_ld_val     <= rg_ld_val;
+	 dw_output_st_amo_val <= 0;
+      end
+   endrule
 
    // ----------------------------------------------------------------
    // Provide write-response (ST op)

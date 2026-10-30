@@ -412,6 +412,28 @@ function Tuple2 #(Bit #(64),
 					  Bit #(7)   funct7,
 					  Bit #(64)  w1_extracted,
 					  Bit #(64)  st_val);
+`ifdef RV32
+   // E27: RV32 has only .W AMOs (.D is decoded as illegal), so the ALU is 32 bits wide.
+   // The 64-bit form below kept 64-bit add / compare carry chains in the
+   // rl_amo_exec -> rg_st_amo_val cone (main's deepest by LUT levels at 50 MHz).
+   Bit #(32) v1 = w1_extracted [31:0];
+   Bit #(32) v2 = st_val [31:0];
+   Int #(32) j1 = unpack (v1);
+   Int #(32) j2 = unpack (v2);
+   Bit #(32) r  = ?;
+   case (funct7 [6:2])
+      f5_AMO_SWAP: r = v2;
+      f5_AMO_ADD:  r = pack (j1 + j2);
+      f5_AMO_XOR:  r = v1 ^ v2;
+      f5_AMO_AND:  r = v1 & v2;
+      f5_AMO_OR:   r = v1 | v2;
+      f5_AMO_MINU: r = ((v1 < v2) ? v1 : v2);
+      f5_AMO_MAXU: r = ((v1 > v2) ? v1 : v2);
+      f5_AMO_MIN:  r = ((j1 < j2) ? v1 : v2);
+      f5_AMO_MAX:  r = ((j1 > j2) ? v1 : v2);
+   endcase
+   return tuple2 (signExtend (v1), zeroExtend (r));
+`else
    Bit #(64) w1     = w1_extracted;
    Bit #(64) w2     = st_val;
    Int #(64) i1     = unpack (w1);    // Signed, for signed ops
@@ -441,6 +463,7 @@ function Tuple2 #(Bit #(64),
       new_st_val = zeroExtend (new_st_val [31:0]);
 
    return tuple2 (truncate (pack (i1)), new_st_val);
+`endif
 endfunction: fv_amo_op_x
 
 // ================================================================

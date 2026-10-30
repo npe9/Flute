@@ -50,7 +50,7 @@ endinterface
 
 // ================================================================
 
-typedef enum { STATE_MUL1, STATE_MUL2, STATE_DIV_REM } State
+typedef enum { STATE_MUL1, STATE_MUL2, STATE_DIV_REM, STATE_MULS } State
 deriving (Bits, Eq, FShow);
 
 (* synthesize *)
@@ -75,7 +75,11 @@ module mkRISCV_MBox (RISCV_MBox_IFC);
    Reg #(Int #(33))  rg_ma   <- mkRegU;
    Reg #(Int #(33))  rg_mb   <- mkRegU;
    Reg #(Bool)       rg_mhi  <- mkRegU;
-   Reg #(Bit #(64))  rg_prod <- mkRegU;
+   // E39: the 18x18 DSP partial products, registered: al*bl and ah*bh
+   // do not overlap (al*bl < 2^34), so they are one concatenated word;
+   // the cross terms are summed as they leave the DSPs.
+   Reg #(Bit #(64))  rg_pcat <- mkRegU;
+   Reg #(Int #(37))  rg_pm   <- mkRegU;
 `endif
 `endif
 
@@ -92,6 +96,20 @@ module mkRISCV_MBox (RISCV_MBox_IFC);
    Reg #(Bool)    dw_valid  <- mkDWire (False);
    Reg #(WordXL)  dw_result <- mkDWire (?);
 
+   // E39: the response comes from registers.  It was dw_valid/dw_result,
+   // i.e. rg_state decode + hi/lo or quotient/remainder select, which
+   // feed Stage2's bypass and then Stage1's operand -> adder -> stage2
+   // register path (the deepest cone, 15 levels).
+   Reg #(Bool)    rg_valid  <- mkReg (False);
+   Reg #(WordXL)  rg_word   <- mkRegU;
+
+   // Any combinational result (DIV/REM; MUL in other configurations)
+   // lands here one cycle later.
+   rule rl_capture (dw_valid && (! rg_valid));
+      rg_valid <= True;
+      rg_word  <= dw_result;
+   endrule
+
    // ----------------------------------------------------------------
    // MUL family: SYNTH implementation
    // Relies on the fav_MUL/MULH/MULHU/MULHSU/MULW functions later in
@@ -102,15 +120,33 @@ module mkRISCV_MBox (RISCV_MBox_IFC);
 `ifdef MULT_SYNTH
 `ifdef RV32
 
+   // E39: the product was DSPs -> LUT adder tree -> rg_prod in one cycle
+   // (16.5 levels with carry chains, a 54.6 MHz critical path).  Split
+   // a = ah * 2^17 + al (al unsigned 17 bits, ah signed 16 bits), same for
+   // b: each partial product is one MULT18X18D, registered here; rl_mul_sum
+   // adds them next cycle.  One more cycle per MUL.
    rule rl_mul (rg_state == STATE_MUL1);
-      Int #(66) p = signExtend (rg_ma) * signExtend (rg_mb);
-      rg_prod  <= truncate (pack (p));
-      rg_state <= STATE_MUL2;
+      Bit #(33) a = pack (rg_ma);
+      Bit #(33) b = pack (rg_mb);
+      Int #(18) al = unpack ({ 1'b0, a [16:0] });
+      Int #(18) bl = unpack ({ 1'b0, b [16:0] });
+      Int #(18) ah = signExtend (Int #(16) ' (unpack (a [32:17])));
+      Int #(18) bh = signExtend (Int #(16) ' (unpack (b [32:17])));
+      Int #(36) pll = signedMul (al, bl);
+      Int #(36) plh = signedMul (al, bh);
+      Int #(36) phl = signedMul (ah, bl);
+      Int #(36) phh = signedMul (ah, bh);
+      rg_pcat  <= { pack (phh) [29:0], pack (pll) [33:0] };
+      rg_pm    <= signExtend (plh) + signExtend (phl);
+      rg_state <= STATE_MULS;
    endrule
 
-   rule rl_mul2 (rg_state == STATE_MUL2);
-      dw_valid  <= True;
-      dw_result <= (rg_mhi ? rg_prod [63:32] : rg_prod [31:0]);
+   rule rl_mul_sum (rg_state == STATE_MULS);
+      Int #(64) pm = signExtend (rg_pm);
+      Bit #(64) p  = rg_pcat + pack (pm << 17);
+      rg_word  <= (rg_mhi ? p [63:32] : p [31:0]);
+      rg_valid <= True;
+      rg_state <= STATE_MUL2;
    endrule
 
 `else
@@ -238,6 +274,7 @@ module mkRISCV_MBox (RISCV_MBox_IFC);
       rg_f3              <= f3;
       rg_v1              <= v1;
       rg_v2              <= v2;
+      rg_valid           <= False;
 
       // MUL, MULH, MULHU, MULHSU
       if (f3 [2] == 1'b0) begin
@@ -299,11 +336,11 @@ module mkRISCV_MBox (RISCV_MBox_IFC);
 
    // MBox interface: response
    method Bool  valid;
-      return dw_valid;
+      return rg_valid;
    endmethod
 
    method WordXL  word;
-      return dw_result;
+      return rg_word;
    endmethod
 endmodule
 

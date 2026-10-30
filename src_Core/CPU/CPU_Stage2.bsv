@@ -163,6 +163,20 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 
 `ifdef ISA_M
    RISCV_MBox_IFC mbox <- mkRISCV_MBox;
+
+   // E26: deferred MBox launch (same idea as RLD-4's f_dreq_pending).  fa_enq
+   // only raises a pending flag; rl_launch_mbox calls mbox.req one cycle later
+   // from the registered rg_stage2.  This takes the MBox operand/state enables
+   // out of the rl_pipe move chain (dcache/stage2 status -> stage2_rg_full ->
+   // stage1->2 move -> mbox.rg_v1 CE, 19.5 ns at the 50 MHz constraint).
+   // +1 cycle per M op.  The flag is set/cleared through pulse wires and one
+   // fire_when_enabled update rule (set wins), so rl_pipe and rl_launch_mbox
+   // are not ordered against each other through it.  While pending, the M-op
+   // status is BUSY: MBox keeps driving valid for the PREVIOUS op until req.
+   Reg #(Bool)  rg_mbox_pending <- mkReg (False);
+   PulseWire    pw_mbox_set     <- mkPulseWire;
+   PulseWire    pw_mbox_clr     <- mkPulseWire;
+   PulseWire    pw_mbox_rst     <- mkPulseWire;    // separate wire: one writer per PulseWire
 `endif
 
    // ----------------
@@ -235,6 +249,9 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
       rg_full <= False;
       rg_resetting <= True;
       f_dreq_pending.clear;
+`ifdef ISA_M
+      pw_mbox_rst.send;    // E26
+`endif
 `ifdef ISA_F
       fbox.server_reset.request.put (?);
 `endif
@@ -503,7 +520,7 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
       // ----------------
       // Path: integer multiply/divide
       else if (rg_stage2.op_stage2 == OP_Stage2_M) begin
-	 let ostatus = ((! mbox.valid) ? OSTATUS_BUSY : OSTATUS_PIPE);
+	 let ostatus = (((! mbox.valid) || rg_mbox_pending) ? OSTATUS_BUSY : OSTATUS_PIPE);
 
 	 let result = mbox.word;
 
@@ -686,8 +703,8 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 	 // If MBox op, initiate it
 	 else if (x.op_stage2 == OP_Stage2_M) begin
             // Instr fields required for decode for F/D opcodes
-	    Bool is_OP_not_OP_32 = (x.instr [3] == 1'b0);
-            mbox.req (is_OP_not_OP_32, funct3, x.val1, x.val2);
+	    // E26: launched by rl_launch_mbox next cycle from rg_stage2.
+	    pw_mbox_set.send;
 	 end
 `endif
 
@@ -778,6 +795,27 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 		     s.satp);
       end
    endrule
+
+`ifdef ISA_M
+   // ----------------------------------------------------------------
+   // E26: deferred MBox launch.  A launch for an op flushed from stage2 in the
+   // meantime is harmless: the next M op's req overwrites MBox state, and its
+   // status stays BUSY until its own launch.
+
+   (* fire_when_enabled *)
+   rule rl_launch_mbox (rg_mbox_pending);
+      pw_mbox_clr.send;
+      let x = rg_stage2;
+      Bool is_OP_not_OP_32 = (x.instr [3] == 1'b0);
+      mbox.req (is_OP_not_OP_32, instr_funct3 (x.instr), x.val1, x.val2);
+   endrule
+
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_mbox_pending_update;
+      if (pw_mbox_set)      rg_mbox_pending <= True;
+      else if (pw_mbox_clr || pw_mbox_rst) rg_mbox_pending <= False;
+   endrule
+`endif
 
    // ----------------------------------------------------------------
    // INTERFACE

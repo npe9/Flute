@@ -303,8 +303,8 @@ module mkICache_Pipe (ICache_Pipe_IFC);
 
       // E32: take the parcel at o from both candidate entries (registers
       // only) and let the late match select last.
-      Bit #(16) p0_e0 = fn_parcel (e0.d, o);
-      Bit #(16) p0_e1 = fn_parcel (e1.d, o);
+      Bit #(16) p0_e0 = fn_parcel (q [0].d, o);
+      Bit #(16) p0_e1 = fn_parcel (q [1].d, o);
       Bit #(16) p0    = (m0 ? p0_e0 : p0_e1);
       Bool      is32 = (p0 [1:0] == 2'b11);
       Bool      strad = is32 && (o == 2'b11);

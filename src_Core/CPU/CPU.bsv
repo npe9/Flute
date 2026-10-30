@@ -879,7 +879,7 @@ module mkCPU (CPU_IFC);
 			 && (   (stage1.out.ostatus == OSTATUS_PIPE)
 			     || (stage1.out.ostatus == OSTATUS_NONPIPE))
 			 && (   (! stage1.out.redirect)
-			     || (stageF.out.ostatus != OSTATUS_BUSY))
+			     || stageF.not_busy)
 			 && (stage2.out.ostatus == OSTATUS_EMPTY)
 			 && (stage3.out.ostatus == OSTATUS_EMPTY));
 
@@ -903,7 +903,7 @@ module mkCPU (CPU_IFC);
 `ifdef INCLUDE_GDB_CONTROL
 	 if (   stage1_has_arch_instr
 	    && (   (! stage1.out.redirect)
-		|| (stageF.out.ostatus != OSTATUS_BUSY))
+		|| (stageF.out.ostatus != OSTATUS_BUSY))    // E29: live status (exact step marking)
 	    && csr_regfile.read_dcsr_step
 	    && (rg_step_count == 0)) begin
 
@@ -1166,7 +1166,7 @@ module mkCPU (CPU_IFC);
 			&& (stage1.out.ostatus == OSTATUS_NONPIPE)
 			&& (stage1.out.control == CONTROL_TRAP)
 			&& (! break_into_Debug_Mode)
-			&& (stageF.out.ostatus != OSTATUS_BUSY));
+			&& stageF.not_busy);
       if (cur_verbosity > 1) $display ("%0d: %m.rl_stage1_trap", mcycle);
 
       // Just save relevant info and handle in next clock
@@ -1190,7 +1190,7 @@ module mkCPU (CPU_IFC);
    // Traps
 
    rule rl_trap ((rg_state == CPU_TRAP)
-		 && (stageF.out.ostatus != OSTATUS_BUSY));
+		 && stageF.not_busy);
       let epc          = rg_trap_info.epc;
       let exc_code     = rg_trap_info.exc_code;
       let tval         = rg_trap_info.tval;
@@ -1579,7 +1579,7 @@ module mkCPU (CPU_IFC);
    // waiting for stageF to be non-busy (servicing a previous request)
 
    rule rl_stage1_restart_after_csrrx (   (rg_state == CPU_CSRRX_RESTART)
-				       && (stageF.out.ostatus != OSTATUS_BUSY));
+				       && stageF.not_busy);
       if (cur_verbosity > 1)
 	 $display ("%0d: %m.rl_stage1_restart_after_csrrx", mcycle);
 
@@ -1601,7 +1601,7 @@ module mkCPU (CPU_IFC);
 			&& (   (stage1.out.control == CONTROL_MRET)
 			    || (stage1.out.control == CONTROL_SRET)
 			    || (stage1.out.control == CONTROL_URET))
-			&& (stageF.out.ostatus != OSTATUS_BUSY));
+			&& stageF.not_busy);
       if (cur_verbosity > 1) $display ("%0d: %m.rl_stage1_xRET", mcycle);
 
       // Return-from-exception actions on CSRs
@@ -1670,7 +1670,7 @@ module mkCPU (CPU_IFC);
 			   && (stage2.out.ostatus == OSTATUS_EMPTY)
 			   && (stage1.out.ostatus == OSTATUS_NONPIPE)
 			   && (stage1.out.control == CONTROL_FENCE_I)
-			   && (stageF.out.ostatus != OSTATUS_BUSY));
+			   && stageF.not_busy);
       if (cur_verbosity > 1) $display ("%0d: %m.rl_stage1_FENCE_I", mcycle);
 
       // Save stage1.out.next_pc since it can be destroyed by FENCE.I op
@@ -1724,7 +1724,7 @@ module mkCPU (CPU_IFC);
 			 && (stage2.out.ostatus == OSTATUS_EMPTY)
 			 && (stage1.out.ostatus == OSTATUS_NONPIPE)
 			 && (stage1.out.control == CONTROL_FENCE)
-			 && (stageF.out.ostatus != OSTATUS_BUSY));
+			 && stageF.not_busy);
       if (cur_verbosity > 1) $display ("%0d: %m.rl_stage1_FENCE", mcycle);
 
       // Save stage1.out.next_pc since it can be destroyed by FENCE op
@@ -1780,7 +1780,7 @@ module mkCPU (CPU_IFC);
 			      && (stage2.out.ostatus == OSTATUS_EMPTY)
 			      && (stage1.out.ostatus == OSTATUS_NONPIPE)
 			      && (stage1.out.control == CONTROL_SFENCE_VMA)
-			      && (stageF.out.ostatus != OSTATUS_BUSY));
+			      && stageF.not_busy);
       if (cur_verbosity > 1) $display ("%0d: %m.rl_stage1_SFENCE_VMA", mcycle);
 
       // Save stage1.out.next_pc since it can be destroyed by FENCE op
@@ -1838,7 +1838,7 @@ module mkCPU (CPU_IFC);
 		       && (stage2.out.ostatus == OSTATUS_EMPTY)
 		       && (stage1.out.ostatus == OSTATUS_NONPIPE)
 		       && (stage1.out.control == CONTROL_WFI)
-		       && (stageF.out.ostatus != OSTATUS_BUSY));
+		       && stageF.not_busy);
 
       rg_next_pc     <= stage1.out.next_pc;
 `ifdef RVFI_DII
@@ -1896,7 +1896,7 @@ module mkCPU (CPU_IFC);
    rule rl_WFI_resume (   (rg_state == CPU_WFI_PAUSED)
 		       && (   rg_wfi_resume
 			   || stop_step_req)
-		       && (stageF.out.ostatus != OSTATUS_BUSY));
+		       && stageF.not_busy);
       if (cur_verbosity > 1)
 	 $display ("%0d: CPU: rl_WFI_resume after waiting %0d cycles", mcycle, rg_wfi_counter);
 
@@ -1920,7 +1920,7 @@ module mkCPU (CPU_IFC);
    // paths from stage2 and stage3 status to IFetch
 
    rule rl_trap_fetch ((rg_state == CPU_START_TRAP_HANDLER)
-		       && (stageF.out.ostatus != OSTATUS_BUSY));
+		       && stageF.not_busy);
       stageD.set_full (False);
       fa_stageF_redirect (rg_next_pc);
    endrule: rl_trap_fetch
@@ -1938,7 +1938,7 @@ module mkCPU (CPU_IFC);
 				     && (stage2.out.ostatus == OSTATUS_EMPTY)
 				     && (stage1.out.ostatus == OSTATUS_NONPIPE)
 				     && (stage1.out.control == CONTROL_TRAP)
-				     && (stageF.out.ostatus != OSTATUS_BUSY)
+				     && stageF.not_busy
 				     && break_into_Debug_Mode);
       if (cur_verbosity > 1) $display ("%0d: %m.rl_trap_BREAK_to_Debug_Mode", mcycle);
 
@@ -2000,7 +2000,7 @@ module mkCPU (CPU_IFC);
    rule rl_stage1_interrupt (interrupt_pending
 			     && (rg_state == CPU_RUNNING)
 			     && stage1_take_interrupt
-			     && (stageF.out.ostatus != OSTATUS_BUSY));
+			     && stageF.not_busy);
       if (cur_verbosity > 1) $display ("%0d: %m.rl_stage1_interrupt", mcycle);
 
       // Just save relevant info and handle in next clock
@@ -2037,7 +2037,7 @@ module mkCPU (CPU_IFC);
    (* descending_urgency = "rl_front, rl_stage1_stop" *)
    rule rl_stage1_stop (   (rg_state== CPU_RUNNING)
 			&& stage1_stop
-			&& (stageF.out.ostatus != OSTATUS_BUSY));
+			&& stageF.not_busy);
       if (cur_verbosity > 1) $display ("%0d: %m.rl_stage1_stop", mcycle);
 
       let pc    = stage1.out.data_to_stage2.pc;    // We'll retry this instruction on 'continue'

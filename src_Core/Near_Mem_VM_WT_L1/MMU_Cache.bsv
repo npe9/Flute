@@ -200,6 +200,7 @@ typedef enum {MODULE_PRERESET,              // After power on reset, before soft
               MODULE_RUNNING,               // Normal operation, during hits
               MODULE_EXCEPTION_RSP,         // On misaligned and access exceptions
               UDTLB_FILL,                   // uDTLB miss: translate, check, fill (slow path)
+              UDTLB_FILL2,                  // LX6: decide and write from UDTLB_FILL's registered verdicts
 
               PTW_START,                    // On TLB miss, initiate refill of PTE into TLB
 `ifdef RV64
@@ -889,6 +890,45 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    Reg #(Bool)        rg_udtlb_tlb_seen <- mkReg (False);
    Reg #(Bool)        rg_udtlb_bypass   <- mkReg (False);    // this req: use rg_pa (partial memory page)
 
+   // LX2: the fill translates from the TLB lookup registered one cycle
+   // earlier (the probe cycle that missed, same rg_addr / rg_satp), with the
+   // invalidation seqs captured alongside it: a context / PMP / SFENCE.VMA
+   // change in between leaves the filled entry stale, and the next probe
+   // misses and refills.  Splits TLB CAM -> xlate -> PMP -> entry in two.
+`ifdef ISA_PRIV_S
+   Reg #(TLB_Lookup_Result) rg_tlb_result <- mkConfigRegU;
+`endif
+   Reg #(Bool)        rg_udtlb_ctx_cap  <- mkConfigRegU;
+   Reg #(Bool)        rg_udtlb_pmp_cap  <- mkConfigRegU;
+   Reg #(Bool)        rg_udtlb_tlb_cap  <- mkConfigRegU;
+
+   // The lookup is unavailable while the TLB flushes; rg_tlb_cap_ok says
+   // the capture fired last cycle.  The fill waits for a capture with no
+   // SFENCE.VMA since (a stale translation could otherwise reach IO_REQ or
+   // an exception, paths the seqs do not guard).
+   PulseWire          pw_tlb_cap        <- mkPulseWire;
+   Reg #(Bool)        rg_tlb_cap_ok     <- mkReg (False);
+
+   (* fire_when_enabled *)
+   rule rl_udtlb_capture;
+`ifdef ISA_PRIV_S
+      rg_tlb_result <= tlb_result;
+`endif
+      rg_udtlb_ctx_cap <= rg_udtlb_ctx_seq;
+      rg_udtlb_pmp_cap <= rg_udtlb_pmp_seq;
+      rg_udtlb_tlb_cap <= rg_udtlb_tlb_seq;
+      pw_tlb_cap.send;
+   endrule
+
+   // ConfigRegs: the fill reads the captures but must also follow the
+   // capture (tlb.lookup < tlb.insert); plain regs made the two conflict.
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_udtlb_capture_ok;
+      rg_tlb_cap_ok <= pw_tlb_cap;
+   endrule
+
+   Bool udtlb_cap_valid = (rg_tlb_cap_ok && (rg_udtlb_tlb_cap == rg_udtlb_tlb_seq));
+
    Bool udtlb_fresh = (   (rg_udtlb_ctx_seq == rg_udtlb_ctx_seen)
 		       && (rg_udtlb_pmp_seq == rg_udtlb_pmp_seen)
 		       && (rg_udtlb_tlb_seq == rg_udtlb_tlb_seen));
@@ -909,6 +949,30 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    for (Integer i = 0; i < valueOf (UDTLB_Size); i = i + 1)
       udtlb_ppn = udtlb_ppn | (udtlb_matches [i] ? vrg_udtlb [i].ppn : 0);
    PA        udtlb_pa  = (rg_udtlb_bypass ? rg_pa : { udtlb_ppn, rg_addr [11:0] });
+
+   // LX4: the probe's tag compare runs against every entry's PPN (and
+   // rg_pa for a bypass) in parallel, then ORs with the VPN matches, so the
+   // uDTLB PPN mux is off the hit -> load-value path.  Matching entries of
+   // one fresh period share a translation (duplicates differ only in ok_*),
+   // so the OR equals the compare against udtlb_pa.
+   function Tuple3 #(Bool, Way_in_CSet, Bit #(64)) fn_test_cache_hit_udtlb;
+      Bool        hit     = False;
+      Way_in_CSet way_hit = 0;
+      CWord       cword   = 0;
+      for (Integer way = 0; way < ways_per_cset; way = way + 1) begin
+	 let ctag = state_and_ctag_cset [way].ctag;
+	 Bool tag_hit = (rg_udtlb_bypass && (ctag == fn_PA_to_CTag (rg_pa)));
+	 for (Integer i = 0; i < valueOf (UDTLB_Size); i = i + 1) begin
+	    PA pa_i = { vrg_udtlb [i].ppn, rg_addr [11:0] };
+	    tag_hit = tag_hit || ((! rg_udtlb_bypass) && udtlb_matches [i] && (ctag == fn_PA_to_CTag (pa_i)));
+	 end
+	 let hit_at_way = ((state_and_ctag_cset [way].state != CTAG_EMPTY) && tag_hit);
+	 hit = hit || hit_at_way;
+	 if (hit_at_way) way_hit = fromInteger (way);
+	 cword = (cword | (cword_set [way] & pack (replicate (hit_at_way))));
+      end
+      return tuple3 (hit, way_hit, cword);
+   endfunction
 
    // ----------------------------------------------------------------
    // Functions to drive read-responses (outputs)
@@ -1213,8 +1277,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	 // Memory requests (an entry exists only for a memory page)
 	 else begin
 	    // Compute cache hit/miss. If hit, also compute Way_in_CSet and Word64
-	    let pa_ctag = fn_PA_to_CTag (pa);
-	    match { .hit, .way_hit, .word64 } <- fn_test_cache_hit_or_miss (pa_ctag);
+	    match { .hit, .way_hit, .word64 } = fn_test_cache_hit_udtlb;
 
 	    // ----------------
 	    // Memory LD and AMO_LR
@@ -1382,10 +1445,23 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // runs again as a uDTLB hit (the captured RAM outputs are unchanged: no
    // RAM read is launched here, and rg_age_seen == rg_req_seq still holds).
 
-`ifdef ISA_PRIV_S
-   (* descending_urgency = "rl_udtlb_fill, rl_writeback_updated_PTE" *)
-`endif
-   rule rl_udtlb_fill (rg_state == UDTLB_FILL);
+   // LX6: the fill is two cycles.  UDTLB_FILL translates and registers
+   // every PMP / PMA / PTE verdict (rg_fx_*); UDTLB_FILL2 decides and
+   // writes.  One cycle it was rg_tlb_result -> xlate -> PA -> PMP compares
+   // -> outcome -> uDTLB / rg_state / rg_lrsc enables (the lx4 critical
+   // path, 24 ns).  FILL2 redoes the fill when an SFENCE.VMA landed between.
+   Reg #(VM_Xlate_Result) rg_fx_xlate    <- mkRegU;
+   Reg #(Bool)            rg_fx_mem_addr <- mkRegU;
+   Reg #(Bool)            rg_fx_io_addr  <- mkRegU;
+   Reg #(Bool)            rg_fx_mem_page <- mkRegU;
+   Reg #(Bool)            rg_fx_pmp_ok   <- mkRegU;
+   Reg #(Bool)            rg_fx_pmp_r    <- mkRegU;
+   Reg #(Bool)            rg_fx_pmp_w    <- mkRegU;
+   Reg #(Bool)            rg_fx_pmp_rw   <- mkRegU;
+   Reg #(Bool)            rg_fx_pte_ld   <- mkRegU;
+   Reg #(Bool)            rg_fx_pte_st   <- mkRegU;
+
+   rule rl_udtlb_fill ((rg_state == UDTLB_FILL) && udtlb_cap_valid);
       if (rg_kill_echo) begin
 	 // RLD-4: stale op; exit (see rl_ST_AMO_response).
 	 rg_state <= MODULE_READY;
@@ -1394,7 +1470,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 `ifdef ISA_PRIV_S
       VM_Xlate_Result vm_xlate_result <- fav_vm_xlate (rg_addr,
 						       rg_satp,
-						       tlb_result,
+						       rg_tlb_result,
 						       dmem_not_imem,
 						       ((rg_op == CACHE_LD) || is_AMO_LR),
 						       rg_priv,
@@ -1407,8 +1483,56 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 							 exc_code:     ?};
 `endif
 
+      PA   pa   = vm_xlate_result.pa;
+      let  page = fv_pa_page (pa);
+      PA   pa_pg_lo = (pa & (~ 'hFFF));
+      PA   pa_pg_hi = (pa | 'hFFF);
+      Bool pte_ld = True;
+      Bool pte_st = True;
+`ifdef ISA_PRIV_S
+`ifdef RV32
+      Bool xlate = ((rg_priv <= s_Priv_Mode) && (vm_mode == satp_mode_RV32_sv32));
+`else
+      Bool xlate = ((rg_priv <= s_Priv_Mode) && (vm_mode == satp_mode_RV64_sv39));
+`endif
+      if (xlate) begin
+	 PTE pte = vm_xlate_result.pte;
+	 pte_ld = (   (! is_pte_denial (dmem_not_imem, True,  rg_priv, rg_sstatus_SUM, rg_mstatus_MXR, pte))
+		   && (! is_pte_A_D_fault (True,  pte)));
+	 pte_st = (   (! is_pte_denial (dmem_not_imem, False, rg_priv, rg_sstatus_SUM, rg_mstatus_MXR, pte))
+		   && (! is_pte_A_D_fault (False, pte)));
+      end
+`endif
+      rg_fx_xlate    <= vm_xlate_result;
+      rg_fx_mem_addr <= soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (pa));
+      rg_fx_io_addr  <= soc_map.m_is_IO_addr  (fn_PA_to_Fabric_Addr (pa));
+      rg_fx_mem_page <= (   soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (pa_pg_lo))
+			 && soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (pa_pg_hi)));
+      rg_fx_pmp_ok   <= fv_pmp_ok (rg_pmp, page, rg_priv, pmp_acc);
+      rg_fx_pmp_r    <= fv_pmp_ok (rg_pmp, page, rg_priv, PMP_R);
+      rg_fx_pmp_w    <= fv_pmp_ok (rg_pmp, page, rg_priv, PMP_W);
+      rg_fx_pmp_rw   <= fv_pmp_ok (rg_pmp, page, rg_priv, PMP_RW);
+      rg_fx_pte_ld   <= pte_ld;
+      rg_fx_pte_st   <= pte_st;
+      rg_state       <= UDTLB_FILL2;
+      end
+   endrule
+
+`ifdef ISA_PRIV_S
+   (* descending_urgency = "rl_udtlb_fill2, rl_writeback_updated_PTE" *)
+`endif
+   rule rl_udtlb_fill2 (rg_state == UDTLB_FILL2);
+      if (rg_kill_echo) begin
+	 rg_state <= MODULE_READY;
+      end
+      else if (! udtlb_cap_valid) begin
+	 rg_state <= UDTLB_FILL;    // SFENCE.VMA since the translation: redo
+      end
+      else begin
+      VM_Xlate_Result vm_xlate_result = rg_fx_xlate;
+
       if (cfg_verbosity > 1)
-	 $display ("%0d: %s: rl_udtlb_fill: TLB result: ", cur_cycle, d_or_i, fshow (vm_xlate_result));
+	 $display ("%0d: %s: rl_udtlb_fill2: TLB result: ", cur_cycle, d_or_i, fshow (vm_xlate_result));
 
       // ---- TLB miss
       if (vm_xlate_result.outcome == VM_XLATE_TLB_MISS) begin
@@ -1424,23 +1548,20 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       // ---- vm_xlate_result.outcome == VM_XLATE_OK
       else begin
 `ifdef ISA_PRIV_S
-	 fa_record_pte_A_D_updates (tlb_result, vm_xlate_result);
+	 fa_record_pte_A_D_updates (rg_tlb_result, vm_xlate_result);
 `endif
 
 	 PA   pa          = vm_xlate_result.pa;
 	 rg_pa <= pa;
 	 let  page        = fv_pa_page (pa);
-	 Bool is_mem_addr = soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (pa));
+	 Bool is_mem_addr = rg_fx_mem_addr;
 	 Bool pa_hi_ok    = ((pa >> 32) == 0);    // the fabric is 32-bit
-	 Bool pmp_ok      = fv_pmp_ok (rg_pmp, page, rg_priv, pmp_acc);
+	 Bool pmp_ok      = rg_fx_pmp_ok;
 
 	 // An entry covers the whole 4 KiB page, so the page must be memory
 	 // end to end (the TestRIG map has RAM up to 0xFFFF_FFC0 and a vacant
 	 // top line inside the last page).  PMP is page-uniform (G = 10).
-	 PA   pa_pg_lo    = (pa & (~ 'hFFF));
-	 PA   pa_pg_hi    = (pa | 'hFFF);
-	 Bool is_mem_page = (   soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (pa_pg_lo))
-			     && soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (pa_pg_hi)));
+	 Bool is_mem_page = rg_fx_mem_page;
 
 	 // ---- Memory page and this access passes: fill, then re-probe.
 	 // (The SC reservation check happens in the probe, as before.)
@@ -1453,28 +1574,14 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
 	 else if (pa_hi_ok && pmp_ok && (is_mem_page || (! dmem_not_imem))) begin
 	    // Per-kind verdicts for this page under the current context
-	    Bool pte_ld = True;
-	    Bool pte_st = True;
-`ifdef ISA_PRIV_S
-	    `ifdef RV32
-	    Bool xlate = ((rg_priv <= s_Priv_Mode) && (vm_mode == satp_mode_RV32_sv32));
-`else
-	    Bool xlate = ((rg_priv <= s_Priv_Mode) && (vm_mode == satp_mode_RV64_sv39));
-`endif
-	    if (xlate) begin
-	       PTE pte = vm_xlate_result.pte;
-	       pte_ld = (   (! is_pte_denial (dmem_not_imem, True,  rg_priv, rg_sstatus_SUM, rg_mstatus_MXR, pte))
-			 && (! is_pte_A_D_fault (True,  pte)));
-	       pte_st = (   (! is_pte_denial (dmem_not_imem, False, rg_priv, rg_sstatus_SUM, rg_mstatus_MXR, pte))
-			 && (! is_pte_A_D_fault (False, pte)));
-	    end
-`endif
+	    Bool pte_ld = rg_fx_pte_ld;
+	    Bool pte_st = rg_fx_pte_st;
 	    let e = UDTLB_Entry {valid:  True,
 				 vpn:    udtlb_vpn,
 				 ppn:    truncate (pa >> 12),
-				 ok_ld:  pte_ld && fv_pmp_ok (rg_pmp, page, rg_priv, PMP_R),
-				 ok_st:  pte_st && fv_pmp_ok (rg_pmp, page, rg_priv, PMP_W),
-				 ok_amo: pte_st && fv_pmp_ok (rg_pmp, page, rg_priv, PMP_RW)};
+				 ok_ld:  pte_ld && rg_fx_pmp_r,
+				 ok_st:  pte_st && rg_fx_pmp_w,
+				 ok_amo: pte_st && rg_fx_pmp_rw};
 
 	    // Stale entries (context / PMP / SFENCE.VMA changed) die here.
 	    UDTLB_Index slot = (udtlb_fresh ? rg_udtlb_victim : 0);
@@ -1485,9 +1592,9 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 		  vrg_udtlb [i] <= unpack (0);
 	    end
 	    rg_udtlb_victim   <= slot + 1;
-	    rg_udtlb_ctx_seen <= rg_udtlb_ctx_seq;
-	    rg_udtlb_pmp_seen <= rg_udtlb_pmp_seq;
-	    rg_udtlb_tlb_seen <= rg_udtlb_tlb_seq;
+	    rg_udtlb_ctx_seen <= rg_udtlb_ctx_cap;
+	    rg_udtlb_pmp_seen <= rg_udtlb_pmp_cap;
+	    rg_udtlb_tlb_seen <= rg_udtlb_tlb_cap;
 
 	    rg_state <= MODULE_RUNNING;
 	    if (cfg_verbosity > 1)
@@ -1515,7 +1622,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	 // Neither memory nor a mapped device: precise access fault, nothing
 	 // reaches the fabric (a posted write-through store would otherwise
 	 // lose the DECERR and complete silently; TestRIG D1).
-	 else if (! soc_map.m_is_IO_addr (fn_PA_to_Fabric_Addr (pa))) begin
+	 else if (! rg_fx_io_addr) begin
 	    rg_state    <= MODULE_EXCEPTION_RSP;
 	    rg_exc_code <= access_exc_code;
 	 end
@@ -1528,7 +1635,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	 end
       end
       end
-   endrule: rl_udtlb_fill
+   endrule: rl_udtlb_fill2
 
 `ifdef ISA_PRIV_S
    // ****************************************************************

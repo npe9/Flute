@@ -135,7 +135,12 @@ module mkDebug_Module (Debug_Module_IFC);
    DM_Abstract_Commands_IFC  dm_abstract_commands <- mkDM_Abstract_Commands;
    DM_System_Bus_IFC         dm_system_bus        <- mkDM_System_Bus;
 
-   FIFOF #(DM_Addr) f_read_addr <- mkBypassFIFOF;
+   // E31: a registered FIFO (was mkBypassFIFOF).  The bypass chained the
+   // SoC's external-control request FIFO, the DMI address decode and the
+   // system-bus read side effects (sbreadonaddr/sbreadondata -> SBA AXI
+   // read) into one cycle -- the 50 MHz critical path once the I-cache
+   // queue was cut (E30).  Costs one cycle of DMI read latency.
+   FIFOF #(DM_Addr) f_read_addr <- mkFIFOF;
 
    // ================================================================
    // Reset all three parts when dm_run_control.dmactive is low

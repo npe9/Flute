@@ -311,26 +311,61 @@ endfunction
 // Compute (one cycle, from registered operands)
 
 function WordXL fv_xbox_compute (XOp op, Instr instr, WordXL a, WordXL b);
-   Bit #(5) shamt_i = instr [24:20];
-   Bit #(5) shamt_r = b [4:0];
-   Bit #(5) bidx    = ((op == X_BCLRI) || (op == X_BEXTI) || (op == X_BINVI) || (op == X_BSETI)) ? shamt_i : shamt_r;
-   Bit #(32) bmask  = (32'h1 << bidx);
+   // Single-cycle reference (unused in the core): stage A then stage B.
+   return fv_xbox_finish (op, instr, a, fv_xbox_compute_main (op, instr, a, b), fv_xbox_clp (a, b), fv_xbox_aes_so (op, instr, b), fv_xbox_cnt (op, a));
+endfunction
 
-   // clmul family (Sail RISCV_CLMUL / CLMULH / CLMULR): xor of shifted copies of a
+// LX3: two-stage compute.  Stage A registers the main case (every op but
+// clmul / AES / clz / ctz / cpop, which yield 0 there) together with the
+// carry-less product, the AES S-box byte and the bit count; stage B picks
+// the family and finishes AES (MixColumn column, rotate, xor).  The single-
+// cycle form was 17 LUT levels deep (clmul xor tree / S-box -> GF mul ->
+// rotate -> 40-way op mux).  +1 cycle per B / Zk op.
+
+function Bit #(64) fv_xbox_clp (WordXL a, WordXL b);
    Bit #(64) clp = 0;
    for (Integer i = 0; i < 32; i = i + 1)
       if (b [i] == 1'b1) clp = clp ^ (zeroExtend (a) << i);
+   return clp;
+endfunction
 
-   // AES32 (Sail AES32ESI/ESMI/DSI/DSMI)
+function Bit #(8) fv_xbox_aes_so (XOp op, Instr instr, WordXL b);
    Bit #(5)  aes_sh  = {instr [31:30], 3'b000};
    Bit #(8)  si      = truncate (b >> aes_sh);
    Bool      aes_fwd = ((op == X_AES32ESI) || (op == X_AES32ESMI));
-   Bit #(8)  so      = (aes_fwd ? fn_aes_sbox_fwd (si) : fn_aes_sbox_inv (si));
+   return (aes_fwd ? fn_aes_sbox_fwd (si) : fn_aes_sbox_inv (si));
+endfunction
+
+function Bit #(6) fv_xbox_cnt (XOp op, WordXL a);
+   return case (op)
+	     X_CLZ:   pack (countZerosMSB (a));
+	     X_CTZ:   pack (countZerosLSB (a));
+	     default: pack (countOnes (a));
+	  endcase;
+endfunction
+
+function WordXL fv_xbox_finish (XOp op, Instr instr, WordXL a, WordXL part, Bit #(64) clp, Bit #(8) so, Bit #(6) cnt);
+   Bit #(5)  aes_sh  = {instr [31:30], 3'b000};
    Bit #(32) mixed   = case (op)
 			  X_AES32ESMI: {fn_gfmul (so, 4'h3), so, so, fn_gfmul (so, 4'h2)};
 			  X_AES32DSMI: {fn_gfmul (so, 4'hb), fn_gfmul (so, 4'hd), fn_gfmul (so, 4'h9), fn_gfmul (so, 4'he)};
 			  default:     zeroExtend (so);
 		       endcase;
+   return case (op)
+	     X_CLMUL:  clp [31:0];
+	     X_CLMULH: clp [63:32];
+	     X_CLMULR: clp [62:31];
+	     X_CLZ, X_CTZ, X_CPOP: zeroExtend (cnt);
+	     X_AES32ESI, X_AES32ESMI, X_AES32DSI, X_AES32DSMI: (a ^ fn_rol_var (mixed, aes_sh));
+	     default:  part;
+	  endcase;
+endfunction
+
+function WordXL fv_xbox_compute_main (XOp op, Instr instr, WordXL a, WordXL b);
+   Bit #(5) shamt_i = instr [24:20];
+   Bit #(5) shamt_r = b [4:0];
+   Bit #(5) bidx    = ((op == X_BCLRI) || (op == X_BEXTI) || (op == X_BINVI) || (op == X_BSETI)) ? shamt_i : shamt_r;
+   Bit #(32) bmask  = (32'h1 << bidx);
 
    Bit #(32) r = 0;
    case (op)
@@ -347,9 +382,6 @@ function WordXL fv_xbox_compute (XOp op, Instr instr, WordXL a, WordXL b);
       X_ROL:     r = fn_rol_var (a, shamt_r);
       X_ROR:     r = fn_ror_var (a, shamt_r);
       X_RORI:    r = fn_ror_var (a, shamt_i);
-      X_CLZ:     r = zeroExtend (pack (countZerosMSB (a)));
-      X_CTZ:     r = zeroExtend (pack (countZerosLSB (a)));
-      X_CPOP:    r = zeroExtend (pack (countOnes (a)));
       X_SEXTB:   r = signExtend (a [7:0]);
       X_SEXTH:   r = signExtend (a [15:0]);
       X_ZEXTH:   r = zeroExtend (a [15:0]);
@@ -361,9 +393,6 @@ function WordXL fv_xbox_compute (XOp op, Instr instr, WordXL a, WordXL b);
 		    Bit #(8) byte_i = a [31-i:24-i];
 		    r [i+7:i] = byte_i;
 		 end
-      X_CLMUL:   r = clp [31:0];
-      X_CLMULH:  r = clp [63:32];
-      X_CLMULR:  r = clp [62:31];
       X_BCLR, X_BCLRI: r = a & (~ bmask);
       X_BEXT, X_BEXTI: r = zeroExtend (pack ((a & bmask) != 0));
       X_BINV, X_BINVI: r = a ^ bmask;
@@ -383,8 +412,6 @@ function WordXL fv_xbox_compute (XOp op, Instr instr, WordXL a, WordXL b);
 		    Bit #(32) sel = a >> {idx [2:0], 2'b00};
 		    r [i+3:i] = ((idx < 8) ? sel [3:0] : 0);
 		 end
-      X_AES32ESI, X_AES32ESMI, X_AES32DSI, X_AES32DSMI:
-		 r = a ^ fn_rol_var (mixed, aes_sh);
       X_SHA256SUM0:  r = fn_ror32 (a, 2) ^ fn_ror32 (a, 13) ^ fn_ror32 (a, 22);
       X_SHA256SUM1:  r = fn_ror32 (a, 6) ^ fn_ror32 (a, 11) ^ fn_ror32 (a, 25);
       X_SHA256SIG0:  r = fn_ror32 (a, 7) ^ fn_ror32 (a, 18) ^ (a >> 3);
@@ -412,7 +439,7 @@ endinterface
 
 (* synthesize *)
 module mkRISCV_XBox (RISCV_XBox_IFC);
-   // 0: idle, 1: operands registered (compute this cycle), 2: result valid
+   // 0: idle, 1: operands registered (stage A), 2: stage B, 3: result valid
    // ConfigRegs: valid/word (read by stage2 output) and req (stage2 enq) are called from the
    // same CPU rule; plain regs would order valid/word < rl_compute < req (SBR, G0004).
    Reg #(Bit #(2))  rg_state  <- mkConfigReg (0);
@@ -422,9 +449,22 @@ module mkRISCV_XBox (RISCV_XBox_IFC);
    Reg #(WordXL)    rg_v2     <- mkRegU;
    Reg #(WordXL)    rg_result <- mkConfigRegU;
 
+   Reg #(WordXL)    rg_part   <- mkRegU;
+   Reg #(Bit #(64)) rg_clp    <- mkRegU;
+   Reg #(Bit #(8))  rg_so     <- mkRegU;
+   Reg #(Bit #(6))  rg_cnt    <- mkRegU;
+
    rule rl_compute (rg_state == 1);
-      rg_result <= fv_xbox_compute (rg_op, rg_instr, rg_v1, rg_v2);
-      rg_state  <= 2;
+      rg_part  <= fv_xbox_compute_main (rg_op, rg_instr, rg_v1, rg_v2);
+      rg_clp   <= fv_xbox_clp (rg_v1, rg_v2);
+      rg_so    <= fv_xbox_aes_so (rg_op, rg_instr, rg_v2);
+      rg_cnt   <= fv_xbox_cnt (rg_op, rg_v1);
+      rg_state <= 2;
+   endrule
+
+   rule rl_finish (rg_state == 2);
+      rg_result <= fv_xbox_finish (rg_op, rg_instr, rg_v1, rg_part, rg_clp, rg_so, rg_cnt);
+      rg_state  <= 3;
    endrule
 
    method Action req (Instr instr, WordXL v1, WordXL v2);
@@ -435,7 +475,7 @@ module mkRISCV_XBox (RISCV_XBox_IFC);
       rg_state <= 1;
    endmethod
 
-   method Bool   valid = (rg_state == 2);
+   method Bool   valid = (rg_state == 3);
    method WordXL word  = rg_result;
 endmodule
 

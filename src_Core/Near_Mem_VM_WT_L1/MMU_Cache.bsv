@@ -994,16 +994,23 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       endaction
    endfunction
 
-   FIFOF #(Tuple3 #(Bit #(3), PA, Bit #(64))) f_fabric_write_reqs <- mkFIFOF;
+   // E33: unguarded.  As a guarded FIFOF, -aggressive-conditions lifted its
+   // FULL_N into rl_probe_and_immed_rsp's firing condition through the
+   // late SC-success (32-bit rg_lrsc_pa compare) / store-path decode, and
+   // that condition gates every register enable in the rule.  Each
+   // enqueuing rule now carries an explicit, early notFull guard.
+   FIFOF #(Tuple3 #(Bit #(3), PA, Bit #(64))) f_fabric_write_reqs <- mkUGFIFOF;
 
    // Send a write-request into the fabric
    function Action fa_fabric_send_write_req (Bit #(3)  f3, PA  pa, Bit #(64)  st_val);
       action
+	 if (! f_fabric_write_reqs.notFull)
+	    $display ("%0d: ASSERT FAIL %s: f_fabric_write_reqs enq while full", cur_cycle, d_or_i);
 	 f_fabric_write_reqs.enq (tuple3 (f3, pa, st_val));
       endaction
    endfunction
 
-   rule rl_fabric_send_write_req (rg_ddr4_ready);
+   rule rl_fabric_send_write_req (rg_ddr4_ready && f_fabric_write_reqs.notEmpty);
       match { .f3, .pa, .st_val } <- pop (f_fabric_write_reqs);
 
       match {.fabric_addr,
@@ -1064,7 +1071,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       endaction
    endfunction
 
-   rule rl_writeback_updated_PTE;
+   rule rl_writeback_updated_PTE (f_fabric_write_reqs.notFull);
       match { .pa, .pte } <- pop (f_pte_writebacks);
       let f3 = ((xlen == 32) ? f3_SW : f3_SD);
       fa_fabric_send_write_req (f3, pa, zeroExtend (pte));
@@ -1151,7 +1158,9 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
    rule rl_probe_and_immed_rsp (rg_ddr4_ready && (rg_state == MODULE_RUNNING)
 				&& (rg_age_seen == rg_req_seq)
-				&& (! rg_kill_echo));    // RLD-4: see interface comment
+				&& (! rg_kill_echo)    // RLD-4: see interface comment
+				// E33: only ST / SC can enqueue a fabric write here
+				&& (f_fabric_write_reqs.notFull || ((rg_op != CACHE_ST) && (! is_AMO_SC))));
 
       // Print some initial information for debugging
       if (cfg_verbosity > 1) begin
@@ -2087,7 +2096,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       rg_state      <= CACHE_AMO_WRITE;
    endrule
 
-   rule rl_amo_write (rg_state == CACHE_AMO_WRITE);
+   rule rl_amo_write ((rg_state == CACHE_AMO_WRITE) && f_fabric_write_reqs.notFull);
       // Update cache line in cache
       let new_cword_set = fn_update_cword_set (rg_amo_cword_set, rg_amo_way, rg_pa, rg_f3, rg_st_amo_val);
       ram_cword_set.a.put (bram_cmd_write, cset_cword_in_cache, new_cword_set);
@@ -2238,7 +2247,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    (* descending_urgency = "rl_io_write_req, rl_writeback_updated_PTE" *)
 `endif
 
-   rule rl_io_write_req ((rg_state == IO_REQ) && (rg_op == CACHE_ST));
+   rule rl_io_write_req ((rg_state == IO_REQ) && (rg_op == CACHE_ST) && f_fabric_write_reqs.notFull);
       if (cfg_verbosity > 1)
 	 $display ("%0d: %s: rl_io_write_req; f3 0x%0h  vaddr %0h  paddr %0h  word64 0x%0h",
 		   cur_cycle, d_or_i, rg_f3, rg_addr, rg_pa, rg_st_amo_val);
@@ -2348,7 +2357,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 `ifdef ISA_PRIV_S
    (* descending_urgency = "rl_io_amo_write, rl_writeback_updated_PTE" *)
 `endif
-   rule rl_io_amo_write (rg_state == IO_AMO_WRITE);
+   rule rl_io_amo_write ((rg_state == IO_AMO_WRITE) && f_fabric_write_reqs.notFull);
       // Write back new st_val to fabric
       fa_fabric_send_write_req (rg_f3, rg_pa, rg_st_amo_val);
       fa_drive_IO_read_rsp (rg_f3, rg_addr, rg_ld_val);

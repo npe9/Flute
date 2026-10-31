@@ -576,10 +576,11 @@ endinterface
 
 (* synthesize *)
 module mkRISCV_XBox (RISCV_XBox_IFC);
-   // 0: idle, 1: operands registered (stage A), 2: stage B, 3: result valid
+   // 0: idle, 1: operands registered (stage A), 2: stage B, 3: result valid,
+   // 4: AES stage B after the S-box byte has been re-registered (LX33)
    // ConfigRegs: valid/word (read by stage2 output) and req (stage2 enq) are called from the
    // same CPU rule; plain regs would order valid/word < rl_compute < req (SBR, G0004).
-   Reg #(Bit #(2))  rg_state  <- mkConfigReg (0);
+   Reg #(Bit #(3))  rg_state  <- mkConfigReg (0);
    Reg #(XOp)       rg_op     <- mkRegU;
    Reg #(Instr)     rg_instr  <- mkRegU;
    Reg #(WordXL)    rg_v1     <- mkRegU;
@@ -589,6 +590,12 @@ module mkRISCV_XBox (RISCV_XBox_IFC);
    Reg #(WordXL)    rg_part   <- mkRegU;
    Reg #(Bit #(64)) rg_clp    <- mkRegU;
    Reg #(Bit #(8))  rg_so     <- mkRegU;
+   // LX33: rg_so is the S-box block RAM's read port (LX29), whose clock-to-out is ~5.6 ns
+   // (lx22 s5: DP16KD DOA -> GF mul -> rotate -> op mux -> rg_result, 20.1 ns).  AES ops
+   // copy it into rg_so_q first, so stage B starts from a fabric flop.  +1 cycle per AES op.
+   Reg #(Bit #(8))  rg_so_q   <- mkRegU;
+   Bool is_aes = ((rg_op == X_AES32ESI) || (rg_op == X_AES32ESMI)
+		  || (rg_op == X_AES32DSI) || (rg_op == X_AES32DSMI));
    Reg #(Bit #(6))  rg_cnt    <- mkRegU;
 
    rule rl_compute (rg_state == 1);
@@ -599,8 +606,13 @@ module mkRISCV_XBox (RISCV_XBox_IFC);
       rg_state <= 2;
    endrule
 
-   rule rl_finish (rg_state == 2);
-      rg_result <= fv_xbox_finish (rg_op, rg_instr, rg_v1, rg_part, rg_clp, rg_so, rg_cnt);
+   rule rl_aes_so (rg_state == 2 && is_aes);
+      rg_so_q  <= rg_so;
+      rg_state <= 4;
+   endrule
+
+   rule rl_finish ((rg_state == 2 && ! is_aes) || rg_state == 4);
+      rg_result <= fv_xbox_finish (rg_op, rg_instr, rg_v1, rg_part, rg_clp, rg_so_q, rg_cnt);
       rg_state  <= 3;
    endrule
 

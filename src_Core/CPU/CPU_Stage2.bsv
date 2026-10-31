@@ -166,14 +166,19 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
    // advance, i.e. on the dcache hit of the op ahead (m12p PLL critical
    // path: dcache -> fbox.rg_x CE; with only the FBox deferred, m13p's
    // moved to dcache -> xbox.rg_op).
-   // A FIFO, not a register: written by both enq and the rule, a register
-   // would make bsc gate the rule on enq again.  In the launch cycle the
-   // box's valid can still show the previous op's result (FBox, XBox):
-   // pw_box_launch holds the op BUSY for that cycle.  rl_pipe must not read
-   // f_box_pending (notEmpty-before-deq vs. rg_stage2-read-before-enq is a
-   // cycle, and bsc then blocks the launch rule whenever rl_pipe fires).
-   FIFOF #(Token) f_box_pending <- mkSizedFIFOF (2);
-   PulseWire      pw_box_launch <- mkPulseWire;
+   // In the launch cycle the box's valid can still show the previous op's
+   // result (FBox, XBox), so the op stays BUSY while a launch is outstanding.
+   // LX11: launch accounting in two counters, each written by one rule
+   // (fa_enq counts box ops in, rl_launch_box_req counts launches out), so
+   // the BUSY status and the launch condition are register compares.  Was a
+   // FIFO token plus a PulseWire from the launch rule's firing, which pulled
+   // the launch rule's whole firing condition into the stage2 bypass ->
+   // stage1 ALU -> rg_stage2 path (lx7 critical, 24.6 ns).  ConfigRegs: the
+   // counters impose no rule order (rl_pipe reads the box's valid before the
+   // launch rule's req, so rl_pipe < launch).
+   Reg #(Bit #(3)) rg_box_enqs <- mkConfigReg (0);
+   Reg #(Bit #(3)) rg_box_deqs <- mkConfigReg (0);
+   Bool box_launch_pending = (rg_box_enqs != rg_box_deqs);
 
    Reg #(Bool)                  rg_resetting  <- mkReg (False);
    // E14: ConfigRegs so CPU.rl_front can read out.redirect (registers only)
@@ -276,12 +281,14 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
    // ----------------------------------------------------------------
    // BEHAVIOR
 
+   // LX11: a reset in the cycle of a launch must leave the counters equal
+   (* preempts = "rl_reset_begin, rl_launch_box_req" *)
    rule rl_reset_begin;
       f_reset_reqs.deq;
       rg_full <= False;
       rg_resetting <= True;
       f_dreq_pending.clear;
-      f_box_pending.clear;
+      rg_box_deqs <= rg_box_enqs;
 `ifdef ISA_F
       fbox.server_reset.request.put (?);
 `endif
@@ -522,7 +529,7 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
       // ----------------
       // Path: Serial shifter
       else if (rg_stage2.op_stage2 == OP_Stage2_SH) begin
-	 let ostatus = (((! shifter_box.valid) || pw_box_launch) ? OSTATUS_BUSY : OSTATUS_PIPE);
+	 let ostatus = (((! shifter_box.valid) || box_launch_pending) ? OSTATUS_BUSY : OSTATUS_PIPE);
 
 	 let result = shifter_box.word;
 
@@ -560,7 +567,7 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
       // ----------------
       // Path: integer multiply/divide
       else if (rg_stage2.op_stage2 == OP_Stage2_M) begin
-	 let ostatus = (((! mbox.valid) || pw_box_launch) ? OSTATUS_BUSY : OSTATUS_PIPE);
+	 let ostatus = (((! mbox.valid) || box_launch_pending) ? OSTATUS_BUSY : OSTATUS_PIPE);
 
 	 let result = mbox.word;
 
@@ -598,7 +605,7 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
       // ----------------
       // Path: bitmanip / scalar crypto (same contract as the MBox path)
       else if (rg_stage2.op_stage2 == OP_Stage2_X) begin
-	 let ostatus = (((! xbox.valid) || pw_box_launch) ? OSTATUS_BUSY : OSTATUS_PIPE);
+	 let ostatus = (((! xbox.valid) || box_launch_pending) ? OSTATUS_BUSY : OSTATUS_PIPE);
 	 let result  = xbox.word;
 
 	 let data_to_stage3 = data_to_stage3_base;
@@ -630,7 +637,7 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
       // ----------------
       // Path: floating point op
       else if (rg_stage2.op_stage2 == OP_Stage2_FD) begin
-	 let ostatus = (((! fbox.valid) || pw_box_launch) ? OSTATUS_BUSY : OSTATUS_PIPE);
+	 let ostatus = (((! fbox.valid) || box_launch_pending) ? OSTATUS_BUSY : OSTATUS_PIPE);
 
          // Extract fields from FBOX result
 	 match {.value, .fflags} = fbox.word;
@@ -786,7 +793,7 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 	 // M13: shifter / MBox / XBox / FBox ops: rl_launch_box_req issues
 	 // the box req next cycle
 	 else if (fv_is_box_op (x.op_stage2))
-	    f_box_pending.enq (?);
+	    rg_box_enqs <= rg_box_enqs + 1;
       endaction
    endfunction
 
@@ -794,11 +801,10 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
    // emptied stage2 in between leaves a token for a dead op: launching it
    // anyway is harmless (the result has no consumer, and the next box op's
    // req restarts the box).  A non-box op in stage2 by then launches nothing.
-   rule rl_launch_box_req (f_box_pending.notEmpty);
-      f_box_pending.deq;
+   rule rl_launch_box_req (box_launch_pending);
+      rg_box_deqs <= rg_box_deqs + 1;
       let x = rg_stage2;
       let funct3 = instr_funct3 (x.instr);
-      if (fv_is_box_op (x.op_stage2)) pw_box_launch.send;
 
       if (False) noAction;
 `ifdef SHIFT_SERIAL

@@ -79,7 +79,10 @@ module mkRISCV_MBox (RISCV_MBox_IFC);
    // do not overlap (al*bl < 2^34), so they are one concatenated word;
    // the cross terms are summed as they leave the DSPs.
    Reg #(Bit #(64))  rg_pcat <- mkRegU;
-   Reg #(Int #(37))  rg_pm   <- mkRegU;
+   // LX26: the cross terms are registered as they leave the DSPs; rl_mul_sum adds them
+   // (was DSP -> 37-bit adder -> rg_pm, lx18 s5 18.6 ns).
+   Reg #(Int #(36))  rg_plh  <- mkRegU;
+   Reg #(Int #(36))  rg_phl  <- mkRegU;
 `endif
 `endif
 
@@ -137,12 +140,13 @@ module mkRISCV_MBox (RISCV_MBox_IFC);
       Int #(36) phl = signedMul (ah, bl);
       Int #(36) phh = signedMul (ah, bh);
       rg_pcat  <= { pack (phh) [29:0], pack (pll) [33:0] };
-      rg_pm    <= signExtend (plh) + signExtend (phl);
+      rg_plh   <= plh;
+      rg_phl   <= phl;
       rg_state <= STATE_MULS;
    endrule
 
    rule rl_mul_sum (rg_state == STATE_MULS);
-      Int #(64) pm = signExtend (rg_pm);
+      Int #(64) pm = signExtend (rg_plh) + signExtend (rg_phl);
       Bit #(64) p  = rg_pcat + pack (pm << 17);
       rg_word  <= (rg_mhi ? p [63:32] : p [31:0]);
       rg_valid <= True;

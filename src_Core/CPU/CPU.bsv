@@ -2275,13 +2275,27 @@ module mkCPU (CPU_IFC);
    // ----------------
    // Debug Module CSR read/write
 
-   rule rl_debug_read_csr ((rg_state == CPU_DEBUG_MODE) && (! f_csr_reqs.first.write));
+   // LX36: the read is registered (rg_dbg_csr) and answered the next cycle, so the CSR read
+   // mux ends at a flop instead of the response FIFO's data0/data1 inputs (lx23 s3:
+   // f_csr_reqs head -> read_csr_port2 -> f_csr_rsps data0, 18.8 ns).  The request stays
+   // at the head until the answer; the write / busy rules wait for it.
+   Reg #(Bool) rg_dbg_csr_v <- mkReg (False);
+   Reg #(Word) rg_dbg_csr   <- mkRegU;
+
+   rule rl_debug_read_csr ((rg_state == CPU_DEBUG_MODE) && (! f_csr_reqs.first.write) && (! rg_dbg_csr_v));
+      Bit #(12) csr_addr = f_csr_reqs.first.address;
+      let m_data = csr_regfile.read_csr_port2 (csr_addr);
+      rg_dbg_csr   <= fromMaybe (?, m_data);
+      rg_dbg_csr_v <= True;
+   endrule
+
+   rule rl_debug_read_csr_rsp (rg_dbg_csr_v);
       let req <- pop (f_csr_reqs);
       Bit #(12) csr_addr = req.address;
-      let m_data = csr_regfile.read_csr_port2 (csr_addr);
-      let data = fromMaybe (?, m_data);
+      let data = rg_dbg_csr;
       let rsp = DM_CPU_Rsp {ok: True, data: data};
       f_csr_rsps.enq (rsp);
+      rg_dbg_csr_v <= False;
 
       $display ("CPU: Debugger read CSR 0x%0x => 0x%0h", csr_addr, data);
       if (cur_verbosity > 1) begin
@@ -2290,7 +2304,7 @@ module mkCPU (CPU_IFC);
       end
    endrule
 
-   rule rl_debug_write_csr ((rg_state == CPU_DEBUG_MODE) && f_csr_reqs.first.write);
+   rule rl_debug_write_csr ((rg_state == CPU_DEBUG_MODE) && f_csr_reqs.first.write && (! rg_dbg_csr_v));
       let req <- pop (f_csr_reqs);
       Bit #(12) csr_addr = req.address;
       let data = req.data;
@@ -2307,7 +2321,7 @@ module mkCPU (CPU_IFC);
       end
    endrule
 
-   rule rl_debug_csr_access_busy (rg_state != CPU_DEBUG_MODE);
+   rule rl_debug_csr_access_busy ((rg_state != CPU_DEBUG_MODE) && (! rg_dbg_csr_v));
       let req <- pop (f_csr_reqs);
       let rsp = DM_CPU_Rsp {ok: False, data: ?};
       f_csr_rsps.enq (rsp);

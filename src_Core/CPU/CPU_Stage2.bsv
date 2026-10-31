@@ -95,9 +95,8 @@ interface CPU_Stage2_IFC;
    method Action deq;
 
    // ---- Input
-   // RLD-4: not always_ready -- a dmem op enqueues a pending-request
-   // sample into f_dreq_pending (guarded by its notFull).  The FIFO is
-   // depth 2 with occupancy <= 1 in practice, so this never blocks.
+   // RLD-4 / LX15: a dmem op counts a pending dcache launch (rg_dreq_enqs);
+   // the launch uses the CSR/VM context sampled in the enqueue cycle.
    method Action enq (Data_Stage1_to_Stage2 x);
 
    (* always_ready *)
@@ -156,7 +155,18 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
    // most 1 in practice because a dmem op holds stage2 BUSY until the
    // dcache response, so no second dmem op can enqueue while one is
    // pending.  See rl_launch_dmem_req for the orphan (kill) handling.
-   FIFOF #(DReq_Sample) f_dreq_pending <- mkSizedFIFOF (2);
+   // LX15: launch accounting in two counters (fa_enq counts dmem ops in,
+   // rl_launch_dmem_req counts launches out), as LX11 for the boxes, and the
+   // CSR/VM context in a register that samples every cycle while no launch
+   // is outstanding, so it holds the enqueue cycle's values until the
+   // launch.  Was a DReq_Sample FIFO whose enqueue (data mux select) hung
+   // off rl_pipe's stage1 advance (lx11 seeds 3/7: stage1 ->
+   // f_dreq_pending.data0_reg / dcache req args, 18.8-19.3 ns).
+   Reg #(Bit #(3))    rg_dreq_enqs <- mkConfigReg (0);
+   Reg #(Bit #(3))    rg_dreq_deqs <- mkConfigReg (0);
+   Bool               dreq_pending = (rg_dreq_enqs != rg_dreq_deqs);
+   Reg #(DReq_Sample) rg_dreq_ctx  <- mkConfigRegU;
+   Reg #(Bool)        rg_dreq_mprv <- mkConfigRegU;
 
    // M13: deferred functional-box launches (shifter, MBox, XBox, FBox), the
    // RLD-4 pattern.  fa_enq of a box op enqueues a token; rl_launch_box_req
@@ -281,13 +291,11 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
    // ----------------------------------------------------------------
    // BEHAVIOR
 
-   // LX11: a reset in the cycle of a launch must leave the counters equal
-   (* preempts = "rl_reset_begin, rl_launch_box_req" *)
    rule rl_reset_begin;
       f_reset_reqs.deq;
       rg_full <= False;
       rg_resetting <= True;
-      f_dreq_pending.clear;
+      rg_dreq_deqs <= rg_dreq_enqs;
       rg_box_deqs <= rg_box_enqs;
 `ifdef ISA_F
       fbox.server_reset.request.put (?);
@@ -767,27 +775,8 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 	 if ((x.op_stage2 == OP_Stage2_LD)
 	     || (x.op_stage2 == OP_Stage2_ST)
 	     || op_stage2_amo) begin
-	    WordXL   mstatus     = csr_regfile.read_mstatus;
-`ifdef ISA_PRIV_S
-	    Bit #(1) sstatus_SUM = (csr_regfile.read_sstatus) [18];
-`else
-	    Bit #(1) sstatus_SUM = 0;
-`endif
-	    Bit #(1) mstatus_MXR = mstatus [19];
-	    Priv_Mode  mem_priv = x.priv;
-	    if (mstatus [17] == 1'b1) begin
-	       mem_priv = mstatus [12:11];
-	       // $display ("    S2.fa_enq: mem_priv %0d => %0d (mstatus.MPP) due to mstatus.MPRV", x.priv, mem_priv);
-	    end
-
-	    // RLD-4: sample the CSR/VM context; rl_launch_dmem_req issues the
-	    // actual dcache.req one cycle later from the registered stage2
-	    // contents (cuts the stage1 output/regfile -> dcache tag-RAM
-	    // address cone, the rld1pp-era 29 ns path0).
-	    f_dreq_pending.enq (DReq_Sample {mem_priv:    mem_priv,
-					  sstatus_SUM: sstatus_SUM,
-					  mstatus_MXR: mstatus_MXR,
-					  satp:        csr_regfile.read_satp});
+	    // LX15: the launch uses rg_dreq_ctx (sampled this cycle)
+	    rg_dreq_enqs <= rg_dreq_enqs + 1;
 	 end
 
 	 // M13: shifter / MBox / XBox / FBox ops: rl_launch_box_req issues
@@ -801,6 +790,8 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
    // emptied stage2 in between leaves a token for a dead op: launching it
    // anyway is harmless (the result has no consumer, and the next box op's
    // req restarts the box).  A non-box op in stage2 by then launches nothing.
+   // LX11: a reset in the cycle of a launch must leave the counters equal
+   (* preempts = "rl_reset_begin, rl_launch_box_req" *)
    rule rl_launch_box_req (box_launch_pending);
       rg_box_deqs <= rg_box_deqs + 1;
       let x = rg_stage2;
@@ -856,8 +847,25 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 
    // E8: same contract as the icache shim -- never issue dcache.req while the
    // dcache has a fabric transaction outstanding (abandoned refill -> stale burst).
-   rule rl_launch_dmem_req (f_dreq_pending.notEmpty && (! dcache.mv_busy));
-      f_dreq_pending.deq;
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_sample_dreq_ctx (! dreq_pending);
+      WordXL   mstatus     = csr_regfile.read_mstatus;
+`ifdef ISA_PRIV_S
+      Bit #(1) sstatus_SUM = (csr_regfile.read_sstatus) [18];
+`else
+      Bit #(1) sstatus_SUM = 0;
+`endif
+      // mem_priv: mstatus.MPP, used at launch when mstatus.MPRV is set (else rg_stage2.priv)
+      rg_dreq_mprv <= (mstatus [17] == 1'b1);
+      rg_dreq_ctx  <= DReq_Sample {mem_priv:    mstatus [12:11],
+				  sstatus_SUM: sstatus_SUM,
+				  mstatus_MXR: mstatus [19],
+				  satp:        csr_regfile.read_satp};
+   endrule
+
+   (* preempts = "rl_reset_begin, rl_launch_dmem_req" *)
+   rule rl_launch_dmem_req (dreq_pending && (! dcache.mv_busy));
+      rg_dreq_deqs <= rg_dreq_deqs + 1;
 
       if (   (rg_stage2.op_stage2 == OP_Stage2_LD)
 	  || (rg_stage2.op_stage2 == OP_Stage2_ST)
@@ -865,8 +873,10 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 	  || (rg_stage2.op_stage2 == OP_Stage2_AMO)
 `endif
 	  ) begin
-	 let s = f_dreq_pending.first;
 	 let x = rg_stage2;
+	 let s = rg_dreq_ctx;
+	 // MPRV: loads / stores use mstatus.MPP (sampled into mem_priv), else the op's priv
+	 s.mem_priv = (rg_dreq_mprv ? rg_dreq_ctx.mem_priv : x.priv);
 
 	 CacheOp cache_op = ?;
 	 if      (x.op_stage2 == OP_Stage2_LD)  cache_op = CACHE_LD;

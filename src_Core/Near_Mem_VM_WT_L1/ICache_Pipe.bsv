@@ -255,6 +255,12 @@ module mkICache_Pipe (ICache_Pipe_IFC);
 
    // ITLB and PTW (sole writer: rl_main)
    Vector #(ITLB_N, Reg #(ITLBE)) vrg_itlb <- replicateM (mkReg (unpack (0)));
+   // LX35: a completed walk's entry is registered here and inserted the next cycle, so the
+   // ITLB write enables see only registers (was: rg_pc -> presentation match -> redirect ->
+   // kill -> drop -> vrg_itlb CE, lx23 s5 19.0 ns).  The replayed fetch issues the cycle
+   // after the walk completes and looks the ITLB up the cycle after that, so it still hits.
+   Reg #(Bool)  rg_ins_v <- mkReg (False);
+   Reg #(ITLBE) rg_ins   <- mkRegU;
 
    // LX25: PMP / PA-range verdicts for the last two fetch pages.  S2 compares rg_s2_ppn
    // against the two page numbers only; a page not held replays its cword (as for an
@@ -668,13 +674,16 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       end
 
       // ITLB: SFENCE.VMA clears; a completed walk inserts (round robin)
+      // (LX35: the insert is the previous cycle's walk; a flush drops it)
       if (ctx_kill && tlb_pend)
          for (Integer i = 0; i < valueOf (ITLB_N); i = i + 1)
             vrg_itlb [i] <= unpack (0);
-      else if (walk_ins matches tagged Valid .e &&& (! drop)) begin
-         vrg_itlb [rg_itlb_rr] <= e;
+      else if (rg_ins_v) begin
+         vrg_itlb [rg_itlb_rr] <= rg_ins;
          rg_itlb_rr <= rg_itlb_rr + 1;
       end
+      rg_ins_v <= isValid (walk_ins) && (! drop);
+      rg_ins   <= fromMaybe (?, walk_ins);
 
       // ---- LX27: queue next state.  Clear / pop, then a kept candidate joins at the tail
       // (credit-limited issue guarantees a free slot).  A flush or reset start empties the

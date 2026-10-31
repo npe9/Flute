@@ -391,6 +391,12 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
    Reg #(Bit #(64))   rg_minstret      <- mkReg (0);    // Needed even for user-mode instrs
    RWire #(Bit #(64)) rw_minstret      <- mkRWire;      // Driven on CSRRx write to minstret
    PulseWire          pw_minstret_incr <- mkPulseWire;
+   // LX18: the retire pulse is registered and minstret increments one cycle later; reads
+   // add the pending increment.  The increment's enable (64 FFs) hung off the pipe's
+   // retire decision (lx12 seed 5: stage1 -> rg_minstret CE, 19.1 ns).  A CSR write in
+   // the retire's cycle still suppresses that increment, as before.
+   Reg #(Bool)        rg_minstret_pend <- mkReg (False);
+   Bit #(64)          minstret_now     = rg_minstret + (rg_minstret_pend ? 1 : 0);
 
    // Debug/Trace
    Reg #(WordXL)    rg_tselect <- mkRegU;
@@ -512,7 +518,12 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
    endrule
 
    (* no_implicit_conditions, fire_when_enabled *)
-   rule rl_upd_minstret_incr ((! isValid (rw_minstret.wget)) && pw_minstret_incr);
+   rule rl_minstret_pend;
+      rg_minstret_pend <= (pw_minstret_incr && (! isValid (rw_minstret.wget)));
+   endrule
+
+   (* no_implicit_conditions, fire_when_enabled *)
+   rule rl_upd_minstret_incr ((! isValid (rw_minstret.wget)) && rg_minstret_pend);
       rg_minstret <= rg_minstret + 1;
       // $display ("%0d: CSR_RegFile_UM.rl_upd_minstret_incr: new value is %0d", rg_mcycle, rg_minstret + 1);
    endrule
@@ -675,11 +686,11 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 
 	    csr_addr_time:     m_csr_value = tagged Valid (truncate (rg_time));
 
-	    csr_addr_instret:  m_csr_value = tagged Valid (truncate (rg_minstret));
+	    csr_addr_instret:  m_csr_value = tagged Valid (truncate (minstret_now));
 `ifdef RV32
 	    csr_addr_cycleh:   m_csr_value = tagged Valid (rg_mcycle   [63:32]);
 	    csr_addr_timeh:    m_csr_value = tagged Valid (rg_time     [63:32]);
-	    csr_addr_instreth: m_csr_value = tagged Valid (rg_minstret [63:32]);
+	    csr_addr_instreth: m_csr_value = tagged Valid (minstret_now [63:32]);
 `endif
 
 `ifdef ISA_PRIV_S
@@ -752,10 +763,10 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 	    // csr_pmpaddr15:  m_csr_value = tagged Valid vrg_pmpaddr [15];
 
 	    csr_addr_mcycle:    m_csr_value = tagged Valid (truncate (rg_mcycle));
-	    csr_addr_minstret:  m_csr_value = tagged Valid (truncate (rg_minstret));
+	    csr_addr_minstret:  m_csr_value = tagged Valid (truncate (minstret_now));
 `ifdef RV32
 	    csr_addr_mcycleh:   m_csr_value = tagged Valid (rg_mcycle [63:32]);
-	    csr_addr_minstreth: m_csr_value = tagged Valid (rg_minstret [63:32]);
+	    csr_addr_minstreth: m_csr_value = tagged Valid (minstret_now [63:32]);
 `endif
 
 	    csr_addr_tselect:  m_csr_value = tagged Valid rg_tselect;
@@ -1016,7 +1027,7 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 				    end
 	       csr_addr_minstret:   begin
 				       new_csr_value = wordxl;
-				       rw_minstret.wset ({ rg_minstret [63:32], wordxl });
+				       rw_minstret.wset ({ minstret_now [63:32], wordxl });
 				    end
 	       csr_addr_mcycleh:    begin
 				       new_csr_value = wordxl;
@@ -1024,7 +1035,7 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 				    end
 	       csr_addr_minstreth:  begin
 				       new_csr_value = wordxl;
-				       rw_minstret.wset ({ wordxl, rg_minstret [31:0] });
+				       rw_minstret.wset ({ wordxl, minstret_now [31:0] });
 				    end
 `else
 	       csr_addr_mcycle:     begin
@@ -1393,6 +1404,8 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
    endmethod
 
    // Read MINSTRET
+   // Raw (lags a retire by a cycle): perf tap, log delay, debug prints only;
+   // architectural reads use minstret_now (LX18)
    method Bit #(64) read_csr_minstret;
       return rg_minstret;
    endmethod

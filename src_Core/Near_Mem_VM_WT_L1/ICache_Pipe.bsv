@@ -205,6 +205,12 @@ module mkICache_Pipe (ICache_Pipe_IFC);
    FIFOF #(Token) f_flush_reqs <- mkUGFIFOF;
    FIFOF #(Token) f_flush_rsps <- mkUGFIFOF;
    FIFOF #(AXI4_Rd_Addr #(Wd_Id, Wd_Addr, Wd_User)) f_ar <- mkUGFIFOF;
+   // LX8: AR staging.  rl_main registers each AR (rg_ar, from rg_st and other registers
+   // only) and its valid bit (rg_ar_v, the only bit the redirect / kill decision reaches);
+   // f_ar.enq runs from these registers next cycle.  Was kill -> f_ar enq select -> 81
+   // data bits in one cycle.  +1 cycle per refill / PTE read / IO fetch.
+   Reg #(AXI4_Rd_Addr #(Wd_Id, Wd_Addr, Wd_User)) rg_ar   <- mkRegU;
+   Reg #(Bool)                                     rg_ar_v <- mkReg (False);
    FIFOF #(AXI4_Rd_Data #(Wd_Id, Wd_Data, Wd_User)) f_rd <- mkUGFIFOF;
 
    rule rl_ar_move (f_ar.notEmpty);
@@ -347,6 +353,11 @@ module mkICache_Pipe (ICache_Pipe_IFC);
    (* fire_when_enabled, no_implicit_conditions *)
    rule rl_main;
       let pres = fv_present;
+
+      // LX8: drain the staged AR; a new one may be staged when the stage is (or becomes) free
+      Bool ar_free = ((! rg_ar_v) || f_ar.notFull);
+      if (rg_ar_v && f_ar.notFull) f_ar.enq (rg_ar);
+      Bool ar_send = False;
 
       CW_Addr w = truncateLSB (rg_pc);
       Bool run  = (rg_st == ST_RUN);
@@ -553,7 +564,7 @@ module mkICache_Pipe (ICache_Pipe_IFC);
          rg_pte_pa <= { rg_satp [21:0], 12'b0 } + zeroExtend ({ walk_va [31:22], 2'b0 });
       rg_pte_ok   <= ((rg_pte_pa [33:32] == 0) && fv_pmp_ok (rg_pmp, fv_pa_page (rg_pte_pa), s_Priv_Mode, PMP_R));
       rg_pte_ok_v <= pte_req;
-      if (pte_req && rg_pte_ok_v && rg_ddr4_ready && f_ar.notFull && (! kill)) begin
+      if (pte_req && rg_pte_ok_v && rg_ddr4_ready && ar_free && (! kill)) begin
          PA pte_pa = rg_pte_pa;
          if (! rg_pte_ok) begin
             walk_fault = tagged Valid False;
@@ -561,18 +572,7 @@ module mkICache_Pipe (ICache_Pipe_IFC);
             st_next    = ST_RUN;
          end
          else begin
-            let ar = AXI4_Rd_Addr { arid:     zeroExtend (rg_epoch),
-                                    araddr:   fn_PA_to_Fabric_Addr (pte_pa),
-                                    arlen:    0,
-                                    arsize:   axsize_4,
-                                    arburst:  axburst_incr,
-                                    arlock:   fabric_default_lock,
-                                    arcache:  fabric_default_arcache,
-                                    arprot:   fabric_default_prot,
-                                    arqos:    fabric_default_qos,
-                                    arregion: fabric_default_region,
-                                    aruser:   fabric_default_user };
-            f_ar.enq (ar);
+            ar_send = True;
             st_next = ((rg_st == ST_PTW1_REQ) ? ST_PTW1_RSP : ST_PTW0_RSP);
          end
       end
@@ -703,20 +703,9 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       // ---- Fabric requests
       // (! kill): a redirect in this cycle cancels the refill above; sending the AR anyway would
       // start an un-stale refill whose beats early restart would forward at the redirect target
-      if ((rg_st == ST_REFILL_REQ) && rg_ddr4_ready && f_ar.notFull && (! kill)) begin
+      if ((rg_st == ST_REFILL_REQ) && rg_ddr4_ready && ar_free && (! kill)) begin
          PA line = fn_align_Addr_to_CLine (fn_pa (rg_miss_ppn, rg_miss_a));
-         let ar = AXI4_Rd_Addr { arid:     zeroExtend (rg_epoch),
-                                 araddr:   fn_PA_to_Fabric_Addr (line),
-                                 arlen:    fromInteger (cwords_per_cline - 1),
-                                 arsize:   axsize_8,
-                                 arburst:  axburst_incr,
-                                 arlock:   fabric_default_lock,
-                                 arcache:  fabric_default_arcache,
-                                 arprot:   fabric_default_prot,
-                                 arqos:    fabric_default_qos,
-                                 arregion: fabric_default_region,
-                                 aruser:   fabric_default_user };
-         f_ar.enq (ar);
+         ar_send = True;
          rg_beat       <= 0;
          rg_refill_err <= False;
          fwd_next = False;
@@ -724,19 +713,8 @@ module mkICache_Pipe (ICache_Pipe_IFC);
          pw_perf_miss.send;
       end
 
-      if ((rg_st == ST_IO_REQ) && rg_ddr4_ready && f_ar.notFull && (! kill)) begin    // as for refills
-         let ar = AXI4_Rd_Addr { arid:     zeroExtend (rg_epoch),
-                                 araddr:   fn_PA_to_Fabric_Addr (fn_pa (rg_io_ppn, rg_pf)),
-                                 arlen:    0,
-                                 arsize:   axsize_8,
-                                 arburst:  axburst_incr,
-                                 arlock:   fabric_default_lock,
-                                 arcache:  fabric_default_arcache,
-                                 arprot:   fabric_default_prot,
-                                 arqos:    fabric_default_qos,
-                                 arregion: fabric_default_region,
-                                 aruser:   fabric_default_user };
-         f_ar.enq (ar);
+      if ((rg_st == ST_IO_REQ) && rg_ddr4_ready && ar_free && (! kill)) begin    // as for refills
+         ar_send = True;
          st_next = ST_IO_RSP;
       end
 
@@ -761,6 +739,25 @@ module mkICache_Pipe (ICache_Pipe_IFC);
             st_next = ST_RUN;
          end
       end
+
+      // LX8: the AR for this state, from registers only (no kill / presentation logic)
+      PA   ar_pa   = (pte_req ? rg_pte_pa
+                              : ((rg_st == ST_IO_REQ) ? fn_pa (rg_io_ppn, rg_pf)
+                                                      : fn_align_Addr_to_CLine (fn_pa (rg_miss_ppn, rg_miss_a))));
+      Bool ar_line = (rg_st == ST_REFILL_REQ);
+      if (ar_free)
+         rg_ar <= AXI4_Rd_Addr { arid:     zeroExtend (rg_epoch),
+                                 araddr:   fn_PA_to_Fabric_Addr (ar_pa),
+                                 arlen:    (ar_line ? fromInteger (cwords_per_cline - 1) : 0),
+                                 arsize:   (pte_req ? axsize_4 : axsize_8),
+                                 arburst:  axburst_incr,
+                                 arlock:   fabric_default_lock,
+                                 arcache:  fabric_default_arcache,
+                                 arprot:   fabric_default_prot,
+                                 arqos:    fabric_default_qos,
+                                 arregion: fabric_default_region,
+                                 aruser:   fabric_default_user };
+      rg_ar_v <= (ar_send || (rg_ar_v && (! f_ar.notFull)));
 
       rg_pf       <= pf_next;
       rg_fwd      <= fwd_next;

@@ -100,29 +100,46 @@ module mkBoot_ROM (Boot_ROM_IFC);
    // ----------------------------------------------------------------
    // Handle fabric read requests
 
-   rule rl_process_rd_req (rg_module_ready);
+   // LX20: the ROM is read into registers (rg_rd_d0 / rg_rd_d4, written only from the ROM
+   // functions) and the response goes out next cycle.  A registered ROM output lets yosys
+   // map the (PROC_ROM-converted) ROMs to block RAM instead of ~2.4K LUTs of decode.
+   // The 4 KiB region needs only a 12-bit offset.  +1 cycle per boot-ROM read.
+   Reg #(Bool)       rg_rd_v   <- mkReg (False);
+   Reg #(Bit #(32))  rg_rd_d0  <- mkRegU;
+   Reg #(Bit #(32))  rg_rd_d4  <- mkRegU;
+   Reg #(Bool)       rg_rd_ok  <- mkRegU;
+   Reg #(Bool)       rg_rd_hi  <- mkRegU;
+   Reg #(AXI4_Rd_Addr #(Wd_Id, Wd_Addr, Wd_User)) rg_rda <- mkRegU;
+
+   rule rl_process_rd_req (rg_module_ready && (! rg_rd_v));
       let rda <- pop_o (slave_xactor.o_rd_addr);
-
-      AXI4_Resp  rresp  = axi4_resp_okay;
-      Bit #(64)  data64 = 0;
-
-      if (! fn_addr_is_ok (rg_addr_base, rda.araddr, rg_addr_lim, rda.arsize)) begin
-	 rresp = axi4_resp_slverr;
+      Bool ok = fn_addr_is_ok (rg_addr_base, rda.araddr, rg_addr_lim, rda.arsize);
+      if (! ok) begin
 	 $display ("%0d: ERROR: Boot_ROM.rl_process_rd_req: unrecognized or misaligned addr",
 		   cur_cycle);
 	 $display ("    ", fshow (rda));
       end
-      else begin
-	 // Byte offset
-	 let byte_offset = rda.araddr - rg_addr_base;
-	 let rom_addr_0 = (byte_offset & (~ 'b_111));
-	 Bit #(32) d0 = fn_read_ROM_0 (rom_addr_0);
-	 let rom_addr_4 = (rom_addr_0 | 'b_100);
-	 Bit #(32) d4 = fn_read_ROM_4 (rom_addr_4);
-	 if ((valueOf (Wd_Data) == 32) && (byte_offset [2] == 1'b_1))
-	    data64 = { 0, d4 };
+      // Byte offset
+      let byte_offset = rda.araddr - rg_addr_base;
+      Bit #(12) rom_addr_0 = (truncate (byte_offset) & (~ 'b_111));
+      Bit #(12) rom_addr_4 = (rom_addr_0 | 'b_100);
+      rg_rd_d0 <= fn_read_ROM_0 (rom_addr_0);
+      rg_rd_d4 <= fn_read_ROM_4 (rom_addr_4);
+      rg_rd_ok <= ok;
+      rg_rd_hi <= (byte_offset [2] == 1'b_1);
+      rg_rda   <= rda;
+      rg_rd_v  <= True;
+   endrule
+
+   rule rl_rd_rsp (rg_rd_v);
+      let rda = rg_rda;
+      AXI4_Resp  rresp  = (rg_rd_ok ? axi4_resp_okay : axi4_resp_slverr);
+      Bit #(64)  data64 = 0;
+      if (rg_rd_ok) begin
+	 if ((valueOf (Wd_Data) == 32) && rg_rd_hi)
+	    data64 = { 0, rg_rd_d4 };
 	 else
-	    data64 = { d4, d0 };
+	    data64 = { rg_rd_d4, rg_rd_d0 };
       end
 
       Bit #(Wd_Data) rdata  = truncate (data64);
@@ -132,9 +149,10 @@ module mkBoot_ROM (Boot_ROM_IFC);
 			      rlast: True,
 			      ruser: rda.aruser};
       slave_xactor.i_rd_data.enq (rdr);
+      rg_rd_v <= False;
 
       if (verbosity > 0) begin
-	 $display ("%0d: Boot_ROM.rl_process_rd_req: ", cur_cycle);
+	 $display ("%0d: Boot_ROM.rl_rd_rsp: ", cur_cycle);
 	 $display ("        ", fshow (rda));
 	 $display ("     => ", fshow (rdr));
       end
@@ -203,6 +221,7 @@ module mkBoot_ROM (Boot_ROM_IFC);
    // Main Fabric Reqs/Rsps
    method Action reset;
       slave_xactor.reset;
+      rg_rd_v <= False;    // LX20: drop a read held across the reset
    endmethod
 
    interface  slave = slave_xactor.axi_side;

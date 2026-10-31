@@ -200,6 +200,7 @@ typedef enum {MODULE_PRERESET,              // After power on reset, before soft
               MODULE_RUNNING,               // Normal operation, during hits
               MODULE_EXCEPTION_RSP,         // On misaligned and access exceptions
               UDTLB_FILL,                   // uDTLB miss: translate, check, fill (slow path)
+              UDTLB_FILLP,                  // LX13: PMA / PMP verdicts from the registered translation
               UDTLB_FILL2,                  // LX6: decide and write from UDTLB_FILL's registered verdicts
 
               PTW_START,                    // On TLB miss, initiate refill of PTE into TLB
@@ -208,6 +209,8 @@ typedef enum {MODULE_PRERESET,              // After power on reset, before soft
 `endif
 	      PTW_LEVEL_1,                  // Page Table Walk, Request Level 1
 	      PTW_LEVEL_0,                  // Page Table Walk, Request Level 0
+	      PTW_CHK,                      // LX12: register the PTE read's PA-range / PMP verdict
+	      PTW_SEND,                     // LX12: send the PTE read from registers
 
               CACHE_START_REFILL,           // On cache miss, initiate refill of cache line in cache
               CACHE_SNAPSHOT,               // Snapshot victim line's other-way words (BRAM read-only)
@@ -667,6 +670,14 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // This reg is used during PTWs
    Reg #(PA) rg_pte_pa <- mkRegU;
 
+   // LX12: a PTE read goes PTW_CHK (PA range + PMP-R on the registered rg_pte_pa) ->
+   // PTW_SEND (exception or AR from registers) -> rg_ptw_next.  Was the level-1 PTE
+   // (fabric response) / satp + VPN add -> PMP -> AR enqueue in one cycle.  +2 cycles
+   // per walk level.
+   Reg #(Module_State) rg_ptw_next <- mkRegU;
+   Reg #(AXI4_Size)    rg_ptw_size <- mkRegU;
+   Reg #(Bool)         rg_ptw_ok   <- mkRegU;
+
 `ifdef ISA_A
    // Reservation regs for AMO LR/SC (Load-Reserved/Store-Conditional)
    Reg #(Bool)     rg_lrsc_valid  <- mkReg (False);
@@ -985,6 +996,18 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       return tuple3 (hit, way_hit, cword);
    endfunction
 
+   // LX14: the hit load's value, extracted and extended per way in parallel with the tag
+   // compare and then selected by the hit (was compare -> way select -> extract -> rg_ld_val).
+   function Bit #(64) fn_hit_ld_val_udtlb;
+      Bit #(64) v = 0;
+      for (Integer way = 0; way < ways_per_cset; way = way + 1) begin
+	 let hit_at_way = (   (state_and_ctag_cset [way].state != CTAG_EMPTY)
+			   && (state_and_ctag_cset [way].ctag  == fn_PA_to_CTag (rg_upa)));
+	 v = (v | (fn_extract_and_extend_bytes (rg_f3, rg_addr, cword_set [way]) & pack (replicate (hit_at_way))));
+      end
+      return v;
+   endfunction
+
    // ----------------------------------------------------------------
    // Functions to drive read-responses (outputs)
 
@@ -1294,8 +1317,9 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	    // Memory LD and AMO_LR
 	    if ((rg_op == CACHE_LD) || is_AMO_LR) begin
 	       if (hit) begin
-		  // Cache hit; drive response
-		  fa_drive_mem_rsp (rg_f3, rg_addr, word64, 0);
+		  // Cache hit; drive response (LX14: value extracted per way)
+		  rg_ld_val <= fn_hit_ld_val_udtlb;
+		  rg_state  <= CACHE_LD_RSP;
 
 `ifdef ISA_A
 		  if (is_AMO_LR) begin
@@ -1494,10 +1518,6 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 							 exc_code:     ?};
 `endif
 
-      PA   pa   = vm_xlate_result.pa;
-      let  page = fv_pa_page (pa);
-      PA   pa_pg_lo = (pa & (~ 'hFFF));
-      PA   pa_pg_hi = (pa | 'hFFF);
       Bool pte_ld = True;
       Bool pte_st = True;
 `ifdef ISA_PRIV_S
@@ -1515,6 +1535,21 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       end
 `endif
       rg_fx_xlate    <= vm_xlate_result;
+      rg_fx_pte_ld   <= pte_ld;
+      rg_fx_pte_st   <= pte_st;
+      rg_state       <= UDTLB_FILLP;
+      end
+   endrule
+
+   // LX13: PMA / PMP verdicts from the registered translation.  Were computed from the
+   // translation's PA in rl_udtlb_fill (op / exception decode -> xlate PA -> PMP range
+   // compares -> rg_fx_pmp_*, lx9 critical, 19.6 ns).  +1 cycle per uDTLB miss.
+   // rl_udtlb_fill2 re-checks rg_kill_echo and the capture's validity.
+   rule rl_udtlb_fillp (rg_state == UDTLB_FILLP);
+      PA   pa   = rg_fx_xlate.pa;
+      let  page = fv_pa_page (pa);
+      PA   pa_pg_lo = (pa & (~ 'hFFF));
+      PA   pa_pg_hi = (pa | 'hFFF);
       rg_fx_mem_addr <= soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (pa));
       rg_fx_io_addr  <= soc_map.m_is_IO_addr  (fn_PA_to_Fabric_Addr (pa));
       rg_fx_mem_page <= (   soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (pa_pg_lo))
@@ -1523,10 +1558,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       rg_fx_pmp_r    <= fv_pmp_ok (rg_pmp, page, rg_priv, PMP_R);
       rg_fx_pmp_w    <= fv_pmp_ok (rg_pmp, page, rg_priv, PMP_W);
       rg_fx_pmp_rw   <= fv_pmp_ok (rg_pmp, page, rg_priv, PMP_RW);
-      rg_fx_pte_ld   <= pte_ld;
-      rg_fx_pte_st   <= pte_st;
       rg_state       <= UDTLB_FILL2;
-      end
    endrule
 
 `ifdef ISA_PRIV_S
@@ -1656,6 +1688,24 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // TODO: should this rule be merged into rl_probe_and_immed_rsp, to avoid losing a cycle?
    //       or does that worsen critical path?
 
+   // LX12: PTE read, PA-range + PMP check from the registered address
+   rule rl_ptw_chk (rg_state == PTW_CHK);
+      rg_ptw_ok <= (   ((rg_pte_pa >> 32) == 0)
+		    && fv_pmp_ok (rg_pmp, fv_pa_page (rg_pte_pa), s_Priv_Mode, PMP_R));
+      rg_state  <= PTW_SEND;
+   endrule
+
+   rule rl_ptw_send (rg_state == PTW_SEND);
+      if (! rg_ptw_ok) begin
+	 rg_exc_code <= access_exc_code;
+	 rg_state    <= MODULE_EXCEPTION_RSP;
+      end
+      else begin
+	 fa_fabric_send_read_req (fn_PA_to_Fabric_Addr ({ rg_pte_pa [pa_sz - 1 : 3], 3'b0 }), rg_ptw_size);
+	 rg_state <= rg_ptw_next;
+      end
+   endrule
+
    rule rl_start_tlb_refill ((rg_state == PTW_START) && (ctr_wr_rsps_pending.value == 0));
 
 `ifdef RV32
@@ -1672,15 +1722,10 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       Fabric_Addr  lev_1_pte_pa_w64_fa = fn_PA_to_Fabric_Addr (lev_1_pte_pa_w64);
       // PMP on the implicit PTE read (Sail: checked as an S-mode read; fault is an
       // access fault of the original access type)
-      if (((lev_1_pte_pa >> 32) != 0) || (! fv_pmp_ok (rg_pmp, fv_pa_page (lev_1_pte_pa), s_Priv_Mode, PMP_R))) begin
-	 rg_exc_code <= access_exc_code;
-	 rg_state    <= MODULE_EXCEPTION_RSP;
-      end
-      else begin
-	 fa_fabric_send_read_req (lev_1_pte_pa_w64_fa, axsize_4);
-	 rg_pte_pa <= lev_1_pte_pa;
-	 rg_state  <= PTW_LEVEL_1;
-      end
+      rg_pte_pa   <= lev_1_pte_pa;
+      rg_ptw_size <= axsize_4;
+      rg_ptw_next <= PTW_LEVEL_1;
+      rg_state    <= PTW_CHK;
 `elsif SV39    // ifdef RV32
 
       // RV64.Sv39: Page Table top is at Level 2
@@ -1848,15 +1893,10 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 `else
 	 AXI4_Size    axi4_size           = axsize_8;
 `endif
-	 if (((lev_0_pte_pa >> 32) != 0) || (! fv_pmp_ok (rg_pmp, fv_pa_page (lev_0_pte_pa), s_Priv_Mode, PMP_R))) begin
-	    rg_exc_code <= access_exc_code;
-	    rg_state    <= MODULE_EXCEPTION_RSP;
-	 end
-	 else begin
-	    fa_fabric_send_read_req (lev_0_pte_pa_w64_fa, axi4_size);
-	    rg_pte_pa <= lev_0_pte_pa;
-	    rg_state  <= PTW_LEVEL_0;
-	 end
+	 rg_pte_pa   <= lev_0_pte_pa;
+	 rg_ptw_size <= axi4_size;
+	 rg_ptw_next <= PTW_LEVEL_0;
+	 rg_state    <= PTW_CHK;
 
       end
 

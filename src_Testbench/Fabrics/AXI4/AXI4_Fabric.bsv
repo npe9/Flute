@@ -88,15 +88,20 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
    // (request, legal, slave_num) by rl_wr_route / rl_rd_route; the routing rules and
    // their arbitration see only registered route bits (was: address-range compares on
    // the transactor head, in series with arbitration and the book-keeping FIFO enqs).
-   // +1 cycle per AW/AR hop; full throughput (2-entry FIFOs).
+   // +1 cycle per AW/AR hop.
+   // LX34: 1-entry route FIFOs: data loads from the decode enqueue only, so the routing
+   // rules' firing (arbitration, book-keeping FIFO flags) no longer reaches a data0/data1
+   // shift mux on the ~100-bit AW/AR record (lx23 s7: f_wr_route EMPTY_N -> f_wr_mis full
+   // -> f_wd_tasks -> f_wr_route data0, 18.3 ns, 16 ns of it routing).  The transactors'
+   // address FIFOs are 1-entry already (LX32), so AW/AR rate is unchanged.
    Vector #(tn_num_masters,
 	    FIFOF #(Tuple3 #(AXI4_Wr_Addr #(wd_id, wd_addr, wd_user),
 			     Bool,
-			     Bit #(TLog #(tn_num_slaves))))) v_f_wr_route <- replicateM (mkFIFOF);
+			     Bit #(TLog #(tn_num_slaves))))) v_f_wr_route <- replicateM (mkFIFOF1);
    Vector #(tn_num_masters,
 	    FIFOF #(Tuple3 #(AXI4_Rd_Addr #(wd_id, wd_addr, wd_user),
 			     Bool,
-			     Bit #(TLog #(tn_num_slaves))))) v_f_rd_route <- replicateM (mkFIFOF);
+			     Bit #(TLog #(tn_num_slaves))))) v_f_rd_route <- replicateM (mkFIFOF1);
 
    // ----------------------------------------------------------------
    // Book-keeping FIFOs and regs

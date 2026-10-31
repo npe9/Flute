@@ -917,11 +917,13 @@ module mkAXI4_Master_Xactor (AXI4_Master_Xactor_IFC #(wd_id, wd_addr, wd_data, w
    Bool guarded   = False;
 
    // These FIFOs are guarded on BSV side, unguarded on AXI side
-   FIFOF #(AXI4_Wr_Addr #(wd_id, wd_addr, wd_user))  f_wr_addr <- mkGFIFOF (guarded, unguarded);
+   // LX32: the address channels are 1-deep (one item per burst; data channels stay 2-deep):
+   // half the flops and no shift mux, in every transactor (area: routing-bound at 80% LUTs)
+   FIFOF #(AXI4_Wr_Addr #(wd_id, wd_addr, wd_user))  f_wr_addr <- mkGFIFOF1 (guarded, unguarded);
    FIFOF #(AXI4_Wr_Data #(wd_data, wd_user))         f_wr_data <- mkGFIFOF (guarded, unguarded);
    FIFOF #(AXI4_Wr_Resp #(wd_id, wd_user))           f_wr_resp <- mkGFIFOF (unguarded, guarded);
 
-   FIFOF #(AXI4_Rd_Addr #(wd_id, wd_addr, wd_user))  f_rd_addr <- mkGFIFOF (guarded, unguarded);
+   FIFOF #(AXI4_Rd_Addr #(wd_id, wd_addr, wd_user))  f_rd_addr <- mkGFIFOF1 (guarded, unguarded);
    FIFOF #(AXI4_Rd_Data #(wd_id, wd_data, wd_user))  f_rd_data <- mkGFIFOF (unguarded, guarded);
 
    // ----------------------------------------------------------------
@@ -1200,11 +1202,12 @@ module mkAXI4_Slave_Xactor (AXI4_Slave_Xactor_IFC #(wd_id, wd_addr, wd_data, wd_
    Bool guarded   = False;
 
    // These FIFOs are guarded on BSV side, unguarded on AXI side
-   FIFOF #(AXI4_Wr_Addr #(wd_id, wd_addr, wd_user))  f_wr_addr <- mkGFIFOF (unguarded, guarded);
+   // LX32: 1-deep address channels (see mkAXI4_Master_Xactor)
+   FIFOF #(AXI4_Wr_Addr #(wd_id, wd_addr, wd_user))  f_wr_addr <- mkGFIFOF1 (unguarded, guarded);
    FIFOF #(AXI4_Wr_Data #(wd_data, wd_user))         f_wr_data <- mkGFIFOF (unguarded, guarded);
    FIFOF #(AXI4_Wr_Resp #(wd_id, wd_user))           f_wr_resp <- mkGFIFOF (guarded, unguarded);
 
-   FIFOF #(AXI4_Rd_Addr #(wd_id, wd_addr, wd_user))  f_rd_addr <- mkGFIFOF (unguarded, guarded);
+   FIFOF #(AXI4_Rd_Addr #(wd_id, wd_addr, wd_user))  f_rd_addr <- mkGFIFOF1 (unguarded, guarded);
    FIFOF #(AXI4_Rd_Data #(wd_id, wd_data, wd_user))  f_rd_data <- mkGFIFOF (guarded, unguarded);
 
    // ----------------------------------------------------------------

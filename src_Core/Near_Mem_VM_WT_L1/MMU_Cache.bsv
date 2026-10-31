@@ -950,23 +950,34 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       udtlb_ppn = udtlb_ppn | (udtlb_matches [i] ? vrg_udtlb [i].ppn : 0);
    PA        udtlb_pa  = (rg_udtlb_bypass ? rg_pa : { udtlb_ppn, rg_addr [11:0] });
 
-   // LX4: the probe's tag compare runs against every entry's PPN (and
-   // rg_pa for a bypass) in parallel, then ORs with the VPN matches, so the
-   // uDTLB PPN mux is off the hit -> load-value path.  Matching entries of
-   // one fresh period share a translation (duplicates differ only in ok_*),
-   // so the OR equals the compare against udtlb_pa.
+   // LX7: the uDTLB lookup is registered in the RAM wait cycle.  'req' and
+   // rl_rereq launch the RAM read and toggle rg_req_seq; the probe waits
+   // for rl_age_ram_rsp (one cycle), so this free-running capture has seen
+   // the request's rg_addr / rg_op before the probe reads it.  Every path
+   // that changes vrg_udtlb, rg_udtlb_bypass or rg_pa and then probes again
+   // goes through CACHE_REREQ (one more wait cycle); rg_lrsc_pa changes only
+   // in the probe, which always leaves MODULE_RUNNING.  Freshness (context /
+   // PMP / SFENCE sequence numbers) stays combinational in the probe.
+   Reg #(Bool) rg_u_any      <- mkConfigRegU;
+   Reg #(PA)   rg_upa        <- mkConfigRegU;
+   Reg #(Bool) rg_ulrsc_eq   <- mkConfigRegU;
+
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_capture_udtlb;
+      rg_u_any    <= any (id, udtlb_matches);
+      rg_upa      <= udtlb_pa;
+      rg_ulrsc_eq <= (udtlb_pa == rg_lrsc_pa);
+   endrule
+
+   Bool udtlb_hit_r = ((udtlb_fresh && rg_u_any) || rg_udtlb_bypass);
+
    function Tuple3 #(Bool, Way_in_CSet, Bit #(64)) fn_test_cache_hit_udtlb;
       Bool        hit     = False;
       Way_in_CSet way_hit = 0;
       CWord       cword   = 0;
       for (Integer way = 0; way < ways_per_cset; way = way + 1) begin
-	 let ctag = state_and_ctag_cset [way].ctag;
-	 Bool tag_hit = (rg_udtlb_bypass && (ctag == fn_PA_to_CTag (rg_pa)));
-	 for (Integer i = 0; i < valueOf (UDTLB_Size); i = i + 1) begin
-	    PA pa_i = { vrg_udtlb [i].ppn, rg_addr [11:0] };
-	    tag_hit = tag_hit || ((! rg_udtlb_bypass) && udtlb_matches [i] && (ctag == fn_PA_to_CTag (pa_i)));
-	 end
-	 let hit_at_way = ((state_and_ctag_cset [way].state != CTAG_EMPTY) && tag_hit);
+	 let hit_at_way = (   (state_and_ctag_cset [way].state != CTAG_EMPTY)
+			   && (state_and_ctag_cset [way].ctag  == fn_PA_to_CTag (rg_upa)));
 	 hit = hit || hit_at_way;
 	 if (hit_at_way) way_hit = fromInteger (way);
 	 cword = (cword | (cword_set [way] & pack (replicate (hit_at_way))));
@@ -1255,19 +1266,19 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       // filled (rl_udtlb_fill), so a hit needs only the VPN compare.  A miss
       // costs the slow path: rl_udtlb_fill, then this rule again.
 
-      if (! udtlb_hit) begin
+      if (! udtlb_hit_r) begin
 	 rg_state <= UDTLB_FILL;
 	 if (cfg_verbosity > 1)
 	    $display ("        uDTLB miss -> UDTLB_FILL");
       end
 
       else begin
-	 PA pa = udtlb_pa;
+	 PA pa = rg_upa;
 	 rg_pa <= pa;
 
 	 // SC without a matching reservation fails (rd = 1) with no access
 	 // (Sail checks the reservation before the PMP / PMA / bus).
-	 if (is_AMO_SC && ((! rg_lrsc_valid) || (rg_lrsc_pa != pa))) begin
+	 if (is_AMO_SC && ((! rg_lrsc_valid) || (! rg_ulrsc_eq))) begin
 	    rg_lrsc_valid <= False;
 	    fa_drive_mem_rsp (rg_f3, rg_addr, 1, 0);
 	    if (cfg_verbosity > 1)
@@ -1305,7 +1316,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 		     $display ("        Read Miss: -> CACHE_START_REFILL.");
 `ifdef ISA_A
 		  // TODO: this is pessimistic; unnecessary in a single-hart system?
-		  if (is_AMO_LR && (pa == rg_lrsc_pa)) begin
+		  if (is_AMO_LR && rg_ulrsc_eq) begin
 		     rg_lrsc_valid <= False;
 		     if (cfg_verbosity > 1)
 			$display ("        AMO LR: cache refill: cancelling LR/SC reservation for PA 0x%0h", rg_lrsc_pa);
@@ -1320,7 +1331,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	       Bool do_write = True;    // Always True for ST; success/fail for AMO_SC
 `ifdef ISA_A
 	       // ST: if to an LR/SC reserved address, invalidate the reservation
-	       if ((rg_op == CACHE_ST) && (pa == rg_lrsc_pa)) begin
+	       if ((rg_op == CACHE_ST) && rg_ulrsc_eq) begin
 		  rg_lrsc_valid <= False;
 		  if (cfg_verbosity > 1)
 		     $display ("        ST: cancelling LR/SC reservation for PA", pa);
@@ -1334,7 +1345,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 		     if (cfg_verbosity > 1)
 			$display ("        AMO SC: fail due to invalid LR/SC reservation");
 		  end
-		  else if (rg_lrsc_pa != pa) begin
+		  else if (! rg_ulrsc_eq) begin
 		     do_write = False;
 		     if (cfg_verbosity > 1)
 			$display ("        AMO SC: fail: reserved addr 0x%0h, this address 0x%0h",
@@ -1423,7 +1434,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 		  // TODO: should we invalidate even if to a different
 		  // addr, since LR/SC pairs are not supposed to have
 		  // other mem ops between them?
-		  if (pa == rg_lrsc_pa) begin
+		  if (rg_ulrsc_eq) begin
 		     rg_lrsc_valid <= False;
 		     if (cfg_verbosity > 1)
 			$display ("        AMO_op: cancelling LR/SC reservation for PA", pa);
@@ -1569,7 +1580,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	    // Memory, but the page is not memory end to end: no entry; this
 	    // request alone re-probes with rg_pa (cleared by the next req).
 	    rg_udtlb_bypass <= True;
-	    rg_state <= MODULE_RUNNING;
+	    rg_state <= CACHE_REREQ;    // LX7: re-capture the lookup
 	 end
 
 	 else if (pa_hi_ok && pmp_ok && (is_mem_page || (! dmem_not_imem))) begin
@@ -1596,7 +1607,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	    rg_udtlb_pmp_seen <= rg_udtlb_pmp_cap;
 	    rg_udtlb_tlb_seen <= rg_udtlb_tlb_cap;
 
-	    rg_state <= MODULE_RUNNING;
+	    rg_state <= CACHE_REREQ;    // LX7: re-capture the lookup
 	    if (cfg_verbosity > 1)
 	       $display ("        uDTLB fill [%0d]: ", slot, fshow (e));
 	 end

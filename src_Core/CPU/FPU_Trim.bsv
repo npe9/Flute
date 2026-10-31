@@ -43,6 +43,7 @@ import GetPut       :: *;
 import ClientServer :: *;
 
 import Vector       :: *;
+import ConfigReg    :: *;
 
 import GetPut_Aux :: *;
 
@@ -61,7 +62,8 @@ Bit #(2) k_zero = 3;
 
 typedef enum {
    FT_IDLE, FT_LOAD, FT_MUL, FT_NORM1, FT_NORM2, FT_ALIGN0, FT_ALIGN, FT_ADD,
-   FT_DIVINIT, FT_DIVITER, FT_DIVEND, FT_RND0, FT_DENORM, FT_RND1, FT_PACK, FT_F2I, FT_IPACK
+   FT_DIVINIT, FT_DIVITER, FT_DIVEND, FT_RND0, FT_DENORM, FT_RND1, FT_PACK, FT_F2I, FT_IPACK,
+   FT_ADD2, FT_PRE
 } FT_State deriving (Bits, Eq, FShow);
 
 typedef struct {
@@ -198,6 +200,10 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
    Reg #(FT_Exp)    rg_es   <- mkRegU;
    Reg #(FT_Exp)    rg_ex   <- mkRegU;
    Reg #(Bit #(7))  rg_amt  <- mkRegU;    // shifter amount (always registered)
+   // LX9: FT_ADD registers the sum and its sign; FT_ADD2 decides.  The 109-bit carry-out
+   // (ad_neg) gated rg_s / rg_state / the pending flags in the same cycle.  +1 cycle per add.
+   Reg #(FT_Sig)    rg_sum  <- mkRegU;
+   Reg #(Bool)      rg_aneg <- mkRegU;
    Reg #(Bool)      rg_xneg <- mkRegU;    // ALIGN: X has the larger exponent, shift S
    Reg #(Bit #(72)) rg_pp   <- mkRegU;
    Reg #(Bit #(57)) rg_r    <- mkRegU;
@@ -227,9 +233,34 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
    Bool in_dbl     = (is_cvtff ? (rg_rs2 [0] == 1) : (rg_f7 [0] == 1));
    Bool out_dbl    = (rg_f7 [0] == 1);
 
-   FT_Unp ua = fn_unpack (in_dbl, rg_v1);
-   FT_Unp ub = fn_unpack (in_dbl, rg_v2);
-   FT_Unp ux = fn_unpack (in_dbl, (is_fma ? rg_v3 : rg_v2));   // addend (FMA) or rs2
+   // LX10: operands are unpacked and magnitude-compared in FT_PRE (the cycle after the
+   // request) by a free-running capture; every later state reads the registers.  Was
+   // request registers -> unpack -> 63-bit compare -> min/max select -> rg_res in FT_LOAD.
+   // +1 cycle per op.
+   FT_Unp ua_c = fn_unpack (in_dbl, rg_v1);
+   FT_Unp ub_c = fn_unpack (in_dbl, rg_v2);
+   FT_Unp ux_c = fn_unpack (in_dbl, (is_fma ? rg_v3 : rg_v2));   // addend (FMA) or rs2
+   Bit #(63) mag_a_c = (in_dbl ? ua_c.raw [62:0] : zeroExtend (ua_c.raw [30:0]));
+   Bit #(63) mag_b_c = (in_dbl ? ub_c.raw [62:0] : zeroExtend (ub_c.raw [30:0]));
+
+   Reg #(FT_Unp) rg_ua   <- mkConfigRegU;
+   Reg #(FT_Unp) rg_ub   <- mkConfigRegU;
+   Reg #(FT_Unp) rg_ux   <- mkConfigRegU;
+   Reg #(Bool)   rg_m_lt <- mkConfigRegU;
+   Reg #(Bool)   rg_m_eq <- mkConfigRegU;
+
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_capture_operands;
+      rg_ua   <= ua_c;
+      rg_ub   <= ub_c;
+      rg_ux   <= ux_c;
+      rg_m_lt <= (mag_a_c < mag_b_c);
+      rg_m_eq <= (mag_a_c == mag_b_c);
+   endrule
+
+   FT_Unp ua = rg_ua;
+   FT_Unp ub = rg_ub;
+   FT_Unp ux = rg_ux;
 
    FT_Exp emin = (rg_dbl ? -1022 : -126);
 
@@ -329,10 +360,8 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
    endfunction
 
    // compares
-   Bit #(63) mag_a = (in_dbl ? ua.raw [62:0] : zeroExtend (ua.raw [30:0]));
-   Bit #(63) mag_b = (in_dbl ? ub.raw [62:0] : zeroExtend (ub.raw [30:0]));
-   Bool m_lt   = (mag_a < mag_b);
-   Bool m_eq   = (mag_a == mag_b);
+   Bool m_lt   = rg_m_lt;
+   Bool m_eq   = rg_m_eq;
    Bool both_z = ua.zero && ub.zero;
    Bool lt_tot = ((ua.sign != ub.sign) ? (ua.sign == 1)
                                        : ((ua.sign == 1) ? ((! m_lt) && (! m_eq)) : m_lt));
@@ -465,9 +494,11 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
          rg_opc <= opc; rg_f7 <= f7; rg_rm <= rm; rg_rs2 <= rs2;
          rg_v1 <= v1; rg_v2 <= v2; rg_v3 <= v3;
          rg_valid <= False;
-         rg_state <= FT_LOAD;
+         rg_state <= FT_PRE;
       end
       else case (rg_state)
+
+      FT_PRE: rg_state <= FT_LOAD;    // LX10: rl_capture_operands samples the request
 
       // ----------------------------------------------------------------
       FT_LOAD: begin
@@ -737,10 +768,18 @@ module mkFPU_Trim #(Bit #(4) verbosity) (FBox_Top_IFC);
       end
 
       FT_ADD: begin
-         if (ad_neg)
-            rg_xbig <= True;          // equal exponents and |X| > |S|: redo as X - S
+         rg_sum   <= ad_out;
+         rg_aneg  <= ad_neg;
+         rg_state <= FT_ADD2;
+      end
+
+      FT_ADD2: begin
+         if (rg_aneg) begin
+            rg_xbig  <= True;         // equal exponents and |X| > |S|: redo as X - S
+            rg_state <= FT_ADD;
+         end
          else begin
-            rg_s     <= ad_out;
+            rg_s     <= rg_sum;
             rg_es    <= rg_es + 1;
             if (rg_sub && rg_xbig) rg_sign <= rg_signc;
             rg_padd  <= False;

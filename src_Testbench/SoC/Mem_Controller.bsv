@@ -215,8 +215,12 @@ module mkMem_Controller (Mem_Controller_IFC);
    // Communication with fabric
    AXI4_Slave_Xactor_IFC #(Wd_Id, Wd_Addr, Wd_Data, Wd_User) slave_xactor <- mkAXI4_Slave_Xactor;
 
-   // Requests merged from the (WrA, WrD) and RdA channels
-   FIFOF #(Req) f_reqs <- mkPipelineFIFOF;
+   // Requests merged from the (WrA, WrD) and RdA channels.
+   // LX16: 2-deep mkFIFOF, not a pipeline FIFO: the merge rules' enqueue (and
+   // so the AXI address pops) then depends only on the registered full flag,
+   // not on this cycle's dequeue by rl_rd_issue / rl_wr (lx11 seed 5: segment
+   // arithmetic -> f_reqs.deq -> enq -> slave_xactor f_rd_addr, 19.4 ns).
+   FIFOF #(Req) f_reqs <- mkFIFOF;
 
    // Write burst in progress (beats after the first)
    Reg #(AXI4_Len)       rg_wr_left <- mkReg (0);
@@ -226,8 +230,12 @@ module mkMem_Controller (Mem_Controller_IFC);
    Reg #(Bool)           rg_wr_ok   <- mkRegU;
 
    // Raw memory
-   // Bypass: the Sdram side is registered (its f_reqs / f_rsps), so these add no cycle
-   FIFOF #(Raw_Mem_Req)   f_raw_reqs <- mkBypassFIFOF;
+   // Responses bypass: the Sdram side is registered (its f_rsps), so this adds no cycle.
+   // LX17: requests are registered here (2-deep mkFIFOF, +1 cycle per raw request): through a
+   // bypass FIFO, rl_rd_issue's segment arithmetic / f_rd_pend state reached the Sdram
+   // controller's LUTRAM request FIFO write enable and output register (lx12 seeds 3/7,
+   // 19.6-20.8 ns).
+   FIFOF #(Raw_Mem_Req)   f_raw_reqs <- mkFIFOF;
    FIFOF #(Raw_Mem_Chunk) f_raw_rsps <- mkBypassFIFOF;
    FIFOF #(Rd_Pend)       f_rd_pend  <- mkSizedFIFOF (2);
 

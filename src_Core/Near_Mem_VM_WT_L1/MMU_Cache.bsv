@@ -539,6 +539,16 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
    // Fabric request/response
    AXI4_Master_Xactor_IFC #(Wd_Id, Wd_Addr, Wd_Data, Wd_User) master_xactor <- mkAXI4_Master_Xactor;
+`ifdef RV32
+   // LX21: AR staging.  rl_ar_capture computes the AR every idle cycle from rg_state and
+   // address registers only (fv_staged_ar); a sender only flips rg_ar_enqs, and rl_ar_drain
+   // enqueues rg_ar next cycle.  Was write-path FIFO state -> sender WILL_FIRE ->
+   // f_rd_addr enq data mux (19 ns, lx14).  +1 cycle per refill / PTE / IO read.
+   Reg #(AXI4_Rd_Addr #(Wd_Id, Wd_Addr, Wd_User)) rg_ar      <- mkConfigRegU;
+   Reg #(Bit #(1))                                 rg_ar_enqs <- mkConfigReg (0);
+   Reg #(Bit #(1))                                 rg_ar_deqs <- mkConfigReg (0);
+   Bool ar_pending = (rg_ar_enqs != rg_ar_deqs);
+`endif
 
 `ifdef ISA_PRIV_S
    // The TLB
@@ -972,12 +982,44 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    Reg #(Bool) rg_u_any      <- mkConfigRegU;
    Reg #(PA)   rg_upa        <- mkConfigRegU;
    Reg #(Bool) rg_ulrsc_eq   <- mkConfigRegU;
+   // LX19: the per-way tag match, from the raw tag-RAM output (valid in the wait cycle;
+   // rl_capture_ram_outputs registers the same value into rg_tag_ram_q) against udtlb_pa.
+   // Was rg_upa -> tag compare -> way select -> rg_ld_val in the probe (lx13, 19.8 ns).
+   Reg #(Vector #(Ways_per_CSet, Bool)) rg_uhitw <- mkConfigRegU;
 
    (* fire_when_enabled, no_implicit_conditions *)
    rule rl_capture_udtlb;
       rg_u_any    <= any (id, udtlb_matches);
       rg_upa      <= udtlb_pa;
-      rg_ulrsc_eq <= (udtlb_pa == rg_lrsc_pa);
+      // LX22: the LR/SC-address and tag compares run per uDTLB entry, in parallel with the
+      // VPN match, and are then selected by it (entries matching together share one PPN).
+      // Was rg_addr -> VPN match -> PPN mux -> udtlb_pa -> 34-bit compare (lx15 s7, 19.9 ns).
+      State_and_CTag_CSet raw_tags = ram_state_and_ctag_cset.b.read;
+      function Vector #(Ways_per_CSet, Bool) fn_tag_eq (PA pa);
+	 Vector #(Ways_per_CSet, Bool) v = replicate (False);
+	 for (Integer way = 0; way < ways_per_cset; way = way + 1)
+	    v [way] = (   (raw_tags [way].state != CTAG_EMPTY)
+		       && (raw_tags [way].ctag  == fn_PA_to_CTag (pa)));
+	 return v;
+      endfunction
+      Bool                          lrsc_eq = False;
+      Vector #(Ways_per_CSet, Bool) hw      = replicate (False);
+      if (rg_udtlb_bypass) begin
+	 lrsc_eq = (rg_pa == rg_lrsc_pa);
+	 hw      = fn_tag_eq (rg_pa);
+      end
+      else
+	 for (Integer i = 0; i < valueOf (UDTLB_Size); i = i + 1) begin
+	    PA pa_i = { vrg_udtlb [i].ppn, rg_addr [11:0] };
+	    Vector #(Ways_per_CSet, Bool) hw_i = fn_tag_eq (pa_i);
+	    if (udtlb_matches [i]) begin
+	       lrsc_eq = lrsc_eq || (pa_i == rg_lrsc_pa);
+	       for (Integer way = 0; way < ways_per_cset; way = way + 1)
+		  hw [way] = hw [way] || hw_i [way];
+	    end
+	 end
+      rg_ulrsc_eq <= lrsc_eq;
+      rg_uhitw    <= hw;
    endrule
 
    Bool udtlb_hit_r = ((udtlb_fresh && rg_u_any) || rg_udtlb_bypass);
@@ -987,8 +1029,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       Way_in_CSet way_hit = 0;
       CWord       cword   = 0;
       for (Integer way = 0; way < ways_per_cset; way = way + 1) begin
-	 let hit_at_way = (   (state_and_ctag_cset [way].state != CTAG_EMPTY)
-			   && (state_and_ctag_cset [way].ctag  == fn_PA_to_CTag (rg_upa)));
+	 let hit_at_way = rg_uhitw [way];    // LX19
 	 hit = hit || hit_at_way;
 	 if (hit_at_way) way_hit = fromInteger (way);
 	 cword = (cword | (cword_set [way] & pack (replicate (hit_at_way))));
@@ -1001,8 +1042,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    function Bit #(64) fn_hit_ld_val_udtlb;
       Bit #(64) v = 0;
       for (Integer way = 0; way < ways_per_cset; way = way + 1) begin
-	 let hit_at_way = (   (state_and_ctag_cset [way].state != CTAG_EMPTY)
-			   && (state_and_ctag_cset [way].ctag  == fn_PA_to_CTag (rg_upa)));
+	 let hit_at_way = rg_uhitw [way];    // LX19
 	 v = (v | (fn_extract_and_extend_bytes (rg_f3, rg_addr, cword_set [way]) & pack (replicate (hit_at_way))));
       end
       return v;
@@ -1054,7 +1094,12 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 					     arregion: fabric_default_region,
 					     aruser:   fabric_default_user};
 
+`ifdef RV32
+	 // LX21: the AR itself comes from fv_staged_ar (same registers, same cycle)
+	 when (! ar_pending, rg_ar_enqs._write (~ rg_ar_enqs));
+`else
 	 master_xactor.i_rd_addr.enq (mem_req_rd_addr);
+`endif
 
 	 // Debugging
 	 if (cfg_verbosity > 1) begin
@@ -1083,7 +1128,11 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 					     arregion: fabric_default_region,
 					     aruser:   fabric_default_user};
 
+`ifdef RV32
+	 when (! ar_pending, rg_ar_enqs._write (~ rg_ar_enqs));    // LX21
+`else
 	 master_xactor.i_rd_addr.enq (mem_req_rd_addr);
+`endif
 
 	 // Debugging
 	 if (cfg_verbosity > 1) begin
@@ -1099,14 +1148,35 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // enqueuing rule now carries an explicit, early notFull guard.
    FIFOF #(Tuple3 #(Bit #(3), PA, Bit #(64))) f_fabric_write_reqs <- mkUGFIFOF;
 
-   // Send a write-request into the fabric
+   // LX28: write staging (the LX21 pattern for writes).  rl_w_capture registers, every idle
+   // cycle, the write the current state's sender would make (fv_staged_w: registers and the
+   // PTE-writeback FIFO head only); a sender flips rg_w_enqs, and rl_w_drain moves rg_w into
+   // f_fabric_write_reqs next cycle.  The senders are exclusive by rg_state: the probe
+   // (MODULE_RUNNING), rl_amo_write, rl_io_write_req, rl_io_amo_write, and the PTE
+   // writeback only outside those states.  Was sender WILL_FIRE (late probe / SC decode)
+   // -> f_fabric_write_reqs data0 (lx19 s7, 21.6 ns).  +1 cycle per fabric write.
+   Reg #(Tuple3 #(Bit #(3), PA, Bit #(64))) rg_w      <- mkConfigRegU;
+   Reg #(Bit #(1))                           rg_w_enqs <- mkConfigReg (0);
+   Reg #(Bit #(1))                           rg_w_deqs <- mkConfigReg (0);
+   Bool w_pending   = (rg_w_enqs != rg_w_deqs);
+   Bool w_src_state = (   (rg_state == MODULE_RUNNING) || (rg_state == CACHE_AMO_WRITE)
+		       || (rg_state == IO_REQ) || (rg_state == IO_AMO_WRITE));
+   // No write anywhere between a sender and the fabric (read starts, IO-write completion)
+   Bool w_quiet     = (! w_pending) && (! f_fabric_write_reqs.notEmpty);
+
+   // Send a write-request into the fabric (LX28: the request itself is fv_staged_w)
    function Action fa_fabric_send_write_req (Bit #(3)  f3, PA  pa, Bit #(64)  st_val);
       action
-	 if (! f_fabric_write_reqs.notFull)
-	    $display ("%0d: ASSERT FAIL %s: f_fabric_write_reqs enq while full", cur_cycle, d_or_i);
-	 f_fabric_write_reqs.enq (tuple3 (f3, pa, st_val));
+	 if (w_pending)
+	    $display ("%0d: ASSERT FAIL %s: write staged while one is pending", cur_cycle, d_or_i);
+	 rg_w_enqs <= ~ rg_w_enqs;
       endaction
    endfunction
+
+   rule rl_w_drain (w_pending && f_fabric_write_reqs.notFull);
+      f_fabric_write_reqs.enq (rg_w);
+      rg_w_deqs <= ~ rg_w_deqs;
+   endrule
 
    rule rl_fabric_send_write_req (rg_ddr4_ready && f_fabric_write_reqs.notEmpty);
       match { .f3, .pa, .st_val } <- pop (f_fabric_write_reqs);
@@ -1169,12 +1239,26 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       endaction
    endfunction
 
-   rule rl_writeback_updated_PTE (f_fabric_write_reqs.notFull);
+   rule rl_writeback_updated_PTE ((! w_src_state) && (! w_pending));    // LX28
       match { .pa, .pte } <- pop (f_pte_writebacks);
       let f3 = ((xlen == 32) ? f3_SW : f3_SD);
       fa_fabric_send_write_req (f3, pa, zeroExtend (pte));
    endrule
 `endif
+
+   // LX28: the write each sender would make, from registers only
+   rule rl_w_capture (! w_pending);
+      if (rg_state == MODULE_RUNNING)
+	 rg_w <= tuple3 (rg_f3, rg_upa, rg_st_amo_val);
+      else if (w_src_state)
+	 rg_w <= tuple3 (rg_f3, rg_pa, rg_st_amo_val);
+`ifdef ISA_PRIV_S
+      else begin
+	 match { .pa, .pte } = f_pte_writebacks.first;
+	 rg_w <= tuple3 (((xlen == 32) ? f3_SW : f3_SD), pa, zeroExtend (pte));
+      end
+`endif
+   endrule
 
    // ================================================================
    // BEHAVIOR
@@ -1209,6 +1293,9 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 	 master_xactor.reset;
 	 ctr_wr_rsps_pending.clear;
 	 rg_epoch <= rg_epoch + 1;
+`ifdef RV32
+	 rg_ar_deqs <= rg_ar_enqs;    // LX21: drop a staged AR (the epoch is stamped at the port)
+`endif
       end
 
       $display ("%0d: %s: cache size %0d KB, associativity %0d, line size %0d bytes (= %0d XLEN words)",
@@ -1258,7 +1345,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 				&& (rg_age_seen == rg_req_seq)
 				&& (! rg_kill_echo)    // RLD-4: see interface comment
 				// E33: only ST / SC can enqueue a fabric write here
-				&& (f_fabric_write_reqs.notFull || ((rg_op != CACHE_ST) && (! is_AMO_SC))));
+				&& ((! w_pending) || ((rg_op != CACHE_ST) && (! is_AMO_SC))));    // LX28
 
       // Print some initial information for debugging
       if (cfg_verbosity > 1) begin
@@ -1680,6 +1767,52 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       end
    endrule: rl_udtlb_fill2
 
+`ifdef RV32
+   // LX21: the AR each sender would send, from registers only.  Senders (RV32):
+   // rl_ptw_send (PTW_SEND), rl_start_cache_refill (CACHE_START_REFILL),
+   // rl_io_read_req / rl_io_AMO_op_req (IO_REQ).
+   function AXI4_Rd_Addr #(Wd_Id, Wd_Addr, Wd_User) fv_staged_ar;
+      Fabric_Addr addr = fn_PA_to_Fabric_Addr (rg_pa);
+      AXI4_Size   size = fn_funct3_to_AXI4_Size (rg_f3);
+      AXI4_Len    len  = 0;
+      AXI4_Burst  brst = fabric_default_burst;
+`ifdef ISA_PRIV_S
+      if (rg_state == PTW_SEND) begin
+	 addr = fn_PA_to_Fabric_Addr ({ rg_pte_pa [pa_sz - 1 : 3], 3'b0 });
+	 size = rg_ptw_size;
+      end
+      else
+`endif
+      if (rg_state == CACHE_START_REFILL) begin
+	 addr = fn_PA_to_Fabric_Addr (fn_align_Addr_to_CLine (rg_pa));
+	 size = ((bytes_per_fabric_data == 4) ? axsize_4 : axsize_8);
+	 len  = fromInteger ((bytes_per_cline / bytes_per_fabric_data) - 1);
+	 brst = axburst_incr;
+      end
+      return AXI4_Rd_Addr {arid:     fabric_default_id,
+			   araddr:   addr,
+			   arlen:    len,
+			   arsize:   size,
+			   arburst:  brst,
+			   arlock:   fabric_default_lock,
+			   arcache:  fabric_default_arcache,
+			   arprot:   fabric_default_prot,
+			   arqos:    fabric_default_qos,
+			   arregion: fabric_default_region,
+			   aruser:   fabric_default_user};
+   endfunction
+
+   rule rl_ar_capture (! ar_pending);
+      rg_ar <= fv_staged_ar;
+   endrule
+
+   (* preempts = "rl_start_reset, rl_ar_drain" *)
+   rule rl_ar_drain (ar_pending);
+      master_xactor.i_rd_addr.enq (rg_ar);
+      rg_ar_deqs <= ~ rg_ar_deqs;
+   endrule
+`endif
+
 `ifdef ISA_PRIV_S
    // ****************************************************************
    // TLB REFILLS (Page Table Walks)
@@ -1706,7 +1839,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       end
    endrule
 
-   rule rl_start_tlb_refill ((rg_state == PTW_START) && (ctr_wr_rsps_pending.value == 0));
+   rule rl_start_tlb_refill ((rg_state == PTW_START) && (ctr_wr_rsps_pending.value == 0) && w_quiet);
 
 `ifdef RV32
 
@@ -2009,7 +2142,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // Initiate read of cword_set in cache for read-modify-write of word64
 
    rule rl_start_cache_refill (   (rg_state == CACHE_START_REFILL)
-			       && (ctr_wr_rsps_pending.value == 0));
+			       && (ctr_wr_rsps_pending.value == 0) && w_quiet);
       if (cfg_verbosity > 1)
 	 $display ("%0d: %s.rl_start_cache_refill: ", cur_cycle, d_or_i);
 
@@ -2254,7 +2387,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       rg_state      <= CACHE_AMO_WRITE;
    endrule
 
-   rule rl_amo_write ((rg_state == CACHE_AMO_WRITE) && f_fabric_write_reqs.notFull);
+   rule rl_amo_write ((rg_state == CACHE_AMO_WRITE) && (! w_pending));    // LX28
       // Update cache line in cache
       let new_cword_set = fn_update_cword_set (rg_amo_cword_set, rg_amo_way, rg_pa, rg_f3, rg_st_amo_val);
       ram_cword_set.a.put (bram_cmd_write, cset_cword_in_cache, new_cword_set);
@@ -2280,33 +2413,38 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // E25: provide a registered hit-LD / LR / SC-fail response.
    // Stays in this state until the CPU's next request (same exit as rl_ST_AMO_response).
 
-   rule rl_LD_response (rg_state == CACHE_LD_RSP);
-      if (rg_kill_echo)
-	 rg_state <= MODULE_READY;
-      else begin
-	 dw_valid             <= True;
-	 dw_output_ld_val     <= rg_ld_val;
-	 dw_output_st_amo_val <= 0;
-      end
+   // LX23: every response is driven from a hold state by a rule that writes only the
+   // output wires, so 'valid' is a function of rg_state / rg_kill_echo alone (no
+   // WILL_FIRE: those rules conflict with nothing).  The RLD-4 kill exit is its own rule.
+   // Was dcache rule urgency (reset / fabric FIFO state) -> valid -> Stage2 status ->
+   // every rl_pipe move (lx15 s5, 18.5 ns).  IO read and IO AMO responses now pass
+   // through IO_READ_RSP first (+1 cycle each).
+   Bool hold_rsp_state = (   (rg_state == CACHE_LD_RSP)
+			  || (rg_state == CACHE_ST_AMO_RSP)
+			  || (rg_state == IO_READ_RSP)
+			  || (rg_state == MODULE_EXCEPTION_RSP));
+
+   rule rl_kill_echo_exit (hold_rsp_state && rg_kill_echo);
+      // RLD-4: a new op just entered Stage2 (its deferred req launches this same cycle
+      // and supersedes this stale response); the req method's write of MODULE_RUNNING
+      // wins this cycle's write-mux if both fire.
+      rg_state <= MODULE_READY;
+   endrule
+
+   rule rl_LD_response ((rg_state == CACHE_LD_RSP) && (! rg_kill_echo));
+      dw_valid             <= True;
+      dw_output_ld_val     <= rg_ld_val;
+      dw_output_st_amo_val <= 0;
    endrule
 
    // ----------------------------------------------------------------
    // Provide write-response (ST op)
    // Stays in this state until CPU's next request puts it back into RUNNING state
 
-   rule rl_ST_AMO_response (rg_state == CACHE_ST_AMO_RSP);
-      if (rg_kill_echo) begin
-	 // RLD-4: a new op just entered Stage2 (its deferred req launches
-	 // this same cycle and supersedes this stale response); the req
-	 // method's write of MODULE_RUNNING wins this cycle's write-mux if
-	 // both fire.
-	 rg_state <= MODULE_READY;
-      end
-      else begin
-	 dw_valid             <= True;
-	 dw_output_ld_val     <= zeroExtend (rg_ld_val);        // Irrelevant for ST; relevant for SC, AMO
-	 dw_output_st_amo_val <= zeroExtend (rg_st_amo_val);
-      end
+   rule rl_ST_AMO_response ((rg_state == CACHE_ST_AMO_RSP) && (! rg_kill_echo));
+      dw_valid             <= True;
+      dw_output_ld_val     <= zeroExtend (rg_ld_val);        // Irrelevant for ST; relevant for SC, AMO
+      dw_output_st_amo_val <= zeroExtend (rg_st_amo_val);
 
 `ifdef WATCH_TOHOST
       // ----------------
@@ -2337,7 +2475,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
    rule rl_io_read_req (   (rg_state == IO_REQ)
 			&& ((rg_op == CACHE_LD) || is_AMO_LR)
-			&& (ctr_wr_rsps_pending.value == 0));
+			&& (ctr_wr_rsps_pending.value == 0) && w_quiet);
 
       if (cfg_verbosity > 1)
 	 $display ("%0d: %s.rl_io_read_req; f3 0x%0h vaddr %0h  paddr %0h",
@@ -2369,8 +2507,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
       // Successful read
       if (rd_data.rresp == axi4_resp_okay) begin
-	 fa_drive_IO_read_rsp (rg_f3, rg_addr, ld_val);
-	 rg_state <= IO_READ_RSP;
+	 rg_state <= IO_READ_RSP;    // LX23: driven from there
       end
 
       // Bus error
@@ -2387,13 +2524,8 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // Maintain I/O-read response
    // Stays in this state until CPU's next request puts it back into RUNNING state
 
-   rule rl_maintain_io_read_rsp (rg_state == IO_READ_RSP);
-      if (rg_kill_echo) begin
-	 // RLD-4: stale response; exit (see rl_ST_AMO_response).
-	 rg_state <= MODULE_READY;
-      end
-      else
-	 fa_drive_IO_read_rsp (rg_f3, rg_addr, rg_ld_val);
+   rule rl_maintain_io_read_rsp ((rg_state == IO_READ_RSP) && (! rg_kill_echo));    // LX23
+      fa_drive_IO_read_rsp (rg_f3, rg_addr, rg_ld_val);
    endrule
 
    // ----------------------------------------------------------------
@@ -2405,7 +2537,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    (* descending_urgency = "rl_io_write_req, rl_writeback_updated_PTE" *)
 `endif
 
-   rule rl_io_write_req ((rg_state == IO_REQ) && (rg_op == CACHE_ST) && f_fabric_write_reqs.notFull);
+   rule rl_io_write_req ((rg_state == IO_REQ) && (rg_op == CACHE_ST) && (! w_pending));    // LX28
       if (cfg_verbosity > 1)
 	 $display ("%0d: %s: rl_io_write_req; f3 0x%0h  vaddr %0h  paddr %0h  word64 0x%0h",
 		   cur_cycle, d_or_i, rg_f3, rg_addr, rg_pa, rg_st_amo_val);
@@ -2423,7 +2555,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    endrule
 
    // All writes acknowledged (rl_discard_write_rsp counts them down, in order)
-   rule rl_io_write_rsp ((rg_state == IO_AWAITING_WRITE_RSP) && (ctr_wr_rsps_pending.value == 0));
+   rule rl_io_write_rsp ((rg_state == IO_AWAITING_WRITE_RSP) && (ctr_wr_rsps_pending.value == 0) && w_quiet);
       rg_state <= CACHE_ST_AMO_RSP;
       if (cfg_verbosity > 1)
 	 $display ("%0d: %s: rl_io_write_rsp => rl_ST_AMO_response", cur_cycle, d_or_i);
@@ -2515,11 +2647,10 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 `ifdef ISA_PRIV_S
    (* descending_urgency = "rl_io_amo_write, rl_writeback_updated_PTE" *)
 `endif
-   rule rl_io_amo_write ((rg_state == IO_AMO_WRITE) && f_fabric_write_reqs.notFull);
+   rule rl_io_amo_write ((rg_state == IO_AMO_WRITE) && (! w_pending));    // LX28
       // Write back new st_val to fabric
       fa_fabric_send_write_req (rg_f3, rg_pa, rg_st_amo_val);
-      fa_drive_IO_read_rsp (rg_f3, rg_addr, rg_ld_val);
-      rg_state <= IO_READ_RSP;
+      rg_state <= IO_READ_RSP;    // LX23: driven from there
    endrule
 `endif
 
@@ -2555,16 +2686,10 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    // This rule drives an exception response until the cache is put
    // into MODULE_RUNNING state by the next request.
 
-   rule rl_drive_exception_rsp (rg_state == MODULE_EXCEPTION_RSP);
-      if (rg_kill_echo) begin
-	 // RLD-4: stale response; exit (see rl_ST_AMO_response).
-	 rg_state <= MODULE_READY;
-      end
-      else begin
-	 dw_valid    <= True;
-	 dw_exc      <= True;
-	 dw_exc_code <= rg_exc_code;
-      end
+   rule rl_drive_exception_rsp ((rg_state == MODULE_EXCEPTION_RSP) && (! rg_kill_echo));    // LX23
+      dw_valid    <= True;
+      dw_exc      <= True;
+      dw_exc_code <= rg_exc_code;
    endrule
 
    // ================================================================

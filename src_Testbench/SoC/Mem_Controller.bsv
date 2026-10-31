@@ -220,7 +220,10 @@ module mkMem_Controller (Mem_Controller_IFC);
    // so the AXI address pops) then depends only on the registered full flag,
    // not on this cycle's dequeue by rl_rd_issue / rl_wr (lx11 seed 5: segment
    // arithmetic -> f_reqs.deq -> enq -> slave_xactor f_rd_addr, 19.4 ns).
-   FIFOF #(Req) f_reqs <- mkFIFOF;
+   // LX31: 1-deep (mkFIFOF1): data loads from the enqueue only, half the flops and no
+   // data0/data1 shift mux for a 312-bit record (area: the design is routing-bound at
+   // 80% LUTs).  Requests are many cycles apart at the SDRAM.
+   FIFOF #(Req) f_reqs <- mkFIFOF1;
 
    // Write burst in progress (beats after the first)
    Reg #(AXI4_Len)       rg_wr_left <- mkReg (0);
@@ -235,7 +238,7 @@ module mkMem_Controller (Mem_Controller_IFC);
    // bypass FIFO, rl_rd_issue's segment arithmetic / f_rd_pend state reached the Sdram
    // controller's LUTRAM request FIFO write enable and output register (lx12 seeds 3/7,
    // 19.6-20.8 ns).
-   FIFOF #(Raw_Mem_Req)   f_raw_reqs <- mkFIFOF;
+   FIFOF #(Raw_Mem_Req)   f_raw_reqs <- mkFIFOF1;    // LX31: 1-deep, as f_reqs
    FIFOF #(Raw_Mem_Chunk) f_raw_rsps <- mkBypassFIFOF;
    FIFOF #(Rd_Pend)       f_rd_pend  <- mkSizedFIFOF (2);
 

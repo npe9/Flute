@@ -131,6 +131,14 @@ deriving (Bits, FShow);
 
 QEnt qent_empty = QEnt { v: False, a: 0, exc: False, pf: False, d: 0 };
 
+// LX27 (m50 E30): a ring slot; the address is implicit (contiguous stream).
+typedef struct {
+   Bool      exc;
+   Bool      pf;
+   Bit #(64) d;
+   } RSlot
+deriving (Bits, FShow);
+
 typedef enum { ST_RUN, ST_REFILL_REQ, ST_REFILL, ST_IO_REQ, ST_IO_RSP, ST_FLUSH,
                ST_PTW1_REQ, ST_PTW1_RSP, ST_PTW0_REQ, ST_PTW0_RSP } IState
 deriving (Bits, Eq, FShow);
@@ -149,7 +157,7 @@ deriving (Bits, FShow);
 typedef 8 ITLB_N;
 
 // S1 translation outcome for a cword
-typedef enum { XK_OK, XK_MISS, XK_PF, XK_AF } XKind deriving (Bits, Eq, FShow);
+typedef enum { XK_OK, XK_MISS, XK_PF, XK_AF, XK_PMP_NEW } XKind deriving (Bits, Eq, FShow);    // XK_PMP_NEW: S2 only (LX25)
 
 typedef struct {
    Bool      valid;
@@ -247,6 +255,16 @@ module mkICache_Pipe (ICache_Pipe_IFC);
 
    // ITLB and PTW (sole writer: rl_main)
    Vector #(ITLB_N, Reg #(ITLBE)) vrg_itlb <- replicateM (mkReg (unpack (0)));
+
+   // LX25: PMP / PA-range verdicts for the last two fetch pages.  S2 compares rg_s2_ppn
+   // against the two page numbers only; a page not held replays its cword (as for an
+   // ITLB miss, without halting) while rl_main registers the page's verdict from S2.
+   // Was rg_s2_ppn -> PMP range compares -> s2_xk -> queue enqueue (lx17 s3, 18.5 ns).
+   // Dropped on any context change (priv / satp / PMP / SFENCE.VMA: ctx_pend).
+   Vector #(2, Reg #(Bit #(22))) vrg_xpg    <- replicateM (mkReg (0));
+   Vector #(2, Reg #(Bool))      vrg_xpg_ok <- replicateM (mkReg (False));
+   Vector #(2, Reg #(Bool))      vrg_xpg_v  <- replicateM (mkReg (False));
+   Reg #(Bit #(1))               rg_xpg_victim <- mkReg (0);
    Reg #(Bit #(3))   rg_itlb_rr  <- mkReg (0);
    Reg #(PA)         rg_pte_pa   <- mkReg (0);
    // LX5: PTE reads are registered twice.  The level-1 PTE address is
@@ -262,7 +280,18 @@ module mkICache_Pipe (ICache_Pipe_IFC);
    // Everything below: sole writer rl_main.
    Reg #(IState) rg_st <- mkReg (ST_RUN);
 
-   Vector #(4, Reg #(QEnt)) q <- replicateM (mkReg (qent_empty));
+   // LX27 (m50 E30): the queue is a ring of {exc, pf, data} slots.  The enqueue candidate
+   // is written at rg_tail whenever present (early: registers, the S2 tag compare, the
+   // fabric beat); the late presentation match (clear / pop / redirect) and the drop
+   // decisions move only the pointers and the two compared addresses, never the data
+   // bits.  Entry j's cword is rg_qa0 + j.  Was q -> match -> clear / pop -> enqueue
+   // slot select -> ~370 queue bits (lx18 s7, 19.1 ns).
+   Vector #(4, Reg #(RSlot)) ring <- replicateM (mkReg (RSlot { exc: False, pf: False, d: 0 }));
+   Reg #(Bit #(2)) rg_head <- mkReg (0);
+   Reg #(Bit #(2)) rg_tail <- mkReg (0);    // == rg_head + rg_n (mod 4)
+   Reg #(Bit #(3)) rg_n    <- mkReg (0);    // entries queued, 0..4
+   Reg #(CW_Addr)  rg_qa0  <- mkReg (0);    // entry 0's cword
+   Reg #(CW_Addr)  rg_qa1  <- mkReg (1);    // rg_qa0 + 1
 
    Reg #(CW_Addr) rg_pf      <- mkReg ('h200);    // next cword the stream reads
    Reg #(Bool)    rg_halt_io  <- mkReg (False);    // stream at a non-memory cword
@@ -308,16 +337,22 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       CW_Addr  w = truncateLSB (rg_pc);
       Bit #(2) o = rg_pc [2:1];
 
-      Bool m0 = q [0].v && (q [0].a == w);
-      Bool m1 = q [1].v && (q [1].a == w);
+      Bool v1 = (rg_n >= 2);
+      Bool v2 = (rg_n >= 3);
+      Bool m0 = (rg_n != 0) && (rg_qa0 == w);
+      Bool m1 = v1 && (rg_qa1 == w);
 
-      QEnt b = (m0 ? q [0] : q [1]);    // base entry
-      QEnt n = (m0 ? q [1] : q [2]);    // following entry (contiguous)
+      RSlot e0 = ring [rg_head];
+      RSlot e1 = ring [rg_head + 1];
+      RSlot e2 = ring [rg_head + 2];
+      RSlot b  = (m0 ? e0 : e1);    // base entry (its cword is w)
+      RSlot n  = (m0 ? e1 : e2);    // following entry (contiguous: w + 1)
+      Bool  nv = (m0 ? v1 : v2);
 
       // E32: take the parcel at o from both candidate entries (registers
       // only) and let the late match select last.
-      Bit #(16) p0_e0 = fn_parcel (q [0].d, o);
-      Bit #(16) p0_e1 = fn_parcel (q [1].d, o);
+      Bit #(16) p0_e0 = fn_parcel (e0.d, o);
+      Bit #(16) p0_e1 = fn_parcel (e1.d, o);
       Bit #(16) p0    = (m0 ? p0_e0 : p0_e1);
       Bool      is32 = (p0 [1:0] == 2'b11);
       Bool      strad = is32 && (o == 2'b11);
@@ -335,14 +370,14 @@ module mkICache_Pipe (ICache_Pipe_IFC);
          else if (! strad) begin
             r.valid = True;  r.instr = { fn_parcel (b.d, o + 1), p0 };
          end
-         else if (n.v) begin
+         else if (nv) begin
             r.valid = True;  r.instr = { fn_parcel (n.d, 0), p0 };
             r.exc   = n.exc;
             r.pf    = n.pf;
-            r.tval  = fn_cw_to_addr (b.a + 1);
+            r.tval  = fn_cw_to_addr (w + 1);
          end
          else
-            r.need_cw = b.a + 1;
+            r.need_cw = w + 1;
       end
       return r;
    endfunction
@@ -416,8 +451,13 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       PA       s2_pa  = fn_pa (rg_s2_ppn, rg_s2_a);
       CTag     s2_tag = fn_PA_to_CTag (s2_pa);
       Bool     s2_mem = soc_map.m_is_mem_addr (fn_PA_to_Fabric_Addr (s2_pa));
-      Bool     s2_af  = (rg_s2_ppn [21:20] != 0) || (! fv_pmp_ok (rg_pmp, rg_s2_ppn, rg_priv, PMP_X));
-      XKind    s2_xk  = (((rg_s2_xk == XK_OK) && s2_af) ? XK_AF : rg_s2_xk);
+      // LX25: cached page verdict; s2_xpg_new = replay (verdict registered this cycle)
+      Bool     xpg_m0 = vrg_xpg_v [0] && (vrg_xpg [0] == rg_s2_ppn);
+      Bool     xpg_m1 = vrg_xpg_v [1] && (vrg_xpg [1] == rg_s2_ppn);
+      Bool     s2_af  = ! (xpg_m0 ? vrg_xpg_ok [0] : vrg_xpg_ok [1]);
+      Bool     s2_xpg_new = (! xpg_m0) && (! xpg_m1);
+      XKind    s2_xk  = (  (rg_s2_xk != XK_OK) ? rg_s2_xk
+                         : (s2_xpg_new ? XK_PMP_NEW : (s2_af ? XK_AF : XK_OK)));
       Bool     s2_ok  = (s2_xk == XK_OK);
       Bool        hit     = False;
       Way_in_CSet hit_way = 0;
@@ -431,24 +471,41 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       Bool s2_io    = s2_live && s2_ok && (! s2_mem);
       Bool s2_walk  = s2_live && (s2_xk == XK_MISS);
       Bool s2_fault = s2_live && ((s2_xk == XK_PF) || (s2_xk == XK_AF));
-      Bool p2_kill  = s2_miss || s2_io || s2_walk || s2_fault;
+      Bool s2_xpg   = s2_live && (s2_xk == XK_PMP_NEW);    // LX25: replay
+      Bool p2_kill  = s2_miss || s2_io || s2_walk || s2_fault || s2_xpg;
 
-      // ---- Queue next state: clear / pop, then enqueue at the tail
-      Vector #(4, QEnt) qn = readVReg (q);
-      if (flush_start || q_clear)
-         qn = replicate (qent_empty);
-      else if (q_pop1)
-         qn = shiftInAtN (qn, qent_empty);
+      // LX25: register the S2 page's verdict (from registers only) into the victim slot
+      Bool xpg_ok_now = (rg_s2_ppn [21:20] == 0) && fv_pmp_ok (rg_pmp, rg_s2_ppn, rg_priv, PMP_X);
+      if (ctx_pend) begin
+         vrg_xpg_v [0] <= False;
+         vrg_xpg_v [1] <= False;
+      end
+      else if (rg_s2_v && s2_xpg_new) begin
+         vrg_xpg    [rg_xpg_victim] <= rg_s2_ppn;
+         vrg_xpg_ok [rg_xpg_victim] <= xpg_ok_now;
+         vrg_xpg_v  [rg_xpg_victim] <= True;
+         rg_xpg_victim <= ~ rg_xpg_victim;
+      end
 
-      Maybe #(QEnt) m_enq = tagged Invalid;
-      if (s2_enq) begin
+      // ---- LX27: enqueue candidate (written at rg_tail whenever present) and whether it
+      // is kept (late: moves the pointers only)
+      Bool cand_v    = False;
+      Bool cand_keep = False;
+      QEnt cand      = qent_empty;
+      Bool s2_pre    = rg_s2_v && run;    // s2_live without the late kill / flush terms
+      if (s2_pre && s2_ok && s2_mem && hit) begin
          CWord d = rg_s2_data [0];
          for (Integer wy = 1; wy < ways_per_cset; wy = wy + 1)
             if (hit_way == fromInteger (wy)) d = rg_s2_data [wy];
-         m_enq = tagged Valid (QEnt { v: True, a: rg_s2_a, exc: False, pf: False, d: d });
+         cand_v    = True;
+         cand_keep = s2_enq;
+         cand      = QEnt { v: True, a: rg_s2_a, exc: False, pf: False, d: d };
       end
-      if (s2_fault)
-         m_enq = tagged Valid (QEnt { v: True, a: rg_s2_a, exc: True, pf: (s2_xk == XK_PF), d: 0 });
+      if (s2_pre && ((s2_xk == XK_PF) || (s2_xk == XK_AF))) begin
+         cand_v    = True;
+         cand_keep = s2_fault;
+         cand      = QEnt { v: True, a: rg_s2_a, exc: True, pf: (s2_xk == XK_PF), d: 0 };
+      end
 
       // ---- Device read / refill completion (may also enqueue)
       Bool drop = rg_stale || kill;
@@ -470,8 +527,10 @@ module mkICache_Pipe (ICache_Pipe_IFC);
 
       if ((rg_st == ST_IO_RSP) && rd_rsp_avail) begin
          f_rd.deq;
+         cand_v = True;
+         cand   = QEnt { v: True, a: rg_pf, exc: ! rd_ok, pf: False, d: zeroExtend (rd_rsp.rdata) };
          if (! drop) begin
-            m_enq = tagged Valid (QEnt { v: True, a: rg_pf, exc: ! rd_ok, pf: False, d: zeroExtend (rd_rsp.rdata) });
+            cand_keep = True;
             pf_next = rg_pf + 1;
             if (! rd_ok) halt_exc_next = True;
             // the next device cword is in another page: re-translate (stream resumes)
@@ -487,12 +546,18 @@ module mkICache_Pipe (ICache_Pipe_IFC);
          // Early restart: forward from the missed cword while contiguous (rg_pf is then the
          // beat's cword: no issue runs during a refill, and a redirect makes it stale)
          CWord_in_CLine miss_off = truncate (rg_miss_a);
-         Bool fwd = (! err) && (! drop) && (! qn [3].v) && ((rg_beat == miss_off) || rg_fwd);
+         // LX27: "ring not full" from rg_n (a full ring's tail slot is the live head)
+         Bool fwd_pre = (! err) && (rg_n != 4) && ((rg_beat == miss_off) || rg_fwd);
+         Bool fwd     = fwd_pre && (! drop);
          fwd_next = fwd;
+         if (fwd_pre) begin
+            cand_v = True;
+            cand   = QEnt { v: True, a: rg_pf, exc: False, pf: False, d: zeroExtend (rd_rsp.rdata) };
+         end
          if (fwd) begin
             if (rg_pf != { truncateLSB (rg_miss_a), rg_beat })
                $display ("%0d: ASSERT FAIL ICache_Pipe: forwarded beat %0d is not the stream's next cword", cur_cycle, rg_beat);
-            m_enq   = tagged Valid (QEnt { v: True, a: rg_pf, exc: False, pf: False, d: zeroExtend (rd_rsp.rdata) });
+            cand_keep = True;
             pf_next = rg_pf + 1;
          end
          CSet_in_Cache cset = fn_Addr_to_CSet_in_Cache (fn_cw_to_addr (rg_miss_a));
@@ -510,11 +575,15 @@ module mkICache_Pipe (ICache_Pipe_IFC);
                                         ctag:  fn_PA_to_CTag (fn_pa (rg_miss_ppn, rg_miss_a)) };
                ram_state_and_ctag_cset.a.put (True, cset, t);
             end
-            else if (! drop) begin
+            else begin
                // the first cword not forwarded (rg_miss_a when nothing was)
-               m_enq = tagged Valid (QEnt { v: True, a: rg_pf, exc: True, pf: False, d: 0 });
-               halt_exc_next = True;
-               pf_next = rg_pf + 1;
+               cand_v = True;
+               cand   = QEnt { v: True, a: rg_pf, exc: True, pf: False, d: 0 };
+               if (! drop) begin
+                  cand_keep = True;
+                  halt_exc_next = True;
+                  pf_next = rg_pf + 1;
+               end
             end
             st_next = ST_RUN;
          end
@@ -564,6 +633,12 @@ module mkICache_Pipe (ICache_Pipe_IFC);
          rg_pte_pa <= { rg_satp [21:0], 12'b0 } + zeroExtend ({ walk_va [31:22], 2'b0 });
       rg_pte_ok   <= ((rg_pte_pa [33:32] == 0) && fv_pmp_ok (rg_pmp, fv_pa_page (rg_pte_pa), s_Priv_Mode, PMP_R));
       rg_pte_ok_v <= pte_req;
+      // LX27: the PMP-fail fault entry is a ring candidate without the late kill term
+      Bool pte_pmp_fail = pte_req && rg_pte_ok_v && rg_ddr4_ready && ar_free && (! rg_pte_ok);
+      if (pte_pmp_fail) begin
+         cand_v = True;
+         cand   = QEnt { v: True, a: rg_pf, exc: True, pf: False, d: 0 };
+      end
       if (pte_req && rg_pte_ok_v && rg_ddr4_ready && ar_free && (! kill)) begin
          PA pte_pa = rg_pte_pa;
          if (! rg_pte_ok) begin
@@ -577,10 +652,16 @@ module mkICache_Pipe (ICache_Pipe_IFC);
          end
       end
 
+      // (the PTE-response faults: no kill term on this path)
+      if (((rg_st == ST_PTW1_RSP) || (rg_st == ST_PTW0_RSP)) && rd_rsp_avail
+          &&& walk_fault matches tagged Valid .is_pf) begin
+         cand_v = True;
+         cand   = QEnt { v: True, a: rg_pf, exc: True, pf: is_pf, d: 0 };
+      end
       if (walk_done && (! drop)) begin
          halt_walk_next = False;
          if (walk_fault matches tagged Valid .is_pf) begin
-            m_enq = tagged Valid (QEnt { v: True, a: rg_pf, exc: True, pf: is_pf, d: 0 });
+            cand_keep = True;
             halt_exc_next = True;
             pf_next = rg_pf + 1;
          end
@@ -595,16 +676,38 @@ module mkICache_Pipe (ICache_Pipe_IFC);
          rg_itlb_rr <= rg_itlb_rr + 1;
       end
 
-      // Tail enqueue (credit-limited issue guarantees a free slot)
-      if (m_enq matches tagged Valid .e) begin
-         if (qn [3].v)
-            $display ("%0d: ASSERT FAIL ICache_Pipe: enqueue into a full queue", cur_cycle);
-         if      (! qn [0].v) qn [0] = e;
-         else if (! qn [1].v) qn [1] = e;
-         else if (! qn [2].v) qn [2] = e;
-         else                 qn [3] = e;
+      // ---- LX27: queue next state.  Clear / pop, then a kept candidate joins at the tail
+      // (credit-limited issue guarantees a free slot).  A flush or reset start empties the
+      // queue and keeps nothing.
+      Bool     q_empty = flush_start || q_clear;
+      Bool     enq     = cand_keep && (! flush_start);
+      Bit #(3) n_aft   = (q_empty ? 0 : (q_pop1 ? rg_n - 1 : rg_n));
+      Bit #(2) h_aft   = (q_empty ? rg_tail : (q_pop1 ? rg_head + 1 : rg_head));
+      CW_Addr  qa0_aft = (q_pop1 ? rg_qa1 : rg_qa0);
+
+      if (cand_v) begin
+         if ((rg_n == 4) && (! q_empty) && (! q_pop1))
+            $display ("%0d: ASSERT FAIL ICache_Pipe: ring write over a live entry", cur_cycle);
+         ring [rg_tail] <= RSlot { exc: cand.exc, pf: cand.pf, d: cand.d };
       end
-      writeVReg (q, qn);
+      if (enq) begin
+         if (n_aft == 4)
+            $display ("%0d: ASSERT FAIL ICache_Pipe: enqueue into a full queue", cur_cycle);
+         if ((n_aft != 0) && (cand.a != qa0_aft + zeroExtend (n_aft)))
+            $display ("%0d: ASSERT FAIL ICache_Pipe: non-contiguous enqueue", cur_cycle);
+      end
+
+      rg_head <= h_aft;
+      rg_tail <= (enq ? rg_tail + 1 : rg_tail);
+      rg_n    <= (enq ? n_aft + 1 : n_aft);
+      if (enq && (n_aft == 0)) begin
+         rg_qa0 <= cand.a;
+         rg_qa1 <= cand.a + 1;
+      end
+      else if (q_pop1) begin
+         rg_qa0 <= rg_qa1;
+         rg_qa1 <= rg_qa1 + 1;
+      end
 
       // ---- S2 miss / device stop: stream replays from s2's cword
       if (s2_miss) begin
@@ -628,6 +731,7 @@ module mkICache_Pipe (ICache_Pipe_IFC);
          pf_next = rg_s2_a;
          halt_walk_next = True;
       end
+      if (s2_xpg) pf_next = rg_s2_a;    // LX25
 
       // ---- Redirect: restart the stream at the wanted cword
       if (redirect) begin
@@ -656,7 +760,7 @@ module mkICache_Pipe (ICache_Pipe_IFC);
 
       // ---- P0: issue.  The BRAM address/enable do not depend on the S2
       // result (a kill only drops the S1 valid bit next cycle).
-      Bit #(3) n_q  = (q [0].v ? 1 : 0) + (q [1].v ? 1 : 0) + (q [2].v ? 1 : 0) + (q [3].v ? 1 : 0);
+      Bit #(3) n_q  = rg_n;
       Bit #(3) n_fl = (rg_s1_v ? 1 : 0) + (rg_s2_v ? 1 : 0);
       Bool credit   = ((n_q + n_fl) < 4);
       Bool issue    = run && rg_want && (! flush_start)

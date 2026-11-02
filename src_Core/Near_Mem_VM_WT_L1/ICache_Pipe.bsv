@@ -608,6 +608,12 @@ module mkICache_Pipe (ICache_Pipe_IFC);
       Maybe #(ITLBE) walk_ins  = tagged Invalid;
       Bool walk_done = False;
 
+      // LX43: the level-0 PTE address is loaded in every PTW1_RSP response cycle, whatever the
+      // PTE decodes to; it was enabled by the decode and drop (lx29 s5: imem_pc -> present/kill
+      // -> rg_st -> rg_pte_pa CE, 19.3 ns).  Any other exit from PTW1_RSP goes to ST_RUN, which
+      // reloads it.  (Not before the response: rg_pte_pa [2] selects the PTE half above.)
+      if ((rg_st == ST_PTW1_RSP) && rd_rsp_avail)
+         rg_pte_pa <= { pte [31:10], 12'b0 } + zeroExtend ({ walk_va [21:12], 2'b0 });
       if (((rg_st == ST_PTW1_RSP) || (rg_st == ST_PTW0_RSP)) && rd_rsp_avail) begin
          f_rd.deq;
          walk_done = True;
@@ -626,7 +632,6 @@ module mkICache_Pipe (ICache_Pipe_IFC);
          else if (! lvl1)
             walk_fault = tagged Valid True;                   // pointer at level 0
          else if (! drop) begin
-            rg_pte_pa <= { pte [31:10], 12'b0 } + zeroExtend ({ walk_va [21:12], 2'b0 });
             walk_done = False;
             st_next = ST_PTW0_REQ;
          end

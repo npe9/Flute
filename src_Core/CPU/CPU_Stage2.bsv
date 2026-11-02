@@ -547,9 +547,9 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 
 	 let bypass = bypass_base;
 	 // Option 1: longer critical path: data bypassed back to previous stage
-	 bypass.bypass_state = ((ostatus == OSTATUS_PIPE)
-				? BYPASS_RD_RDVAL : BYPASS_RD);
-	 bypass.rd_val       = result;
+	 // LX42: box results are not bypassed from stage2 (box mux -> stage1 operand -> ALU,
+	 // lx29 s2/s4 19.2 ns); a dependent instruction takes the stage3 bypass a cycle later.
+	 bypass.bypass_state = BYPASS_RD;
 
 	 // Option 2: shorter critical path: data not bypassed to previous stage
 	 // bypass.bypass_state = BYPASS_RD;
@@ -585,9 +585,9 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 
 	 let bypass = bypass_base;
 	 // Option 1: longer critical path: data bypassed back to previous stage
-	 bypass.bypass_state = ((ostatus == OSTATUS_PIPE) ?
-				BYPASS_RD_RDVAL : BYPASS_RD);
-	 bypass.rd_val       = result;
+	 // LX42: box results are not bypassed from stage2 (box mux -> stage1 operand -> ALU,
+	 // lx29 s2/s4 19.2 ns); a dependent instruction takes the stage3 bypass a cycle later.
+	 bypass.bypass_state = BYPASS_RD;
 
 	 // Option 2: shorter critical path: data not bypassed to previous stage
 	 // bypass.bypass_state = BYPASS_RD;
@@ -621,8 +621,9 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
 	 data_to_stage3.rd_val   = result;
 
 	 let bypass = bypass_base;
-	 bypass.bypass_state = ((ostatus == OSTATUS_PIPE) ? BYPASS_RD_RDVAL : BYPASS_RD);
-	 bypass.rd_val       = result;
+	 // LX42: box results are not bypassed from stage2 (box mux -> stage1 operand -> ALU,
+	 // lx29 s2/s4 19.2 ns); a dependent instruction takes the stage3 bypass a cycle later.
+	 bypass.bypass_state = BYPASS_RD;
 
 `ifdef INCLUDE_TANDEM_VERIF
 	 let trace_data            = rg_stage2.trace_data;
@@ -672,8 +673,7 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
          let fbypass = fbypass_base;
          if (rg_stage2.rd_in_fpr) begin
 	    // Option 1: longer critical path: data bypassed back to previous stage
-            fbypass.bypass_state = ((ostatus==OSTATUS_PIPE)
-				    ? BYPASS_RD_RDVAL : BYPASS_RD);
+            fbypass.bypass_state = BYPASS_RD;    // LX42 (see the MBox path)
 `ifdef ISA_D
             fbypass.rd_val       = value;
 `else
@@ -686,8 +686,7 @@ module mkCPU_Stage2 #(Bit #(4)         verbosity,
          // result is meant for a GPR
          else begin
 	    // Option 1: longer critical path: data bypassed back to previous stage
-            bypass.bypass_state = ((ostatus==OSTATUS_PIPE)
-				   ? BYPASS_RD_RDVAL : BYPASS_RD);
+            bypass.bypass_state = BYPASS_RD;     // LX42 (see the MBox path)
 `ifdef RV64
             bypass.rd_val       = (value);
 `else

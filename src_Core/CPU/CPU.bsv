@@ -484,6 +484,11 @@ module mkCPU (CPU_IFC);
 
    FIFOF #(Bool)  f_reset_reqs <- mkFIFOF;
    FIFOF #(Bool)  f_reset_rsps <- mkFIFOF;
+   // LX44: registered "reset request pending" for the reset-from-DM/WFI rules (lx29 s1:
+   // f_reset_reqs.EMPTY_N -> debug-rule urgency -> f_csr_reqs.DEQ -> rg_dbg_rsp_v, 21.5 ns).
+   // It lags the FIFO by a cycle: after rl_reset_start pops in CPU_RESET1 it is still set
+   // for one cycle, during which rg_state is CPU_RESET2 and the reset rules stay off.
+   Reg #(Bool)    rg_reset_pend <- mkReg (False);
 
    // ----------------
    // Performance-monitoring pulses (consumed by Core/SoC_Info counters)
@@ -1939,11 +1944,16 @@ module mkCPU (CPU_IFC);
 
    // ----------------
    rule rl_reset_from_WFI (   (rg_state == CPU_WFI_PAUSED)
-			   && f_reset_reqs.notEmpty);
+			   && rg_reset_pend);
       if (cur_verbosity > 1) $display ("%0d: %m.rl_reset_from_WFI", mcycle);
 
       rg_state <= CPU_RESET1;
    endrule: rl_reset_from_WFI
+
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_reset_pend;
+      rg_reset_pend <= f_reset_reqs.notEmpty;
+   endrule
 
    // ================================================================
    // Initiate instruction fetch from new_pc.
@@ -2014,7 +2024,7 @@ module mkCPU (CPU_IFC);
    // ----------------
    // Reset from Debug Module
 
-   rule rl_reset_from_Debug_Module (f_reset_reqs.notEmpty && (rg_state != CPU_RESET1));
+   rule rl_reset_from_Debug_Module (rg_reset_pend && (rg_state != CPU_RESET1) && (rg_state != CPU_RESET2));
       $display ("%0d: CPU reset from Debug Module", mcycle);
       $display ("    At: %m.rl_reset_from_Debug_Module");
       rg_state <= CPU_RESET1;

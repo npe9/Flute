@@ -110,7 +110,7 @@ module mkCPU_Stage1 #(Bit #(4)         verbosity,
 
    // Register rs1 read and bypass
    let rs1 = decoded_instr.rs1;
-   let rs1_val = gpr_regfile.read_rs1 (rs1);
+   let rs1_val = gpr_regfile.read_rs1_q;    // LX38: registered read of rs1 (GPR_RegFile)
    match { .busy1a, .rs1a } = fn_gpr_bypass (bypass_from_stage3, rs1, rs1_val);
    match { .busy1b, .rs1b } = fn_gpr_bypass (bypass_from_stage2, rs1, rs1a);
    Bool rs1_busy = (busy1a || busy1b);
@@ -118,7 +118,7 @@ module mkCPU_Stage1 #(Bit #(4)         verbosity,
 
    // Register rs2 read and bypass
    let rs2 = decoded_instr.rs2;
-   let rs2_val = gpr_regfile.read_rs2 (rs2);
+   let rs2_val = gpr_regfile.read_rs2_q;    // LX38
    match { .busy2a, .rs2a } = fn_gpr_bypass (bypass_from_stage3, rs2, rs2_val);
    match { .busy2b, .rs2b } = fn_gpr_bypass (bypass_from_stage2, rs2, rs2a);
    Bool rs2_busy = (busy2a || busy2b);

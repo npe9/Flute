@@ -63,6 +63,15 @@ interface CPU_StageF_IFC;
 			   Instr    instr,
 			   CF_Info  cf_info);
 
+   // LX40: BTB training staged in a register.  bp_train_stage is called every cycle with
+   // stage2's cf_info; bp_train_go when rl_pipe moves that op out of stage2.  The record is
+   // registered regardless and enqueued the next cycle if go was set (and it is a CF op),
+   // so f_bp_train's data and enqueue come from flops, not from rl_pipe's firing.
+   (* always_ready *)
+   method Action bp_train_stage (CF_Info cf_info);
+   (* always_ready *)
+   method Action bp_train_go;
+
    // E14: RAS training from the fetch side (CPU.rl_front)
    (* always_ready *)
    method Action bp_train_ras (WordXL pc, Bool is_i32_not_i16, Instr instr);
@@ -131,6 +140,20 @@ module mkCPU_StageF #(Bit #(4)  verbosity,
    // and the drain merges them into one bp_train call (pc/instr 0 = no RAS
    // action, cf_info_none = no BTB action).
    FIFOF #(Tuple3 #(WordXL, Bool, Instr)) f_ras_train <- mkUGFIFOF;
+
+   // LX40: training staging register (see interface)
+   Wire #(CF_Info) dw_bpt    <- mkDWire (cf_info_none);
+   PulseWire       pw_bpt_go <- mkPulseWire;
+   Reg #(CF_Info)  rg_bpt    <- mkRegU;
+   Reg #(Bool)     rg_bpt_v  <- mkReg (False);
+
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_bp_train_stage;
+      rg_bpt   <= dw_bpt;
+      rg_bpt_v <= pw_bpt_go;
+      if (rg_bpt_v && (rg_bpt.cf_op != CF_None) && f_bp_train.notFull)
+	 f_bp_train.enq (tuple4 (0, True, 0, rg_bpt));
+   endrule
 
    rule rl_bp_train_drain (f_bp_train.notEmpty || f_ras_train.notEmpty);
       WordXL  pc      = 0;
@@ -227,6 +250,14 @@ module mkCPU_StageF #(Bit #(4)  verbosity,
 			   CF_Info  cf_info);
       if (f_bp_train.notFull)
 	 f_bp_train.enq (tuple4 (pc, is_i32_not_i16, instr, cf_info));
+   endmethod
+
+   method Action bp_train_stage (CF_Info cf_info);
+      dw_bpt <= cf_info;
+   endmethod
+
+   method Action bp_train_go;
+      pw_bpt_go.send;
    endmethod
 
    method Action bp_train_ras (WordXL pc, Bool is_i32_not_i16, Instr instr);

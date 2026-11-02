@@ -946,6 +946,34 @@ module mkCPU (CPU_IFC);
    // But cond_i32_odd_fetch_next should make these rules mutually exclusive; why doesn't bsc realize this?
 `endif
 
+   // LX41: while RUNNING, rg_next_pc follows a redirecting op held in stage2 (registers
+   // only), instead of being written by rl_pipe when the op leaves stage2: rg_next_pc$EN
+   // was WILL_FIRE_rl_pipe && stage2 moving && redirect (lx28 s3: stage1 -> rl_pipe firing
+   // -> rg_next_pc CE, 18.5 ns).  rg_next_pc is read only outside CPU_RUNNING
+   // (rl_trap_fetch after the redirect, restart/finish rules after the non-pipe rules,
+   // which write it themselves), and the value is the same op's next_pc when rl_pipe moves
+   // it and sets CPU_START_TRAP_HANDLER.
+   (* fire_when_enabled *)
+   rule rl_stage2_next_pc ((rg_state == CPU_RUNNING) && stage2.out.redirect);
+      rg_next_pc <= stage2.out.next_pc;
+   endrule
+
+   // LX40: stage2's cf_info to StageF's BTB-training register, every cycle
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_bp_train_stage;
+      stageF.bp_train_stage (stage2.out.cf_info);
+   endrule
+
+   // LX38: every cycle, present StageD's rs1/rs2 to the GPR file's registered read ports;
+   // rl_pipe's StageD->Stage1 move (ma_load) selects them for Stage1 the next cycle.  Stage1
+   // then starts from flops instead of the GPR LUTRAM read (lx24 s7: rg_stage_input ->
+   // LUTRAM -> bypass -> ALU carry chain -> rg_stage2, 18.6 ns).
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_gpr_prefetch;
+      match { .rs1, .rs2 } = stageD.prefetch_rs;    // LX38b: late select of the ring slot
+      gpr_regfile.ma_prefetch (rs1, rs2);
+   endrule
+
    rule rl_pipe (   (rg_state == CPU_RUNNING)
 		 && (! pipe_is_empty)
 		 && (! pipe_has_nonpipe)
@@ -963,6 +991,7 @@ module mkCPU (CPU_IFC);
       // the resolved cf_info of the op leaving stage2 THIS cycle (one shot);
       // train_ras marks that the feed block ran (RAS uses the fetched instr).
       CF_Info cf_train  = cf_info_none;
+      Bool    train_go  = False;    // LX40
       Bool    train_ras = False;
 
       // ----------------
@@ -1004,7 +1033,7 @@ module mkCPU (CPU_IFC);
 	 // wrong-path instruction in stage1 is held out of stage2 below and
 	 // discarded by the epoch bump in rl_trap_fetch.
 	 if (stage2.out.redirect) begin
-	    rg_next_pc <= stage2.out.next_pc;
+	    // LX41: rg_next_pc is written by rl_stage2_next_pc (below) from registers
 	    redirect    = True;
 	    pw_perf_redirect.send;
 	    // Drop the wrong-path instruction in stage1 now (it would be
@@ -1021,6 +1050,7 @@ module mkCPU (CPU_IFC);
 	 // iteration and the BTB never learned it: 2.0M redirects vs 395 on
 	 // rld4 in the J1 run, loader repair window 40 vs 26 cycles/iter.)
 	 cf_train = stage2.out.cf_info;
+	 train_go = True;
 	 fa_emit_instr_trace (minstret, stage2.out.data_to_stage3.pc, stage2.out.data_to_stage3.instr, rg_cur_priv);
       end
 
@@ -1053,13 +1083,15 @@ module mkCPU (CPU_IFC);
 	  && (stageD.out.ostatus == OSTATUS_PIPE))
 	 begin
 	    stage1.enq (stageD.out.data_to_stage1);  stage1_full = True;
+	    gpr_regfile.ma_load;    // LX38
 	    stageD.deq;                              stageD_full = False;
 	 end
 
       // E14: the StageF->StageD move, the fetch feed and RAS training are in
       // rl_front (below); only BTB training (cf_train) stays here.
-      if (cf_train.cf_op != CF_None)
-	 stageF.bp_train (0, True, 0, cf_train);
+      // LX40: staged in StageF (bp_train_stage carries stage2.out.cf_info every cycle)
+      if (train_go)
+	 stageF.bp_train_go;
 
       // E2: the redirect state change must not depend on the feed block
       // running this cycle (the held-back stage1 instruction can keep the
@@ -2282,6 +2314,18 @@ module mkCPU (CPU_IFC);
    Reg #(Bool) rg_dbg_csr_v <- mkReg (False);
    Reg #(Word) rg_dbg_csr   <- mkRegU;
 
+   // LX39: every debug CSR response (read / write / busy) is staged in rg_dbg_rsp and
+   // enqueued by rl_debug_csr_rsp_out alone, so f_csr_rsps' data and enqueue come from
+   // flops, not from a select among the three rules' firing (lx26 s3/s7: stage1 ->
+   // ... -> f_csr_rsps D_IN select -> data0, 18.9 / 19.2 ns).
+   Reg #(Bool)                rg_dbg_rsp_v <- mkReg (False);
+   Reg #(DM_CPU_Rsp #(XLEN))  rg_dbg_rsp   <- mkRegU;
+
+   rule rl_debug_csr_rsp_out (rg_dbg_rsp_v);
+      f_csr_rsps.enq (rg_dbg_rsp);
+      rg_dbg_rsp_v <= False;
+   endrule
+
    rule rl_debug_read_csr ((rg_state == CPU_DEBUG_MODE) && (! f_csr_reqs.first.write) && (! rg_dbg_csr_v));
       Bit #(12) csr_addr = f_csr_reqs.first.address;
       let m_data = csr_regfile.read_csr_port2 (csr_addr);
@@ -2289,12 +2333,13 @@ module mkCPU (CPU_IFC);
       rg_dbg_csr_v <= True;
    endrule
 
-   rule rl_debug_read_csr_rsp (rg_dbg_csr_v);
+   rule rl_debug_read_csr_rsp (rg_dbg_csr_v && (! rg_dbg_rsp_v));
       let req <- pop (f_csr_reqs);
       Bit #(12) csr_addr = req.address;
       let data = rg_dbg_csr;
       let rsp = DM_CPU_Rsp {ok: True, data: data};
-      f_csr_rsps.enq (rsp);
+      rg_dbg_rsp   <= rsp;    // LX39
+      rg_dbg_rsp_v <= True;
       rg_dbg_csr_v <= False;
 
       $display ("CPU: Debugger read CSR 0x%0x => 0x%0h", csr_addr, data);
@@ -2304,14 +2349,15 @@ module mkCPU (CPU_IFC);
       end
    endrule
 
-   rule rl_debug_write_csr ((rg_state == CPU_DEBUG_MODE) && f_csr_reqs.first.write && (! rg_dbg_csr_v));
+   rule rl_debug_write_csr ((rg_state == CPU_DEBUG_MODE) && f_csr_reqs.first.write && (! rg_dbg_csr_v) && (! rg_dbg_rsp_v));
       let req <- pop (f_csr_reqs);
       Bit #(12) csr_addr = req.address;
       let data = req.data;
       let csr_write_result <- csr_regfile.mav_csr_write (csr_addr, data);
 
       let rsp = DM_CPU_Rsp {ok: True, data: ?};
-      f_csr_rsps.enq (rsp);
+      rg_dbg_rsp   <= rsp;    // LX39
+      rg_dbg_rsp_v <= True;
 
       $display ("CPU: Debugger write CSR 0x%0h <= 0x%0h.  New csr contents: 0x%0h",
 		csr_addr, data, csr_write_result.new_csr_value);
@@ -2321,10 +2367,11 @@ module mkCPU (CPU_IFC);
       end
    endrule
 
-   rule rl_debug_csr_access_busy ((rg_state != CPU_DEBUG_MODE) && (! rg_dbg_csr_v));
+   rule rl_debug_csr_access_busy ((rg_state != CPU_DEBUG_MODE) && (! rg_dbg_csr_v) && (! rg_dbg_rsp_v));
       let req <- pop (f_csr_reqs);
       let rsp = DM_CPU_Rsp {ok: False, data: ?};
-      f_csr_rsps.enq (rsp);
+      rg_dbg_rsp   <= rsp;    // LX39
+      rg_dbg_rsp_v <= True;
 
       $display ("CPU: Debugger CSR access busy: state (not CPU_DEBUG_MODE) = ", fshow (rg_state));
       if (cur_verbosity > 1) begin

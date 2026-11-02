@@ -68,6 +68,11 @@ interface CPU_StageD_IFC;
 
    (* always_ready *)
    method Bool can_enq;
+
+   // LX38b: rs1/rs2 of the head instruction (as out.data_to_stage1.decoded_instr), for the
+   // GPR file's registered reads: decoded per ring slot and selected by rg_rp last.
+   (* always_ready *)
+   method Tuple2 #(RegName, RegName) prefetch_rs;
 endinterface
 
 // ================================================================
@@ -218,6 +223,21 @@ module mkCPU_StageD #(Bit #(4)  verbosity, MISA misa)
    endmethod
 
    method Bool can_enq = (rg_cnt != 2);
+
+   method Tuple2 #(RegName, RegName) prefetch_rs;
+      function Tuple2 #(RegName, RegName) fv_rs (Data_StageF_to_StageD d);
+	 Instr i = d.instr;
+`ifdef ISA_C
+	 if (! d.is_i32_not_i16)
+	    i = fv_decode_C (misa, xl, i [15:0]);
+`endif
+	 let di = fv_decode (i);
+	 return tuple2 (di.rs1, di.rs2);
+      endfunction
+      let rs0 = fv_rs (vr_data [0]);
+      let rs1 = fv_rs (vr_data [1]);
+      return ((rg_rp == 0) ? rs0 : rs1);
+   endmethod
 endmodule
 
 // ================================================================

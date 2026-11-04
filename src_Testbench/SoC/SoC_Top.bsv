@@ -108,11 +108,17 @@ interface SoC_Top_IFC;
    (* always_enabled *) method Action gpio_btn1 (Bit #(1) v);
 `endif
 `ifdef INCLUDE_SPI0
-   // microSD slot, SPI mode (src/AXI4_SPI.bsv)
+   // microSD slot, SPI mode (src/AXI4_SPI.bsv, chip select 0)
    (* always_ready *)   method Bit #(1) sd_sclk;
    (* always_ready *)   method Bit #(1) sd_mosi;
    (* always_ready *)   method Bit #(1) sd_cs_n;
    (* always_enabled *) method Action   sd_miso (Bit #(1) v);
+   // configuration flash on chip select 1 of the same host (its own pins; the clock leaves
+   // through USRMCLK in src/Top.v)
+   (* always_ready *)   method Bit #(1) flash_sclk;
+   (* always_ready *)   method Bit #(1) flash_mosi;
+   (* always_ready *)   method Bit #(1) flash_cs_n;
+   (* always_enabled *) method Action   flash_miso (Bit #(1) v);
 `endif
 
    // ----------------------------------------------------------------
@@ -197,7 +203,7 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 `endif
 
 `ifdef INCLUDE_SPI0
-   // SPI host on the microSD slot
+   // SPI host: microSD slot (CS 0) and configuration flash (CS 1)
    AXI4_SPI_IFC  spi0 <- mkAXI4_SPI;
 `endif
 
@@ -555,9 +561,15 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 `ifdef INCLUDE_SPI0
    method Bit #(1) sd_sclk = spi0.sclk;
    method Bit #(1) sd_mosi = spi0.mosi;
-   method Bit #(1) sd_cs_n = spi0.cs_n;
+   method Bit #(1) sd_cs_n = spi0.cs_n [0];
    method Action sd_miso (Bit #(1) v);
-      spi0.miso (v);
+      spi0.miso0 (v);
+   endmethod
+   method Bit #(1) flash_sclk = spi0.sclk;
+   method Bit #(1) flash_mosi = spi0.mosi;
+   method Bit #(1) flash_cs_n = spi0.cs_n [1];
+   method Action flash_miso (Bit #(1) v);
+      spi0.miso1 (v);
    endmethod
 `endif
 

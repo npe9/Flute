@@ -62,6 +62,9 @@ import Camera_Model   :: *;
 
 `ifdef INCLUDE_ACCEL0
 import AXI4_GPIO      :: *;
+`ifdef INCLUDE_SPI0
+import AXI4_SPI       :: *;
+`endif
 import SoC_Info       :: *;
 `endif
 
@@ -103,6 +106,13 @@ interface SoC_Top_IFC;
    // GPIO (Accel0 slot repurposed for ULX3S LEDs/buttons)
    (* always_ready *) method Bit #(8) gpio_leds;
    (* always_enabled *) method Action gpio_btn1 (Bit #(1) v);
+`endif
+`ifdef INCLUDE_SPI0
+   // microSD slot, SPI mode (src/AXI4_SPI.bsv)
+   (* always_ready *)   method Bit #(1) sd_sclk;
+   (* always_ready *)   method Bit #(1) sd_mosi;
+   (* always_ready *)   method Bit #(1) sd_cs_n;
+   (* always_enabled *) method Action   sd_miso (Bit #(1) v);
 `endif
 
    // ----------------------------------------------------------------
@@ -185,6 +195,11 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
    SoC_Info_IFC  soc_info <- mkSoC_Info (clk_hz);
 `endif
 
+`ifdef INCLUDE_SPI0
+   // SPI host on the microSD slot
+   AXI4_SPI_IFC  spi0 <- mkAXI4_SPI;
+`endif
+
    // ----------------
    // SoC fabric master connections
    // Note: see 'SoC_Map' for 'master_num' definitions
@@ -225,6 +240,11 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 
    // Fabric to soc_info
    mkConnection (fabric.v_to_slaves [soc_info_slave_num], soc_info.slave);
+
+`ifdef INCLUDE_SPI0
+   // Fabric to spi0
+   mkConnection (fabric.v_to_slaves [spi0_slave_num], spi0.slave);
+`endif
 
    // Bus-error monitor: drain fabric decode-error events into SoC_Info
    rule rl_bus_err_capture;
@@ -289,6 +309,10 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
       core.core_external_interrupt_sources [irq_num_accel0].m_interrupt_req (intr_accel0);
       last_irq_num = irq_num_accel0;
 `endif
+`ifdef INCLUDE_SPI0
+      core.core_external_interrupt_sources [irq_num_spi0].m_interrupt_req (spi0.interrupt_req);
+      last_irq_num = irq_num_spi0;
+`endif
 
       // Tie off remaining interrupt request lines (2..N)
       for (Integer j = last_irq_num + 1; j < valueOf (N_External_Interrupt_Sources); j = j + 1)
@@ -323,6 +347,9 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 	 accel0.reset;
 `endif
 	 soc_info.reset;
+`ifdef INCLUDE_SPI0
+	 spi0.reset;
+`endif
       endaction
    endfunction
 
@@ -349,6 +376,9 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 	 soc_info.init (fabric_default_id,
 			soc_map.m_soc_info_addr_base,
 			soc_map.m_soc_info_addr_lim);
+`ifdef INCLUDE_SPI0
+	 spi0.init (fabric_default_id, soc_map.m_spi0_addr_base, soc_map.m_spi0_addr_lim);
+`endif
 
 	 if (verbosity != 0) begin
 	    $display ("  SoC address map:");
@@ -515,6 +545,14 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
    method Bit #(8) gpio_leds = accel0.leds;
    method Action gpio_btn1 (Bit #(1) v);
       accel0.btn1 (v);
+   endmethod
+`endif
+`ifdef INCLUDE_SPI0
+   method Bit #(1) sd_sclk = spi0.sclk;
+   method Bit #(1) sd_mosi = spi0.mosi;
+   method Bit #(1) sd_cs_n = spi0.cs_n;
+   method Action sd_miso (Bit #(1) v);
+      spi0.miso (v);
    endmethod
 `endif
 

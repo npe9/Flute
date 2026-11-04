@@ -39,6 +39,10 @@ export  mem0_controller_slave_num;
 export  uart0_slave_num;
 export  accel0_slave_num;
 export  soc_info_slave_num;
+`ifdef INCLUDE_SPI0
+export  spi0_slave_num;
+export  irq_num_spi0;
+`endif
 
 export  N_External_Interrupt_Sources;
 export  n_external_interrupt_sources;
@@ -76,7 +80,7 @@ import Fabric_Defs :: *;    // Only for type Fabric_Addr
 
 typedef Bit #(TLog #(Num_Slaves))  Slave_Num;
 
-typedef enum {Dev_BootROM, Dev_SDRAM, Dev_CLINT, Dev_UART0, Dev_GPIO, Dev_PLIC, Dev_SoCInfo}
+typedef enum {Dev_BootROM, Dev_SDRAM, Dev_CLINT, Dev_UART0, Dev_GPIO, Dev_PLIC, Dev_SoCInfo, Dev_SPI0}
         DeviceId deriving (Bits, Eq);
 
 typedef struct {
@@ -127,6 +131,13 @@ Fabric_Addr soc_info_addr_base = 'hC000_3000;
 Fabric_Addr soc_info_addr_size = 'h0000_1000;    // 4K
 Fabric_Addr soc_info_addr_lim  = soc_info_addr_base + soc_info_addr_size;
 
+`ifdef INCLUDE_SPI0
+// SPI host (SiFive SPI registers) on the microSD slot (src/AXI4_SPI.bsv)
+Fabric_Addr spi0_addr_base = 'hC000_4000;
+Fabric_Addr spi0_addr_size = 'h0000_1000;    // 4K
+Fabric_Addr spi0_addr_lim  = spi0_addr_base + spi0_addr_size;
+`endif
+
 // ---- address predicates (package level; used by the module methods)
 
 function Bool fn_is_near_mem_io_addr (Fabric_Addr addr);
@@ -162,6 +173,9 @@ function List #(MemRegion) fn_soc_memmap ();
    rs = List::cons (MemRegion {name: "clint",    device: Dev_CLINT,  base: truncate (near_mem_io_addr_base),    size: truncate (near_mem_io_addr_size),    bus: "near_mem", fabric_decoded: False, irq: 32'h0000_00FF, flags: 2}, rs);
    rs = List::cons (MemRegion {name: "plic",     device: Dev_PLIC,   base: truncate (plic_addr_base),           size: truncate (plic_addr_size),           bus: "reserved", fabric_decoded: False, irq: 32'h0000_00FF, flags: 4}, rs);
    rs = List::cons (MemRegion {name: "soc_info", device: Dev_SoCInfo, base: truncate (soc_info_addr_base),       size: truncate (soc_info_addr_size),       bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
+`ifdef INCLUDE_SPI0
+   rs = List::cons (MemRegion {name: "spi0",     device: Dev_SPI0,   base: truncate (spi0_addr_base),           size: truncate (spi0_addr_size),           bus: "axi",      fabric_decoded: True, irq: fromInteger (irq_num_spi0), flags: 1}, rs);
+`endif
    return rs;
 endfunction
 
@@ -175,6 +189,9 @@ function Slave_Num fn_dev_slave_num (DeviceId d);
       Dev_UART0:  return fromInteger (uart0_slave_num);
       Dev_GPIO:   return fromInteger (accel0_slave_num);
       Dev_SoCInfo: return fromInteger (soc_info_slave_num);
+`ifdef INCLUDE_SPI0
+      Dev_SPI0:   return fromInteger (spi0_slave_num);
+`endif
       default:    return fromInteger (0);
    endcase
 endfunction
@@ -213,6 +230,10 @@ interface SoC_Map_IFC;
    (* always_ready *)   method  Fabric_Addr  m_soc_info_addr_base;
    (* always_ready *)   method  Fabric_Addr  m_soc_info_addr_size;
    (* always_ready *)   method  Fabric_Addr  m_soc_info_addr_lim;
+`ifdef INCLUDE_SPI0
+   (* always_ready *)   method  Fabric_Addr  m_spi0_addr_base;
+   (* always_ready *)   method  Fabric_Addr  m_spi0_addr_lim;
+`endif
 
    (* always_ready *)   method  Fabric_Addr  m_tcm_addr_base;
    (* always_ready *)   method  Fabric_Addr  m_tcm_addr_size;
@@ -276,6 +297,9 @@ module mkSoC_Map (SoC_Map_IFC);
       messageM ("MEMMAPIRQ uart0 " + integerToString (irq_num_uart0) + " core_external");
 `ifdef INCLUDE_ACCEL0
       messageM ("MEMMAPIRQ gpio " + integerToString (irq_num_accel0) + " core_external");
+`endif
+`ifdef INCLUDE_SPI0
+      messageM ("MEMMAPIRQ spi0 " + integerToString (irq_num_spi0) + " core_external");
 `endif
    endrule
 
@@ -342,6 +366,9 @@ module mkSoC_Map (SoC_Map_IFC);
 	      || fn_is_plic_addr (addr)
 	      || fn_is_uart0_addr  (addr)
 	      || ((soc_info_addr_base <= addr) && (addr < soc_info_addr_lim))
+`ifdef INCLUDE_SPI0
+	      || ((spi0_addr_base <= addr) && (addr < spi0_addr_lim))
+`endif
 `ifdef INCLUDE_ACCEL0
 	      || fn_is_accel0_addr  (addr)
 `endif
@@ -393,6 +420,10 @@ module mkSoC_Map (SoC_Map_IFC);
    method  Fabric_Addr  m_soc_info_addr_base = soc_info_addr_base;
    method  Fabric_Addr  m_soc_info_addr_size = soc_info_addr_size;
    method  Fabric_Addr  m_soc_info_addr_lim  = soc_info_addr_lim;
+`ifdef INCLUDE_SPI0
+   method  Fabric_Addr  m_spi0_addr_base = spi0_addr_base;
+   method  Fabric_Addr  m_spi0_addr_lim  = spi0_addr_lim;
+`endif
    method  Fabric_Addr  m_mem0_controller_addr_size = mem0_controller_addr_size;
    method  Fabric_Addr  m_mem0_controller_addr_lim  = mem0_controller_addr_lim;
 
@@ -433,7 +464,11 @@ typedef 2 Num_Masters;
 // ================================================================
 // Count and slave-numbers of slaves in the fabric.
 
-`ifdef INCLUDE_ACCEL0
+`ifdef INCLUDE_SPI0
+
+typedef 6 Num_Slaves;
+
+`elsif INCLUDE_ACCEL0
 
 typedef 5 Num_Slaves;
 
@@ -449,6 +484,9 @@ Integer mem0_controller_slave_num = 1;
 Integer uart0_slave_num           = 2;
 Integer accel0_slave_num          = 3;
 Integer soc_info_slave_num        = 4;
+`ifdef INCLUDE_SPI0
+Integer spi0_slave_num            = 5;
+`endif
 
 // ================================================================
 // Interrupt request numbers (== index in to vector of
@@ -459,6 +497,9 @@ Integer  n_external_interrupt_sources = valueOf (N_External_Interrupt_Sources);
 
 Integer irq_num_uart0  = 0;
 Integer irq_num_accel0 = 1;
+`ifdef INCLUDE_SPI0
+Integer irq_num_spi0   = 2;
+`endif
 
 // ================================================================
 

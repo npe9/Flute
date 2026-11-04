@@ -170,8 +170,9 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
    Reset dm_power_on_reset <- exposeCurrentReset;    // TODO: plumb this in from outside
    Core_IFC #(N_External_Interrupt_Sources)  core <- mkCore (dm_power_on_reset);
 
-   // SoC Fabric
-   Fabric_AXI4_IFC  fabric <- mkFabric_AXI4;
+   // SoC Fabric, and the peripheral bridge behind it (low-speed slaves)
+   Fabric_AXI4_IFC         fabric <- mkFabric_AXI4;
+   Periph_Fabric_AXI4_IFC  periph <- mkPeriph_Fabric_AXI4;
 
    // SoC Boot ROM
    Boot_ROM_IFC  boot_rom <- mkBoot_ROM;
@@ -231,19 +232,22 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
    // Fabric to Mem Controller
    mkConnection (fabric.v_to_slaves [mem0_controller_slave_num], mem0_controller.slave);
 
-   // Fabric to UART0
-   mkConnection (fabric.v_to_slaves [uart0_slave_num],  uart0.slave);
+   // Fabric to the peripheral bridge
+   mkConnection (fabric.v_to_slaves [periph_slave_num], periph.v_from_masters [0]);
+
+   // Bridge to UART0
+   mkConnection (periph.v_to_slaves [uart0_periph_num],  uart0.slave);
 
 `ifdef INCLUDE_ACCEL0
    // Fabric to accel0
    mkConnection (fabric.v_to_slaves [accel0_slave_num], accel0.slave);
 
-   // Fabric to soc_info
-   mkConnection (fabric.v_to_slaves [soc_info_slave_num], soc_info.slave);
+   // Bridge to soc_info
+   mkConnection (periph.v_to_slaves [soc_info_periph_num], soc_info.slave);
 
 `ifdef INCLUDE_SPI0
-   // Fabric to spi0
-   mkConnection (fabric.v_to_slaves [spi0_slave_num], spi0.slave);
+   // Bridge to spi0
+   mkConnection (periph.v_to_slaves [spi0_periph_num], spi0.slave);
 `endif
 
    // Bus-error monitor: drain fabric decode-error events into SoC_Info
@@ -340,6 +344,7 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 	 mem0_controller.server_reset.request.put (?);
 	 uart0.server_reset.request.put (?);
 	 fabric.reset;
+	 periph.reset;
 	 // slaves without a reset handshake: drop their in-flight transactions with the fabric's
 	 boot_rom.reset;
 	 boot_rom_axi4_deburster.reset;

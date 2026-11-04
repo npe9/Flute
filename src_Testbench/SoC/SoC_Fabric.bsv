@@ -81,5 +81,58 @@ module mkFabric_AXI4 (Fabric_AXI4_IFC);
 endmodule
 
 // ================================================================
+// Peripheral bridge: a 1-master sub-fabric on main-fabric slave port periph_slave_num, decoding
+// the bridged devices' regions from the same SoC_Map table.  Both fabrics' xactors are FIFOs, so
+// the hop between them is registered and the low-speed devices can sit anywhere on the die.
+// The main fabric only forwards addresses inside bridged regions, so this decoder never sees an
+// unmapped address (its err_events stay empty).
+
+typedef AXI4_Fabric_IFC #(1,
+			  Num_Periph,
+			  Wd_Id,
+			  Wd_Addr,
+			  Wd_Data,
+			  Wd_User)  Periph_Fabric_AXI4_IFC;
+
+(* synthesize *)
+module mkPeriph_Fabric_AXI4 (Periph_Fabric_AXI4_IFC);
+
+   function Bool fn_is_periph_region (MemRegion r);
+      return r.fabric_decoded && fn_dev_is_periph (r.device);
+   endfunction
+
+   function Tuple3 #(Fabric_Addr, Fabric_Addr, Periph_Num) fn_mk_entry (MemRegion r);
+      return tuple3 (zeroExtend (r.base),
+                     zeroExtend (r.base + r.size),
+                     fn_dev_periph_num (r.device));
+   endfunction
+
+   List #(Tuple3 #(Fabric_Addr, Fabric_Addr, Periph_Num)) tbl =
+      List::map (fn_mk_entry, List::filter (fn_is_periph_region, fn_soc_memmap ()));
+
+   function Tuple2 #(Bool, Periph_Num) fn_decode (Fabric_Addr addr,
+                                                  List #(Tuple3 #(Fabric_Addr,
+                                                                  Fabric_Addr,
+                                                                  Periph_Num)) rs);
+      if (rs == nil)
+         return tuple2 (False, ?);
+      else begin
+         match { .rb, .rl, .rpn } = List::head (rs);
+         if ((rb <= addr) && (addr < rl))
+            return tuple2 (True, rpn);
+         else
+            return fn_decode (addr, List::tail (rs));
+      end
+   endfunction
+
+   function Tuple2 #(Bool, Periph_Num) fn_addr_to_periph_num (Fabric_Addr addr);
+      return fn_decode (addr, tbl);
+   endfunction
+
+   Periph_Fabric_AXI4_IFC fabric <- mkAXI4_Fabric (fn_addr_to_periph_num);
+   return fabric;
+endmodule
+
+// ================================================================
 
 endpackage

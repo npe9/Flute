@@ -34,13 +34,15 @@ export  dmem_master_num;
 export  accel0_master_num;
 
 export  Num_Slaves;
+export  periph_slave_num;
+export  Num_Periph, Periph_Num, fn_dev_is_periph, fn_dev_periph_num;
+export  uart0_periph_num;
 export  boot_rom_slave_num;
 export  mem0_controller_slave_num;
-export  uart0_slave_num;
 export  accel0_slave_num;
-export  soc_info_slave_num;
+export  soc_info_periph_num;
 `ifdef INCLUDE_SPI0
-export  spi0_slave_num;
+export  spi0_periph_num;
 export  irq_num_spi0;
 `endif
 
@@ -186,11 +188,11 @@ function Slave_Num fn_dev_slave_num (DeviceId d);
    case (d)
       Dev_SDRAM:  return fromInteger (mem0_controller_slave_num);
       Dev_BootROM: return fromInteger (boot_rom_slave_num);
-      Dev_UART0:  return fromInteger (uart0_slave_num);
+      Dev_UART0:  return fromInteger (periph_slave_num);
       Dev_GPIO:   return fromInteger (accel0_slave_num);
-      Dev_SoCInfo: return fromInteger (soc_info_slave_num);
+      Dev_SoCInfo: return fromInteger (periph_slave_num);
 `ifdef INCLUDE_SPI0
-      Dev_SPI0:   return fromInteger (spi0_slave_num);
+      Dev_SPI0:   return fromInteger (periph_slave_num);
 `endif
       default:    return fromInteger (0);
    endcase
@@ -464,29 +466,50 @@ typedef 2 Num_Masters;
 // ================================================================
 // Count and slave-numbers of slaves in the fabric.
 
-`ifdef INCLUDE_SPI0
+// The main fabric carries only the high-bandwidth slaves plus one port to the peripheral bridge
+// (a 1xN sub-fabric in SoC_Fabric).  Every low-speed device sits behind the bridge, so adding
+// peripherals never widens the main fabric's write-data dispatch: with 5-6 slaves that star
+// spanned the die and was the 50 MHz critical path (lx29 s3, lx32 s7, lx33 s3/s5).
 
-typedef 6 Num_Slaves;
-
-`elsif INCLUDE_ACCEL0
-
-typedef 5 Num_Slaves;
-
-`else
-
+`ifdef INCLUDE_ACCEL0
 typedef 4 Num_Slaves;
-
+`else
+typedef 3 Num_Slaves;
 `endif
-
 
 Integer boot_rom_slave_num        = 0;
 Integer mem0_controller_slave_num = 1;
-Integer uart0_slave_num           = 2;
+Integer periph_slave_num          = 2;
 Integer accel0_slave_num          = 3;
-Integer soc_info_slave_num        = 4;
+
+// Slaves behind the peripheral bridge
 `ifdef INCLUDE_SPI0
-Integer spi0_slave_num            = 5;
+typedef 3 Num_Periph;
+`else
+typedef 2 Num_Periph;
 `endif
+typedef Bit #(TLog #(Num_Periph))  Periph_Num;
+
+Integer uart0_periph_num          = 0;
+Integer soc_info_periph_num       = 1;
+`ifdef INCLUDE_SPI0
+Integer spi0_periph_num           = 2;
+`endif
+
+function Bool fn_dev_is_periph (DeviceId d);
+   return (d == Dev_UART0) || (d == Dev_SoCInfo) || (d == Dev_SPI0);
+endfunction
+
+function Periph_Num fn_dev_periph_num (DeviceId d);
+   case (d)
+      Dev_UART0:   return fromInteger (uart0_periph_num);
+      Dev_SoCInfo: return fromInteger (soc_info_periph_num);
+`ifdef INCLUDE_SPI0
+      Dev_SPI0:    return fromInteger (spi0_periph_num);
+`endif
+      default:     return 0;
+   endcase
+endfunction
 
 // ================================================================
 // Interrupt request numbers (== index in to vector of

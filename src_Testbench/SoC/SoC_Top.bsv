@@ -65,6 +65,9 @@ import AXI4_GPIO      :: *;
 `ifdef INCLUDE_SPI0
 import AXI4_SPI       :: *;
 `endif
+`ifdef INCLUDE_VIDEO
+import AXI4_RegBus    :: *;
+`endif
 import SoC_Info       :: *;
 `endif
 
@@ -119,6 +122,15 @@ interface SoC_Top_IFC;
    (* always_ready *)   method Bit #(1) flash_mosi;
    (* always_ready *)   method Bit #(1) flash_cs_n;
    (* always_enabled *) method Action   flash_miso (Bit #(1) v);
+`endif
+`ifdef INCLUDE_VIDEO
+   // register bus (src/AXI4_RegBus.bsv) to the Verilog devices in src/Top.v (the video block)
+   (* always_ready *)   method Bit #(1)  rb_valid;
+   (* always_ready *)   method Bit #(1)  rb_we;
+   (* always_ready *)   method Bit #(32) rb_addr;
+   (* always_ready *)   method Bit #(32) rb_wdata;
+   (* always_ready *)   method Bit #(4)  rb_wstrb;
+   (* always_enabled *) method Action    rb_ack (Bit #(1) ack, Bit #(32) rdata);
 `endif
 
    // ----------------------------------------------------------------
@@ -206,6 +218,10 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
    // SPI host: microSD slot (CS 0) and configuration flash (CS 1)
    AXI4_SPI_IFC  spi0 <- mkAXI4_SPI;
 `endif
+`ifdef INCLUDE_VIDEO
+   // register bus for the Verilog-side devices (video)
+   AXI4_RegBus_IFC  regbus <- mkAXI4_RegBus;
+`endif
 
    // ----------------
    // SoC fabric master connections
@@ -254,6 +270,9 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 `ifdef INCLUDE_SPI0
    // Bridge to spi0
    mkConnection (periph.v_to_slaves [spi0_periph_num], spi0.slave);
+`endif
+`ifdef INCLUDE_VIDEO
+   mkConnection (periph.v_to_slaves [regbus_periph_num], regbus.slave);
 `endif
 
    // Bus-error monitor: drain fabric decode-error events into SoC_Info
@@ -344,25 +363,56 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
    // ================================================================
    // SOFT RESET
 
+   Reg #(Bool) rg_fabric_reset <- mkReg (False);
+   Reg #(Bool) rg_accel0_reset <- mkReg (False);
+   Reg #(Bool) rg_periph_reset <- mkReg (False);
+   Bool resets_pending = rg_fabric_reset || rg_accel0_reset || rg_periph_reset;
+
    function Action fa_reset_start_actions (Bool running);
       action
 	 core.cpu_reset_server.request.put (running);
 	 mem0_controller.server_reset.request.put (?);
 	 uart0.server_reset.request.put (?);
-	 fabric.reset;
-	 periph.reset;
-	 // slaves without a reset handshake: drop their in-flight transactions with the fabric's
-	 boot_rom.reset;
-	 boot_rom_axi4_deburster.reset;
+	 rg_fabric_reset <= True;
 `ifdef INCLUDE_ACCEL0
-	 accel0.reset;
+	 rg_accel0_reset <= True;
 `endif
-	 soc_info.reset;
-`ifdef INCLUDE_SPI0
-	 spi0.reset;
-`endif
+	 rg_periph_reset <= True;
       endaction
    endfunction
+
+   // The fabric and the slaves without a reset handshake (which drop their in-flight
+   // transactions with the fabric's) reset one cycle later, from registers, one rule per
+   // corner of the die.  Folding their reset methods' ready signals into the guards of the
+   // reset-start rules put cross-die routes in one sys_clk cycle (39-41 MHz with video).
+   rule rl_fabric_reset (rg_fabric_reset);
+      fabric.reset;
+      boot_rom.reset;
+      boot_rom_axi4_deburster.reset;
+      rg_fabric_reset <= False;
+   endrule
+
+`ifdef INCLUDE_ACCEL0
+   rule rl_accel0_reset (rg_accel0_reset);
+      accel0.reset;
+      rg_accel0_reset <= False;
+   endrule
+`endif
+
+   // Likewise the peripheral sub-fabric and its handshake-less slaves (the video block pulls
+   // the peripheral side to the far corner).  The reset-complete rules wait for all of these
+   // passes, so they still land inside the reset window.
+   rule rl_periph_reset (rg_periph_reset);
+      periph.reset;
+      soc_info.reset;
+`ifdef INCLUDE_SPI0
+      spi0.reset;
+`endif
+`ifdef INCLUDE_VIDEO
+      regbus.reset;
+`endif
+      rg_periph_reset <= False;
+   endrule
 
    function Action fa_reset_complete_actions ();
       action
@@ -417,7 +467,7 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
       $display ("%0d:%m.rl_reset_start_initial ...", cur_cycle);
    endrule
 
-   rule rl_reset_complete_initial (rg_state == SOC_RESETTING);
+   rule rl_reset_complete_initial ((rg_state == SOC_RESETTING) && (! resets_pending));
       fa_reset_complete_actions;
       rg_state <= SOC_IDLE;
 
@@ -436,8 +486,11 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
    // was dropped (or data whose address was), or a response the fabric's in-order routing will
    // hand to the wrong request.  The first pass brings the hart up halted, so once it completes
    // no master issues anything; after a short settle the second pass resets everything again
-   // with nothing in flight and brings the hart up as requested.
-   Reg #(Bit #(4)) rg_ndm_settle <- mkReg (0);
+   // with nothing in flight and brings the hart up as requested.  "Nothing" is not quite true:
+   // the halted hart's I$ may still be refilling a line (8 beats from the boot ROM, ~20 cycles),
+   // and a second pass landing inside that burst leaves its tail beats to the next fetch, which
+   // then hangs.  The settle covers a whole refill.
+   Reg #(Bit #(6)) rg_ndm_settle <- mkReg (0);
 
    rule rl_ndm_reset_start (rg_state == SOC_IDLE);
       let running <- core.ndm_reset_client.request.get;
@@ -450,7 +503,7 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 		cur_cycle, fshow (running));
    endrule
 
-   rule rl_ndm_reset_quiet (rg_state == SOC_RESETTING_NDM);
+   rule rl_ndm_reset_quiet ((rg_state == SOC_RESETTING_NDM) && (! resets_pending));
       fa_reset_complete_actions;
       rg_ndm_settle <= 0;
       rg_state <= SOC_NDM_SETTLE;
@@ -464,7 +517,7 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
       rg_ndm_settle <= rg_ndm_settle + 1;
    endrule
 
-   rule rl_ndm_reset_complete (rg_state == SOC_RESETTING_NDM2);
+   rule rl_ndm_reset_complete ((rg_state == SOC_RESETTING_NDM2) && (! resets_pending));
       fa_reset_complete_actions;
       rg_state <= SOC_IDLE;
 
@@ -570,6 +623,16 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
    method Bit #(1) flash_cs_n = spi0.cs_n [1];
    method Action flash_miso (Bit #(1) v);
       spi0.miso1 (v);
+   endmethod
+`endif
+`ifdef INCLUDE_VIDEO
+   method Bit #(1)  rb_valid = regbus.rb_valid;
+   method Bit #(1)  rb_we    = regbus.rb_we;
+   method Bit #(32) rb_addr  = regbus.rb_addr;
+   method Bit #(32) rb_wdata = regbus.rb_wdata;
+   method Bit #(4)  rb_wstrb = regbus.rb_wstrb;
+   method Action rb_ack (Bit #(1) ack, Bit #(32) rdata);
+      regbus.rb_ack (ack, rdata);
    endmethod
 `endif
 

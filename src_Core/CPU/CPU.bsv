@@ -2185,6 +2185,14 @@ module mkCPU (CPU_IFC);
    (* descending_urgency = "rl_debug_halt, rl_stage1_FENCE" *)
    (* descending_urgency = "rl_debug_halt, rl_stage1_stop" *)
    (* descending_urgency = "rl_debug_halt, rl_stage1_trap" *)
+`ifdef ISA_PRIV_S
+   // SFENCE.VMA was left out above and bsc ranked it over both rules, which put its stage1
+   // decode and near_mem's sfence RDY into WILL_FIRE_rl_debug_halt and from there into every
+   // stage1 rule and the rg_state / rg_step_count / debug enables.
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_SFENCE_VMA" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_finish_SFENCE_VMA" *)
+   (* descending_urgency = "rl_debug_halt, rl_stage1_SFENCE_VMA" *)
+`endif
    (* descending_urgency = "rl_debug_halt, rl_stage1_WFI" *)
    (* descending_urgency = "rl_debug_halt, rl_stage1_xRET" *)
    (* descending_urgency = "rl_debug_halt, rl_trap_BREAK_to_Debug_Mode" *)

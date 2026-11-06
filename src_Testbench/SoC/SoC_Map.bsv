@@ -45,6 +45,9 @@ export  soc_info_periph_num;
 export  spi0_periph_num;
 export  irq_num_spi0;
 `endif
+`ifdef INCLUDE_VIDEO
+export  regbus_periph_num;
+`endif
 
 export  N_External_Interrupt_Sources;
 export  n_external_interrupt_sources;
@@ -82,7 +85,7 @@ import Fabric_Defs :: *;    // Only for type Fabric_Addr
 
 typedef Bit #(TLog #(Num_Slaves))  Slave_Num;
 
-typedef enum {Dev_BootROM, Dev_SDRAM, Dev_CLINT, Dev_UART0, Dev_GPIO, Dev_PLIC, Dev_SoCInfo, Dev_SPI0}
+typedef enum {Dev_BootROM, Dev_SDRAM, Dev_CLINT, Dev_UART0, Dev_GPIO, Dev_PLIC, Dev_SoCInfo, Dev_SPI0, Dev_Video}
         DeviceId deriving (Bits, Eq);
 
 typedef struct {
@@ -140,6 +143,17 @@ Fabric_Addr spi0_addr_size = 'h0000_1000;    // 4K
 Fabric_Addr spi0_addr_lim  = spi0_addr_base + spi0_addr_size;
 `endif
 
+`ifdef INCLUDE_VIDEO
+// DVI framebuffer (src/Video_DVI.v) on the register bus (src/AXI4_RegBus.bsv): control and
+// palette, and the block-RAM pixel memory (153600 bytes backed)
+Fabric_Addr video_addr_base    = 'hC001_0000;
+Fabric_Addr video_addr_size    = 'h0000_1000;    // 4K
+Fabric_Addr video_addr_lim     = video_addr_base + video_addr_size;
+Fabric_Addr video_fb_addr_base = 'hC100_0000;
+Fabric_Addr video_fb_addr_size = 'h0004_0000;    // 256K
+Fabric_Addr video_fb_addr_lim  = video_fb_addr_base + video_fb_addr_size;
+`endif
+
 // ---- address predicates (package level; used by the module methods)
 
 function Bool fn_is_near_mem_io_addr (Fabric_Addr addr);
@@ -178,6 +192,10 @@ function List #(MemRegion) fn_soc_memmap ();
 `ifdef INCLUDE_SPI0
    rs = List::cons (MemRegion {name: "spi0",     device: Dev_SPI0,   base: truncate (spi0_addr_base),           size: truncate (spi0_addr_size),           bus: "axi",      fabric_decoded: True, irq: fromInteger (irq_num_spi0), flags: 1}, rs);
 `endif
+`ifdef INCLUDE_VIDEO
+   rs = List::cons (MemRegion {name: "video",    device: Dev_Video,  base: truncate (video_addr_base),          size: truncate (video_addr_size),          bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
+   rs = List::cons (MemRegion {name: "video_fb", device: Dev_Video,  base: truncate (video_fb_addr_base),       size: truncate (video_fb_addr_size),       bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
+`endif
    return rs;
 endfunction
 
@@ -193,6 +211,9 @@ function Slave_Num fn_dev_slave_num (DeviceId d);
       Dev_SoCInfo: return fromInteger (periph_slave_num);
 `ifdef INCLUDE_SPI0
       Dev_SPI0:   return fromInteger (periph_slave_num);
+`endif
+`ifdef INCLUDE_VIDEO
+      Dev_Video:  return fromInteger (periph_slave_num);
 `endif
       default:    return fromInteger (0);
    endcase
@@ -371,6 +392,10 @@ module mkSoC_Map (SoC_Map_IFC);
 `ifdef INCLUDE_SPI0
 	      || ((spi0_addr_base <= addr) && (addr < spi0_addr_lim))
 `endif
+`ifdef INCLUDE_VIDEO
+	      || ((video_addr_base <= addr) && (addr < video_addr_lim))
+	      || ((video_fb_addr_base <= addr) && (addr < video_fb_addr_lim))
+`endif
 `ifdef INCLUDE_ACCEL0
 	      || fn_is_accel0_addr  (addr)
 `endif
@@ -482,11 +507,19 @@ Integer mem0_controller_slave_num = 1;
 Integer periph_slave_num          = 2;
 Integer accel0_slave_num          = 3;
 
-// Slaves behind the peripheral bridge
+// Slaves behind the peripheral bridge (the register bus, when present, is the last)
 `ifdef INCLUDE_SPI0
+`ifdef INCLUDE_VIDEO
+typedef 4 Num_Periph;
+`else
+typedef 3 Num_Periph;
+`endif
+`else
+`ifdef INCLUDE_VIDEO
 typedef 3 Num_Periph;
 `else
 typedef 2 Num_Periph;
+`endif
 `endif
 typedef Bit #(TLog #(Num_Periph))  Periph_Num;
 
@@ -495,9 +528,12 @@ Integer soc_info_periph_num       = 1;
 `ifdef INCLUDE_SPI0
 Integer spi0_periph_num           = 2;
 `endif
+`ifdef INCLUDE_VIDEO
+Integer regbus_periph_num         = valueOf (Num_Periph) - 1;
+`endif
 
 function Bool fn_dev_is_periph (DeviceId d);
-   return (d == Dev_UART0) || (d == Dev_SoCInfo) || (d == Dev_SPI0);
+   return (d == Dev_UART0) || (d == Dev_SoCInfo) || (d == Dev_SPI0) || (d == Dev_Video);
 endfunction
 
 function Periph_Num fn_dev_periph_num (DeviceId d);
@@ -506,6 +542,9 @@ function Periph_Num fn_dev_periph_num (DeviceId d);
       Dev_SoCInfo: return fromInteger (soc_info_periph_num);
 `ifdef INCLUDE_SPI0
       Dev_SPI0:    return fromInteger (spi0_periph_num);
+`endif
+`ifdef INCLUDE_VIDEO
+      Dev_Video:   return fromInteger (regbus_periph_num);
 `endif
       default:     return 0;
    endcase

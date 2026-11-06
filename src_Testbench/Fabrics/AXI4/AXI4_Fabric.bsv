@@ -159,6 +159,21 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
 			     Bit #(wd_user),
 			     Bit #(wd_addr)))) v_f_rd_err_info <- replicateM (mkSizedFIFOF (8));
 
+   // Each error-response rule stages its event (the faulting address; master, direction and
+   // response are fixed per rule) in its own one-entry slot, and rl_err_events_merge moves one
+   // per cycle into f_err_events.  Enqueuing f_err_events from the error rules directly made
+   // them compete for it: bsc chained every master's error-rule WILL_FIRE into the next
+   // through the enq mux, and from there into the err_info FIFO dequeues -- a cross-die path.
+   // A slot is pending while tog != ack; the error rule flips tog, the merge rule flips ack.
+   // ConfigRegs, so neither rule orders against the other (each sees last cycle's values),
+   // and with no tog/ack/addr writer in common they never conflict.
+   Vector #(tn_num_masters, Reg #(Bool))           v_rg_wr_ev_tog  <- replicateM (mkConfigReg (False));
+   Vector #(tn_num_masters, Reg #(Bool))           v_rg_wr_ev_ack  <- replicateM (mkConfigReg (False));
+   Vector #(tn_num_masters, Reg #(Bit #(wd_addr))) v_rg_wr_ev_addr <- replicateM (mkConfigRegU);
+   Vector #(tn_num_masters, Reg #(Bool))           v_rg_rd_ev_tog  <- replicateM (mkConfigReg (False));
+   Vector #(tn_num_masters, Reg #(Bool))           v_rg_rd_ev_ack  <- replicateM (mkConfigReg (False));
+   Vector #(tn_num_masters, Reg #(Bit #(wd_addr))) v_rg_rd_ev_addr <- replicateM (mkConfigRegU);
+
    // On an mi->non-existent-slave read-transaction,
    // this register is the R-channel burst beat_count
    // (0 => ready for next burst)
@@ -362,11 +377,11 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
 
 	 match { .awid, .awuser, .awaddr } = v_f_wr_err_info [mi].first;
 
-	 if (f_err_events.notFull)
-	    f_err_events.enq (BusErrEvent {addr:   zeroExtend (awaddr),
-					   is_wr:  True,
-					   master: fromInteger (mi),
-					   resp:   axi4_resp_decerr});
+	 // (dropped if the slot is still pending)
+	 if (v_rg_wr_ev_tog [mi] == v_rg_wr_ev_ack [mi]) begin
+	    v_rg_wr_ev_addr [mi] <= awaddr;
+	    v_rg_wr_ev_tog  [mi] <= ! v_rg_wr_ev_tog [mi];
+	 end
 
 	 let b = AXI4_Wr_Resp {bid:   awid,
 			       bresp: axi4_resp_decerr,
@@ -468,11 +483,10 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
       rule rl_rd_resp_err_to_master (v_f_rd_sjs [mi].first == fromInteger (num_slaves));
 	 match { .arlen, .arid, .aruser, .araddr } = v_f_rd_err_info [mi].first;
 
-	 if ((f_err_events.notFull) && (v_rg_r_err_beat_count [mi] == arlen))
-	    f_err_events.enq (BusErrEvent {addr:   zeroExtend (araddr),
-					   is_wr:  False,
-					   master: fromInteger (mi),
-					   resp:   axi4_resp_decerr});
+	 if ((v_rg_rd_ev_tog [mi] == v_rg_rd_ev_ack [mi]) && (v_rg_r_err_beat_count [mi] == arlen)) begin
+	    v_rg_rd_ev_addr [mi] <= araddr;
+	    v_rg_rd_ev_tog  [mi] <= ! v_rg_rd_ev_tog [mi];
+	 end
 
 	 Bit #(wd_data) data = 0;
 	 let r = AXI4_Rd_Data {rid:    arid,
@@ -499,6 +513,34 @@ module mkAXI4_Fabric #(function Tuple2 #(Bool, Bit #(TLog #(tn_num_slaves)))
 	    $display ("    r: ", fshow (r));
 	 end
       endrule
+
+   // One staged event per cycle into f_err_events; lowest master first, a write before a read.
+   rule rl_err_events_merge (f_err_events.notFull);
+      Maybe #(BusErrEvent) m_e = tagged Invalid;
+      Vector #(tn_num_masters, Bool) ack_wr = replicate (False);
+      Vector #(tn_num_masters, Bool) ack_rd = replicate (False);
+      for (Integer mi = num_masters - 1; mi >= 0; mi = mi - 1) begin
+	 if (v_rg_rd_ev_tog [mi] != v_rg_rd_ev_ack [mi]) begin
+	    m_e = tagged Valid (BusErrEvent {addr:   zeroExtend (v_rg_rd_ev_addr [mi]),
+					     is_wr:  False,
+					     master: fromInteger (mi),
+					     resp:   axi4_resp_decerr});
+	    ack_wr = replicate (False);  ack_rd = replicate (False);  ack_rd [mi] = True;
+	 end
+	 if (v_rg_wr_ev_tog [mi] != v_rg_wr_ev_ack [mi]) begin
+	    m_e = tagged Valid (BusErrEvent {addr:   zeroExtend (v_rg_wr_ev_addr [mi]),
+					     is_wr:  True,
+					     master: fromInteger (mi),
+					     resp:   axi4_resp_decerr});
+	    ack_wr = replicate (False);  ack_rd = replicate (False);  ack_wr [mi] = True;
+	 end
+      end
+      if (m_e matches tagged Valid .e) f_err_events.enq (e);
+      for (Integer mi = 0; mi < num_masters; mi = mi + 1) begin
+	 if (ack_wr [mi]) v_rg_wr_ev_ack [mi] <= ! v_rg_wr_ev_ack [mi];
+	 if (ack_rd [mi]) v_rg_rd_ev_ack [mi] <= ! v_rg_rd_ev_ack [mi];
+      end
+   endrule
 
    // ================================================================
    // INTERFACE

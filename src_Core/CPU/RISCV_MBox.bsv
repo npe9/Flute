@@ -65,6 +65,11 @@ module mkRISCV_MBox (RISCV_MBox_IFC);
    Reg #(WordXL)    rg_v1              <- mkRegU;
    Reg #(WordXL)    rg_v2              <- mkRegU;
    Reg #(WordXL)    rg_result          <- mkRegU;
+`ifdef RVFI_ALTOPS
+   // The operands as requested: mkIntDiv works in rg_v1 / rg_v2 (the dividend becomes the remainder).
+   Reg #(WordXL)    rg_alt_v1          <- mkRegU;
+   Reg #(WordXL)    rg_alt_v2          <- mkRegU;
+`endif
 
 `ifdef MULT_SYNTH
 `ifdef RV32
@@ -278,6 +283,10 @@ module mkRISCV_MBox (RISCV_MBox_IFC);
       rg_f3              <= f3;
       rg_v1              <= v1;
       rg_v2              <= v2;
+`ifdef RVFI_ALTOPS
+      rg_alt_v1          <= v1;
+      rg_alt_v2          <= v2;
+`endif
       rg_valid           <= False;
 
       // MUL, MULH, MULHU, MULHSU
@@ -344,7 +353,31 @@ module mkRISCV_MBox (RISCV_MBox_IFC);
    endmethod
 
    method WordXL  word;
+`ifdef RVFI_ALTOPS
+      // riscv-formal ALTOPS (insns/generate.py, same constants; RV32 only): the RVFI checks prove
+      // operands, opcode dispatch, rd and the unit's real timing; the value is a stand-in because
+      // no solver will do 32-bit multiply/divide.  Formal builds only.  The arithmetic is covered
+      // by the ISA tests, not by this.
+      Bit #(64) alt_mask = case (rg_f3)
+                              3'b000: 64'h2cdf52a55876063e;
+                              3'b001: 64'h15d01651f6583fb7;
+                              3'b010: 64'hea3969edecfbe137;
+                              3'b011: 64'hd13db50d949ce5e8;
+                              3'b100: 64'h29bbf66f7f8529ec;
+                              3'b101: 64'h8c629acb10e8fd70;
+                              3'b110: 64'hf5b7d8538da68fa5;
+                              3'b111: 64'hbc4402413138d0e1;
+                           endcase;
+      Bool alt_is_add = (rg_f3 == 3'b000) || (rg_f3 == 3'b001) || (rg_f3 == 3'b011);
+`ifdef RVFI_MUTANT_M_SWAP
+      WordXL alt_v = alt_is_add ? (rg_alt_v1 + rg_alt_v2) : (rg_alt_v2 - rg_alt_v1);   // mutant: operands swapped
+`else
+      WordXL alt_v = alt_is_add ? (rg_alt_v1 + rg_alt_v2) : (rg_alt_v1 - rg_alt_v2);
+`endif
+      return alt_v ^ truncate (alt_mask);
+`else
       return rg_word;
+`endif
    endmethod
 endmodule
 

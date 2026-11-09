@@ -85,7 +85,7 @@ import Fabric_Defs :: *;    // Only for type Fabric_Addr
 
 typedef Bit #(TLog #(Num_Slaves))  Slave_Num;
 
-typedef enum {Dev_BootROM, Dev_SDRAM, Dev_CLINT, Dev_UART0, Dev_GPIO, Dev_PLIC, Dev_SoCInfo, Dev_SPI0, Dev_Video}
+typedef enum {Dev_BootROM, Dev_SDRAM, Dev_CLINT, Dev_UART0, Dev_GPIO, Dev_PLIC, Dev_SoCInfo, Dev_SPI0, Dev_Video, Dev_I2C0, Dev_GPIO1, Dev_Audio}
         DeviceId deriving (Bits, Eq);
 
 typedef struct {
@@ -152,6 +152,17 @@ Fabric_Addr video_addr_lim     = video_addr_base + video_addr_size;
 Fabric_Addr video_fb_addr_base = 'hC100_0000;
 Fabric_Addr video_fb_addr_size = 'h0004_0000;    // 256K
 Fabric_Addr video_fb_addr_lim  = video_fb_addr_base + video_fb_addr_size;
+// src/Board_IO.v and src/Audio.v, on the same register bus: the I2C bus (RTC, HDMI DDC), buttons
+// and switches, the audio jack.  Each has its own DeviceId: it is what the SoCInfo device table reports.
+Fabric_Addr i2c0_addr_base  = 'hC000_6000;
+Fabric_Addr i2c0_addr_size  = 'h0000_1000;    // 4K
+Fabric_Addr i2c0_addr_lim   = i2c0_addr_base + i2c0_addr_size;
+Fabric_Addr gpio1_addr_base = 'hC000_8000;
+Fabric_Addr gpio1_addr_size = 'h0000_1000;    // 4K
+Fabric_Addr gpio1_addr_lim  = gpio1_addr_base + gpio1_addr_size;
+Fabric_Addr audio_addr_base = 'hC000_9000;
+Fabric_Addr audio_addr_size = 'h0000_1000;    // 4K
+Fabric_Addr audio_addr_lim  = audio_addr_base + audio_addr_size;
 `endif
 
 // ---- address predicates (package level; used by the module methods)
@@ -195,6 +206,9 @@ function List #(MemRegion) fn_soc_memmap ();
 `ifdef INCLUDE_VIDEO
    rs = List::cons (MemRegion {name: "video",    device: Dev_Video,  base: truncate (video_addr_base),          size: truncate (video_addr_size),          bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
    rs = List::cons (MemRegion {name: "video_fb", device: Dev_Video,  base: truncate (video_fb_addr_base),       size: truncate (video_fb_addr_size),       bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
+   rs = List::cons (MemRegion {name: "i2c0",     device: Dev_I2C0,   base: truncate (i2c0_addr_base),       size: truncate (i2c0_addr_size),       bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
+   rs = List::cons (MemRegion {name: "gpio1",    device: Dev_GPIO1,  base: truncate (gpio1_addr_base),       size: truncate (gpio1_addr_size),       bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
+   rs = List::cons (MemRegion {name: "audio",    device: Dev_Audio,  base: truncate (audio_addr_base),       size: truncate (audio_addr_size),       bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
 `endif
    return rs;
 endfunction
@@ -214,6 +228,9 @@ function Slave_Num fn_dev_slave_num (DeviceId d);
 `endif
 `ifdef INCLUDE_VIDEO
       Dev_Video:  return fromInteger (periph_slave_num);
+      Dev_I2C0:   return fromInteger (periph_slave_num);
+      Dev_GPIO1:  return fromInteger (periph_slave_num);
+      Dev_Audio:  return fromInteger (periph_slave_num);
 `endif
       default:    return fromInteger (0);
    endcase
@@ -395,6 +412,9 @@ module mkSoC_Map (SoC_Map_IFC);
 `ifdef INCLUDE_VIDEO
 	      || ((video_addr_base <= addr) && (addr < video_addr_lim))
 	      || ((video_fb_addr_base <= addr) && (addr < video_fb_addr_lim))
+	      || ((i2c0_addr_base <= addr) && (addr < i2c0_addr_lim))
+	      || ((gpio1_addr_base <= addr) && (addr < gpio1_addr_lim))
+	      || ((audio_addr_base <= addr) && (addr < audio_addr_lim))
 `endif
 `ifdef INCLUDE_ACCEL0
 	      || fn_is_accel0_addr  (addr)
@@ -533,7 +553,8 @@ Integer regbus_periph_num         = valueOf (Num_Periph) - 1;
 `endif
 
 function Bool fn_dev_is_periph (DeviceId d);
-   return (d == Dev_UART0) || (d == Dev_SoCInfo) || (d == Dev_SPI0) || (d == Dev_Video);
+   return (d == Dev_UART0) || (d == Dev_SoCInfo) || (d == Dev_SPI0) || (d == Dev_Video)
+          || (d == Dev_I2C0) || (d == Dev_GPIO1) || (d == Dev_Audio);
 endfunction
 
 function Periph_Num fn_dev_periph_num (DeviceId d);
@@ -545,6 +566,9 @@ function Periph_Num fn_dev_periph_num (DeviceId d);
 `endif
 `ifdef INCLUDE_VIDEO
       Dev_Video:   return fromInteger (regbus_periph_num);
+      Dev_I2C0:    return fromInteger (regbus_periph_num);
+      Dev_GPIO1:   return fromInteger (regbus_periph_num);
+      Dev_Audio:   return fromInteger (regbus_periph_num);
 `endif
       default:     return 0;
    endcase

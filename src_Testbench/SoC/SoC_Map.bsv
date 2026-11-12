@@ -45,6 +45,10 @@ export  soc_info_periph_num;
 export  spi0_periph_num;
 export  irq_num_spi0;
 `endif
+`ifdef INCLUDE_SPI2
+export  spi2_periph_num;
+export  irq_num_spi2;
+`endif
 `ifdef INCLUDE_VIDEO
 export  regbus_periph_num;
 `endif
@@ -85,7 +89,7 @@ import Fabric_Defs :: *;    // Only for type Fabric_Addr
 
 typedef Bit #(TLog #(Num_Slaves))  Slave_Num;
 
-typedef enum {Dev_BootROM, Dev_SDRAM, Dev_CLINT, Dev_UART0, Dev_GPIO, Dev_PLIC, Dev_SoCInfo, Dev_SPI0, Dev_Video, Dev_I2C0, Dev_GPIO1, Dev_Audio}
+typedef enum {Dev_BootROM, Dev_SDRAM, Dev_CLINT, Dev_UART0, Dev_GPIO, Dev_PLIC, Dev_SoCInfo, Dev_SPI0, Dev_Video, Dev_I2C0, Dev_GPIO1, Dev_Audio, Dev_SPI2}
         DeviceId deriving (Bits, Eq);
 
 typedef struct {
@@ -141,6 +145,13 @@ Fabric_Addr soc_info_addr_lim  = soc_info_addr_base + soc_info_addr_size;
 Fabric_Addr spi0_addr_base = 'hC000_4000;
 Fabric_Addr spi0_addr_size = 'h0000_1000;    // 4K
 Fabric_Addr spi0_addr_lim  = spi0_addr_base + spi0_addr_size;
+`endif
+
+`ifdef INCLUDE_SPI2
+// Second SPI host (the same src/AXI4_SPI.bsv) on the on-board 8-channel ADC (MAX11125), chip select 0
+Fabric_Addr spi2_addr_base = 'hC000_A000;
+Fabric_Addr spi2_addr_size = 'h0000_1000;    // 4K
+Fabric_Addr spi2_addr_lim  = spi2_addr_base + spi2_addr_size;
 `endif
 
 `ifdef INCLUDE_VIDEO
@@ -203,6 +214,9 @@ function List #(MemRegion) fn_soc_memmap ();
 `ifdef INCLUDE_SPI0
    rs = List::cons (MemRegion {name: "spi0",     device: Dev_SPI0,   base: truncate (spi0_addr_base),           size: truncate (spi0_addr_size),           bus: "axi",      fabric_decoded: True, irq: fromInteger (irq_num_spi0), flags: 1}, rs);
 `endif
+`ifdef INCLUDE_SPI2
+   rs = List::cons (MemRegion {name: "spi2",     device: Dev_SPI2,   base: truncate (spi2_addr_base),           size: truncate (spi2_addr_size),           bus: "axi",      fabric_decoded: True, irq: fromInteger (irq_num_spi2), flags: 1}, rs);
+`endif
 `ifdef INCLUDE_VIDEO
    rs = List::cons (MemRegion {name: "video",    device: Dev_Video,  base: truncate (video_addr_base),          size: truncate (video_addr_size),          bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
    rs = List::cons (MemRegion {name: "video_fb", device: Dev_Video,  base: truncate (video_fb_addr_base),       size: truncate (video_fb_addr_size),       bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
@@ -225,6 +239,9 @@ function Slave_Num fn_dev_slave_num (DeviceId d);
       Dev_SoCInfo: return fromInteger (periph_slave_num);
 `ifdef INCLUDE_SPI0
       Dev_SPI0:   return fromInteger (periph_slave_num);
+`endif
+`ifdef INCLUDE_SPI2
+      Dev_SPI2:   return fromInteger (periph_slave_num);
 `endif
 `ifdef INCLUDE_VIDEO
       Dev_Video:  return fromInteger (periph_slave_num);
@@ -273,6 +290,10 @@ interface SoC_Map_IFC;
 `ifdef INCLUDE_SPI0
    (* always_ready *)   method  Fabric_Addr  m_spi0_addr_base;
    (* always_ready *)   method  Fabric_Addr  m_spi0_addr_lim;
+`endif
+`ifdef INCLUDE_SPI2
+   (* always_ready *)   method  Fabric_Addr  m_spi2_addr_base;
+   (* always_ready *)   method  Fabric_Addr  m_spi2_addr_lim;
 `endif
 
    (* always_ready *)   method  Fabric_Addr  m_tcm_addr_base;
@@ -340,6 +361,9 @@ module mkSoC_Map (SoC_Map_IFC);
 `endif
 `ifdef INCLUDE_SPI0
       messageM ("MEMMAPIRQ spi0 " + integerToString (irq_num_spi0) + " core_external");
+`endif
+`ifdef INCLUDE_SPI2
+      messageM ("MEMMAPIRQ spi2 " + integerToString (irq_num_spi2) + " core_external");
 `endif
    endrule
 
@@ -409,6 +433,9 @@ module mkSoC_Map (SoC_Map_IFC);
 `ifdef INCLUDE_SPI0
 	      || ((spi0_addr_base <= addr) && (addr < spi0_addr_lim))
 `endif
+`ifdef INCLUDE_SPI2
+	      || ((spi2_addr_base <= addr) && (addr < spi2_addr_lim))
+`endif
 `ifdef INCLUDE_VIDEO
 	      || ((video_addr_base <= addr) && (addr < video_addr_lim))
 	      || ((video_fb_addr_base <= addr) && (addr < video_fb_addr_lim))
@@ -471,6 +498,10 @@ module mkSoC_Map (SoC_Map_IFC);
    method  Fabric_Addr  m_spi0_addr_base = spi0_addr_base;
    method  Fabric_Addr  m_spi0_addr_lim  = spi0_addr_lim;
 `endif
+`ifdef INCLUDE_SPI2
+   method  Fabric_Addr  m_spi2_addr_base = spi2_addr_base;
+   method  Fabric_Addr  m_spi2_addr_lim  = spi2_addr_lim;
+`endif
    method  Fabric_Addr  m_mem0_controller_addr_size = mem0_controller_addr_size;
    method  Fabric_Addr  m_mem0_controller_addr_lim  = mem0_controller_addr_lim;
 
@@ -530,7 +561,11 @@ Integer accel0_slave_num          = 3;
 // Slaves behind the peripheral bridge (the register bus, when present, is the last)
 `ifdef INCLUDE_SPI0
 `ifdef INCLUDE_VIDEO
+`ifdef INCLUDE_SPI2
+typedef 5 Num_Periph;    // INCLUDE_SPI2 needs INCLUDE_SPI0 and INCLUDE_VIDEO
+`else
 typedef 4 Num_Periph;
+`endif
 `else
 typedef 3 Num_Periph;
 `endif
@@ -548,13 +583,16 @@ Integer soc_info_periph_num       = 1;
 `ifdef INCLUDE_SPI0
 Integer spi0_periph_num           = 2;
 `endif
+`ifdef INCLUDE_SPI2
+Integer spi2_periph_num           = 3;
+`endif
 `ifdef INCLUDE_VIDEO
 Integer regbus_periph_num         = valueOf (Num_Periph) - 1;
 `endif
 
 function Bool fn_dev_is_periph (DeviceId d);
    return (d == Dev_UART0) || (d == Dev_SoCInfo) || (d == Dev_SPI0) || (d == Dev_Video)
-          || (d == Dev_I2C0) || (d == Dev_GPIO1) || (d == Dev_Audio);
+          || (d == Dev_I2C0) || (d == Dev_GPIO1) || (d == Dev_Audio) || (d == Dev_SPI2);
 endfunction
 
 function Periph_Num fn_dev_periph_num (DeviceId d);
@@ -563,6 +601,9 @@ function Periph_Num fn_dev_periph_num (DeviceId d);
       Dev_SoCInfo: return fromInteger (soc_info_periph_num);
 `ifdef INCLUDE_SPI0
       Dev_SPI0:    return fromInteger (spi0_periph_num);
+`endif
+`ifdef INCLUDE_SPI2
+      Dev_SPI2:    return fromInteger (spi2_periph_num);
 `endif
 `ifdef INCLUDE_VIDEO
       Dev_Video:   return fromInteger (regbus_periph_num);
@@ -585,6 +626,9 @@ Integer irq_num_uart0  = 0;
 Integer irq_num_accel0 = 1;
 `ifdef INCLUDE_SPI0
 Integer irq_num_spi0   = 2;
+`endif
+`ifdef INCLUDE_SPI2
+Integer irq_num_spi2   = 3;
 `endif
 
 // ================================================================

@@ -123,6 +123,13 @@ interface SoC_Top_IFC;
    (* always_ready *)   method Bit #(1) flash_cs_n;
    (* always_enabled *) method Action   flash_miso (Bit #(1) v);
 `endif
+`ifdef INCLUDE_SPI2
+   // on-board ADC (second SPI host, chip select 0)
+   (* always_ready *)   method Bit #(1) adc_sclk;
+   (* always_ready *)   method Bit #(1) adc_mosi;
+   (* always_ready *)   method Bit #(1) adc_cs_n;
+   (* always_enabled *) method Action   adc_miso (Bit #(1) v);
+`endif
 `ifdef INCLUDE_VIDEO
    // register bus (src/AXI4_RegBus.bsv) to the Verilog devices in src/Top.v (the video block)
    (* always_ready *)   method Bit #(1)  rb_valid;
@@ -218,6 +225,10 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
    // SPI host: microSD slot (CS 0) and configuration flash (CS 1)
    AXI4_SPI_IFC  spi0 <- mkAXI4_SPI;
 `endif
+`ifdef INCLUDE_SPI2
+   // SPI host: the on-board ADC (CS 0; CS 1 has no pin and its MISO is tied high)
+   AXI4_SPI_IFC  spi2 <- mkAXI4_SPI;
+`endif
 `ifdef INCLUDE_VIDEO
    // register bus for the Verilog-side devices (video)
    AXI4_RegBus_IFC  regbus <- mkAXI4_RegBus;
@@ -270,6 +281,14 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 `ifdef INCLUDE_SPI0
    // Bridge to spi0
    mkConnection (periph.v_to_slaves [spi0_periph_num], spi0.slave);
+`endif
+`ifdef INCLUDE_SPI2
+   mkConnection (periph.v_to_slaves [spi2_periph_num], spi2.slave);
+   // CS 1 of spi2 has no pin: its MISO idles high
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_spi2_miso1_tie;
+      spi2.miso1 (1);
+   endrule
 `endif
 `ifdef INCLUDE_VIDEO
    mkConnection (periph.v_to_slaves [regbus_periph_num], regbus.slave);
@@ -342,6 +361,10 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
       core.core_external_interrupt_sources [irq_num_spi0].m_interrupt_req (spi0.interrupt_req);
       last_irq_num = irq_num_spi0;
 `endif
+`ifdef INCLUDE_SPI2
+      core.core_external_interrupt_sources [irq_num_spi2].m_interrupt_req (spi2.interrupt_req);
+      last_irq_num = irq_num_spi2;
+`endif
 
       // Tie off remaining interrupt request lines (2..N)
       for (Integer j = last_irq_num + 1; j < valueOf (N_External_Interrupt_Sources); j = j + 1)
@@ -408,6 +431,9 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 `ifdef INCLUDE_SPI0
       spi0.reset;
 `endif
+`ifdef INCLUDE_SPI2
+      spi2.reset;
+`endif
 `ifdef INCLUDE_VIDEO
       regbus.reset;
 `endif
@@ -439,6 +465,9 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 			soc_map.m_soc_info_addr_lim);
 `ifdef INCLUDE_SPI0
 	 spi0.init (fabric_default_id, soc_map.m_spi0_addr_base, soc_map.m_spi0_addr_lim);
+`endif
+`ifdef INCLUDE_SPI2
+	 spi2.init (fabric_default_id, soc_map.m_spi2_addr_base, soc_map.m_spi2_addr_lim);
 `endif
 
 	 if (verbosity != 0) begin
@@ -623,6 +652,14 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
    method Bit #(1) flash_cs_n = spi0.cs_n [1];
    method Action flash_miso (Bit #(1) v);
       spi0.miso1 (v);
+   endmethod
+`endif
+`ifdef INCLUDE_SPI2
+   method Bit #(1) adc_sclk = spi2.sclk;
+   method Bit #(1) adc_mosi = spi2.mosi;
+   method Bit #(1) adc_cs_n = spi2.cs_n [0];
+   method Action adc_miso (Bit #(1) v);
+      spi2.miso0 (v);
    endmethod
 `endif
 `ifdef INCLUDE_VIDEO

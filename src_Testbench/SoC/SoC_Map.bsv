@@ -49,6 +49,10 @@ export  irq_num_spi0;
 export  spi2_periph_num;
 export  irq_num_spi2;
 `endif
+`ifdef INCLUDE_UART1
+export  uart1_periph_num;
+export  irq_num_uart1;
+`endif
 `ifdef INCLUDE_VIDEO
 export  regbus_periph_num;
 `endif
@@ -89,7 +93,7 @@ import Fabric_Defs :: *;    // Only for type Fabric_Addr
 
 typedef Bit #(TLog #(Num_Slaves))  Slave_Num;
 
-typedef enum {Dev_BootROM, Dev_SDRAM, Dev_CLINT, Dev_UART0, Dev_GPIO, Dev_PLIC, Dev_SoCInfo, Dev_SPI0, Dev_Video, Dev_I2C0, Dev_GPIO1, Dev_Audio, Dev_SPI2}
+typedef enum {Dev_BootROM, Dev_SDRAM, Dev_CLINT, Dev_UART0, Dev_GPIO, Dev_PLIC, Dev_SoCInfo, Dev_SPI0, Dev_Video, Dev_I2C0, Dev_GPIO1, Dev_Audio, Dev_SPI2, Dev_UART1}
         DeviceId deriving (Bits, Eq);
 
 typedef struct {
@@ -152,6 +156,13 @@ Fabric_Addr spi0_addr_lim  = spi0_addr_base + spi0_addr_size;
 Fabric_Addr spi2_addr_base = 'hC000_A000;
 Fabric_Addr spi2_addr_size = 'h0000_1000;    // 4K
 Fabric_Addr spi2_addr_lim  = spi2_addr_base + spi2_addr_size;
+`endif
+
+`ifdef INCLUDE_UART1
+// Second 16550 (the same UART_Model) to the ESP32's UART0, at a fixed 115200 baud (src/ULX3S_Top.bsv)
+Fabric_Addr uart1_addr_base = 'hC000_7000;
+Fabric_Addr uart1_addr_size = 'h0000_0080;    // 128, as uart0
+Fabric_Addr uart1_addr_lim  = uart1_addr_base + uart1_addr_size;
 `endif
 
 `ifdef INCLUDE_VIDEO
@@ -217,6 +228,9 @@ function List #(MemRegion) fn_soc_memmap ();
 `ifdef INCLUDE_SPI2
    rs = List::cons (MemRegion {name: "spi2",     device: Dev_SPI2,   base: truncate (spi2_addr_base),           size: truncate (spi2_addr_size),           bus: "axi",      fabric_decoded: True, irq: fromInteger (irq_num_spi2), flags: 1}, rs);
 `endif
+`ifdef INCLUDE_UART1
+   rs = List::cons (MemRegion {name: "uart1",    device: Dev_UART1,   base: truncate (uart1_addr_base),           size: truncate (uart1_addr_size),           bus: "axi",      fabric_decoded: True, irq: fromInteger (irq_num_uart1), flags: 1}, rs);
+`endif
 `ifdef INCLUDE_VIDEO
    rs = List::cons (MemRegion {name: "video",    device: Dev_Video,  base: truncate (video_addr_base),          size: truncate (video_addr_size),          bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
    rs = List::cons (MemRegion {name: "video_fb", device: Dev_Video,  base: truncate (video_fb_addr_base),       size: truncate (video_fb_addr_size),       bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
@@ -242,6 +256,9 @@ function Slave_Num fn_dev_slave_num (DeviceId d);
 `endif
 `ifdef INCLUDE_SPI2
       Dev_SPI2:   return fromInteger (periph_slave_num);
+`endif
+`ifdef INCLUDE_UART1
+      Dev_UART1:  return fromInteger (periph_slave_num);
 `endif
 `ifdef INCLUDE_VIDEO
       Dev_Video:  return fromInteger (periph_slave_num);
@@ -294,6 +311,10 @@ interface SoC_Map_IFC;
 `ifdef INCLUDE_SPI2
    (* always_ready *)   method  Fabric_Addr  m_spi2_addr_base;
    (* always_ready *)   method  Fabric_Addr  m_spi2_addr_lim;
+`endif
+`ifdef INCLUDE_UART1
+   (* always_ready *)   method  Fabric_Addr  m_uart1_addr_base;
+   (* always_ready *)   method  Fabric_Addr  m_uart1_addr_lim;
 `endif
 
    (* always_ready *)   method  Fabric_Addr  m_tcm_addr_base;
@@ -364,6 +385,9 @@ module mkSoC_Map (SoC_Map_IFC);
 `endif
 `ifdef INCLUDE_SPI2
       messageM ("MEMMAPIRQ spi2 " + integerToString (irq_num_spi2) + " core_external");
+`endif
+`ifdef INCLUDE_UART1
+      messageM ("MEMMAPIRQ uart1 " + integerToString (irq_num_uart1) + " core_external");
 `endif
    endrule
 
@@ -436,6 +460,9 @@ module mkSoC_Map (SoC_Map_IFC);
 `ifdef INCLUDE_SPI2
 	      || ((spi2_addr_base <= addr) && (addr < spi2_addr_lim))
 `endif
+`ifdef INCLUDE_UART1
+	      || ((uart1_addr_base <= addr) && (addr < uart1_addr_lim))
+`endif
 `ifdef INCLUDE_VIDEO
 	      || ((video_addr_base <= addr) && (addr < video_addr_lim))
 	      || ((video_fb_addr_base <= addr) && (addr < video_fb_addr_lim))
@@ -502,6 +529,10 @@ module mkSoC_Map (SoC_Map_IFC);
    method  Fabric_Addr  m_spi2_addr_base = spi2_addr_base;
    method  Fabric_Addr  m_spi2_addr_lim  = spi2_addr_lim;
 `endif
+`ifdef INCLUDE_UART1
+   method  Fabric_Addr  m_uart1_addr_base = uart1_addr_base;
+   method  Fabric_Addr  m_uart1_addr_lim  = uart1_addr_lim;
+`endif
    method  Fabric_Addr  m_mem0_controller_addr_size = mem0_controller_addr_size;
    method  Fabric_Addr  m_mem0_controller_addr_lim  = mem0_controller_addr_lim;
 
@@ -562,7 +593,11 @@ Integer accel0_slave_num          = 3;
 `ifdef INCLUDE_SPI0
 `ifdef INCLUDE_VIDEO
 `ifdef INCLUDE_SPI2
+`ifdef INCLUDE_UART1
+typedef 6 Num_Periph;    // INCLUDE_UART1 needs INCLUDE_SPI2
+`else
 typedef 5 Num_Periph;    // INCLUDE_SPI2 needs INCLUDE_SPI0 and INCLUDE_VIDEO
+`endif
 `else
 typedef 4 Num_Periph;
 `endif
@@ -586,13 +621,16 @@ Integer spi0_periph_num           = 2;
 `ifdef INCLUDE_SPI2
 Integer spi2_periph_num           = 3;
 `endif
+`ifdef INCLUDE_UART1
+Integer uart1_periph_num          = 4;
+`endif
 `ifdef INCLUDE_VIDEO
 Integer regbus_periph_num         = valueOf (Num_Periph) - 1;
 `endif
 
 function Bool fn_dev_is_periph (DeviceId d);
    return (d == Dev_UART0) || (d == Dev_SoCInfo) || (d == Dev_SPI0) || (d == Dev_Video)
-          || (d == Dev_I2C0) || (d == Dev_GPIO1) || (d == Dev_Audio) || (d == Dev_SPI2);
+          || (d == Dev_I2C0) || (d == Dev_GPIO1) || (d == Dev_Audio) || (d == Dev_SPI2) || (d == Dev_UART1);
 endfunction
 
 function Periph_Num fn_dev_periph_num (DeviceId d);
@@ -604,6 +642,9 @@ function Periph_Num fn_dev_periph_num (DeviceId d);
 `endif
 `ifdef INCLUDE_SPI2
       Dev_SPI2:    return fromInteger (spi2_periph_num);
+`endif
+`ifdef INCLUDE_UART1
+      Dev_UART1:   return fromInteger (uart1_periph_num);
 `endif
 `ifdef INCLUDE_VIDEO
       Dev_Video:   return fromInteger (regbus_periph_num);
@@ -629,6 +670,9 @@ Integer irq_num_spi0   = 2;
 `endif
 `ifdef INCLUDE_SPI2
 Integer irq_num_spi2   = 3;
+`endif
+`ifdef INCLUDE_UART1
+Integer irq_num_uart1  = 4;
 `endif
 
 // ================================================================

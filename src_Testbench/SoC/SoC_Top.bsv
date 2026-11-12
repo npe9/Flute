@@ -100,6 +100,11 @@ interface SoC_Top_IFC;
    // UART0 to external console
    interface Get #(Bit #(8)) get_to_console;
    interface Put #(Bit #(8)) put_from_console;
+`ifdef INCLUDE_UART1
+   // UART1 to the ESP32
+   interface Get #(Bit #(8)) get_to_esp32;
+   interface Put #(Bit #(8)) put_from_esp32;
+`endif
 
    // Catch-all status; return-value can identify the origin (0 = none)
    (* always_ready *)
@@ -212,6 +217,9 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 
    // SoC IPs
    UART_IFC   uart0  <- mkUART;
+`ifdef INCLUDE_UART1
+   UART_IFC   uart1  <- mkUART;
+`endif
 
 `ifdef INCLUDE_ACCEL0
    // Accel0 master to fabric
@@ -270,6 +278,9 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 
    // Bridge to UART0
    mkConnection (periph.v_to_slaves [uart0_periph_num],  uart0.slave);
+`ifdef INCLUDE_UART1
+   mkConnection (periph.v_to_slaves [uart1_periph_num],  uart1.slave);
+`endif
 
 `ifdef INCLUDE_ACCEL0
    // Fabric to accel0
@@ -365,6 +376,10 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
       core.core_external_interrupt_sources [irq_num_spi2].m_interrupt_req (spi2.interrupt_req);
       last_irq_num = irq_num_spi2;
 `endif
+`ifdef INCLUDE_UART1
+      core.core_external_interrupt_sources [irq_num_uart1].m_interrupt_req (uart1.intr);
+      last_irq_num = irq_num_uart1;
+`endif
 
       // Tie off remaining interrupt request lines (2..N)
       for (Integer j = last_irq_num + 1; j < valueOf (N_External_Interrupt_Sources); j = j + 1)
@@ -396,6 +411,9 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 	 core.cpu_reset_server.request.put (running);
 	 mem0_controller.server_reset.request.put (?);
 	 uart0.server_reset.request.put (?);
+`ifdef INCLUDE_UART1
+	 uart1.server_reset.request.put (?);
+`endif
 	 rg_fabric_reset <= True;
 `ifdef INCLUDE_ACCEL0
 	 rg_accel0_reset <= True;
@@ -445,6 +463,9 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 	 let cpu_rsp             <- core.cpu_reset_server.response.get;
 	 let mem0_controller_rsp <- mem0_controller.server_reset.response.get;
 	 let uart0_rsp           <- uart0.server_reset.response.get;
+`ifdef INCLUDE_UART1
+	 let uart1_rsp           <- uart1.server_reset.response.get;
+`endif
 
 	 // Initialize address maps of slave IPs
 	 boot_rom.set_addr_map (soc_map.m_boot_rom_addr_base,
@@ -454,6 +475,9 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
 				       soc_map.m_mem0_controller_addr_lim);
 
 	 uart0.set_addr_map (soc_map.m_uart0_addr_base, soc_map.m_uart0_addr_lim);
+`ifdef INCLUDE_UART1
+	 uart1.set_addr_map (soc_map.m_uart1_addr_base, soc_map.m_uart1_addr_lim);
+`endif
 
 `ifdef INCLUDE_ACCEL0
 	 accel0.init (fabric_default_id,
@@ -629,6 +653,10 @@ module mkSoC_Top #(int clk_hz) (SoC_Top_IFC);
    // UART to external console
    interface get_to_console   = uart0.get_to_console;
    interface put_from_console = uart0.put_from_console;
+`ifdef INCLUDE_UART1
+   interface get_to_esp32     = uart1.get_to_console;
+   interface put_from_esp32   = uart1.put_from_console;
+`endif
 
    // Catch-all status; return-value can identify the origin (0 = none)
    method Bit #(8) status = 0;

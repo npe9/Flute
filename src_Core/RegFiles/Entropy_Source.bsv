@@ -22,6 +22,10 @@ package Entropy_Source;
 interface Entropy_Source_IFC;
    (* always_ready *) method Bit #(32) seed;      // current OPST + data
    (* always_ready *) method Action    consume;   // seed CSR access retired
+   // Trace (spec events; unconnected in the SoC; formal/fv/ips/entropy_ro):
+   (* always_ready *) method Bit #(1)          tr_raw;      // the raw noise bit this clock
+   (* always_ready *) method Maybe #(Bit #(1)) tr_sample;   // a decimated sample, health-tested this clock
+   (* always_ready *) method Bool              tr_fail;     // a health test failed on that sample
 endinterface
 
 Bit #(2) opst_bist = 2'b00;
@@ -32,6 +36,9 @@ Bit #(2) opst_dead = 2'b11;
 module mkEntropy_Source_Wait (Entropy_Source_IFC);
    method Bit #(32) seed = { opst_wait, 30'b0 };
    method Action consume = noAction;
+   method Bit #(1)          tr_raw    = 0;
+   method Maybe #(Bit #(1)) tr_sample = tagged Invalid;
+   method Bool              tr_fail   = False;
 endmodule
 
 // ================================================================
@@ -74,11 +81,19 @@ module mkRO_TRNG (RO_TRNG_IFC);
 endmodule
 `endif
 
-typedef 41  RCT_Cutoff;
-typedef 793 APT_Cutoff;
-typedef 1024 APT_Window;
-
+// The SoC's instance.  _P's parameters: raw bits per sample, RCT cutoff, APT cutoff, APT window
+// (formal/fv instantiates small ones too).
 module mkEntropy_Source_RO (Entropy_Source_IFC);
+   let m <- mkEntropy_Source_RO_P (8, 41, 793, 1024);
+   return m;
+endmodule
+
+module mkEntropy_Source_RO_P #(Integer dec, Integer rct_cutoff, Integer apt_cutoff, Integer apt_window)
+                             (Entropy_Source_IFC);
+   if (dec < 1 || dec > 8 || rct_cutoff < 2 || rct_cutoff > 63 || apt_window < 2 || apt_window > 1024
+       || apt_cutoff < 2 || apt_cutoff > apt_window)
+      error ("mkEntropy_Source_RO_P: parameter out of range");
+
    RO_TRNG_IFC ro <- mkRO_TRNG;
 
    Reg #(Bit #(3))  rg_dec_n   <- mkReg (0);      // raw bits folded into rg_dec so far
@@ -97,13 +112,15 @@ module mkEntropy_Source_RO (Entropy_Source_IFC);
    Reg #(Bit #(5))  rg_word_n  <- mkReg (0);       // samples in rg_word (16 = full)
 
    PulseWire pw_consume <- mkPulseWire;
+   RWire #(Bit #(1)) rw_sample <- mkRWire;      // trace
+   PulseWire         pw_fail   <- mkPulseWire;
 
    (* fire_when_enabled, no_implicit_conditions *)
    rule rl_step;
       Bit #(1) raw   = ro.raw_bit;
       Bit #(1) samp  = rg_dec ^ raw;
-      Bool     fresh = (rg_dec_n == 7);
-      rg_dec_n <= rg_dec_n + 1;
+      Bool     fresh = (rg_dec_n == fromInteger (dec - 1));
+      rg_dec_n <= fresh ? 0 : rg_dec_n + 1;
       rg_dec   <= fresh ? 0 : samp;
 
       Bit #(2)  opst     = rg_opst;
@@ -117,20 +134,22 @@ module mkEntropy_Source_RO (Entropy_Source_IFC);
       end
 
       if (fresh && (opst != opst_dead)) begin
+         rw_sample.wset (samp);
          // repetition count test
          Bit #(6) rct_n = ((samp == rg_rct_v) && (rg_rct_n != 0)) ? rg_rct_n + 1 : 1;
          rg_rct_v <= samp;
-         Bool rct_fail = (rct_n >= fromInteger (valueOf (RCT_Cutoff)));
+         Bool rct_fail = (rct_n >= fromInteger (rct_cutoff));
 
          // adaptive proportion test (window of 1024: sample 0 is the reference)
          Bool     first  = (rg_apt_i == 0);
          Bit #(1) ref_v  = first ? samp : rg_apt_v;
          Bit #(10) apt_n = first ? 1 : ((samp == rg_apt_v) ? rg_apt_n + 1 : rg_apt_n);
-         Bool apt_fail   = (zeroExtend (apt_n) >= Bit #(11) ' (fromInteger (valueOf (APT_Cutoff))));
-         Bool window_end = (rg_apt_i == fromInteger (valueOf (APT_Window) - 1));
+         Bool apt_fail   = (zeroExtend (apt_n) >= Bit #(11) ' (fromInteger (apt_cutoff)));
+         Bool window_end = (rg_apt_i == fromInteger (apt_window - 1));
          rg_apt_v <= ref_v;
 
          if (rct_fail || apt_fail) begin
+            pw_fail.send;
             fails   = fails + 1;
             opst    = (fails == 4) ? opst_dead : opst_bist;
             startup = False; word = 0; word_n = 0;
@@ -163,6 +182,10 @@ module mkEntropy_Source_RO (Entropy_Source_IFC);
    method Action consume;
       pw_consume.send;
    endmethod
+
+   method Bit #(1)          tr_raw    = ro.raw_bit;
+   method Maybe #(Bit #(1)) tr_sample = rw_sample.wget;
+   method Bool              tr_fail   = pw_fail;
 endmodule
 
 endpackage

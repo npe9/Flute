@@ -144,6 +144,13 @@ interface CSR_RegFile_IFC;
    // Break should enter Debug Mode
    method Bool dcsr_break_enters_debug (Priv_Mode cur_priv);
 
+   // dcsr.step && ! dcsr.stepie: interrupts (and NMI) are not taken while single-stepping
+   method Bool dcsr_step_masks_interrupts ();
+
+   // The CPU tells the regfile each cycle whether the hart is in Debug Mode (dcsr.stopcount)
+   (* always_ready *)
+   method Action ma_debug_mode (Bool in_debug_mode);
+
    // Read dcsr.prv: the privilege a debugger resume runs at
    method Priv_Mode read_dcsr_prv ();
 
@@ -299,6 +306,7 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
    // mcycle is needed even for user-mode RDCYCLE instruction
    // It can be updated by a CSR instruction (in Priv_M), and by the clock
    Reg #(Bit #(64))   rg_mcycle <- mkReg (0);
+   Reg #(Bool)        rg_hold_mcycle <- mkConfigReg (False);   // Debug Mode && dcsr.stopcount; ConfigReg: no read-before-write order (breaks a cycle through mav_csr_write)
    RWire #(Bit #(64)) rw_mcycle <- mkRWire;    // Driven on CSRRx write to mcycle
 
    // minstret is needed even for user-mode RDINSTRET instructions
@@ -365,7 +373,7 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 			      1'h1,    // [13]     ebreaks
 			      1'h1,    // [12]     ebreaku
 			      1'h0,    // [11]     stepie
-			      1'h0,    // [10]     stopcount
+			      1'h1,    // [10]     stopcount: counters stop in Debug Mode
 			      1'h0,    // [9]      stoptime
 			      3'h0,    // [8:7]    cause    // WARNING: 0 is non-standard
 			      1'h0,    // [5]      reserved
@@ -383,12 +391,16 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
    // CYCLE counter
 
    (* no_implicit_conditions, fire_when_enabled *)
+   // A CSR write sets mcycle (it used to be dropped: both arms incremented).  With dcsr.stopcount
+   // set the counter holds while the hart is in Debug Mode (rg_hold_mcycle, registered from the
+   // CPU's state and dcsr.stopcount, one cycle late), as the debug spec describes.
    rule rl_mcycle_incr;
-      // Update due to CSRRx    TODO: fix this
       if (rw_mcycle.wget matches tagged Valid .v)
-	 rg_mcycle <= rg_mcycle + 1;
-
-      // Update due to clock
+	 rg_mcycle <= v;
+`ifdef INCLUDE_GDB_CONTROL
+      else if (rg_hold_mcycle)
+	 noAction;
+`endif
       else
 	 rg_mcycle <= rg_mcycle + 1;
    endrule
@@ -656,7 +668,8 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 				       = {rg_dcsr [31:28],   // xdebugver: read-only
 					  rg_dcsr [27:16],   // reserved
 					  wordxl  [15:12],   // ebreakm/s/u,
-					  wordxl  [11:9],    // stepie, stopcount, stoptime
+					  wordxl  [11:10],   // stepie, stopcount (both honored)
+					  1'b0,              // stoptime: 0 (mtime is the shared CLINT's)
 					  rg_dcsr [8:6],     // cause: read-only
 					  rg_dcsr [5],       // reserved
 					  wordxl  [4],       // mprvn
@@ -1028,6 +1041,14 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 		s_Priv_Mode: (rg_dcsr [13] == 1'b1);
 		u_Priv_Mode: (rg_dcsr [12] == 1'b1);
 	     endcase;
+   endmethod
+
+   method Bool dcsr_step_masks_interrupts ();
+      return ((rg_dcsr [2] == 1'b1) && (rg_dcsr [11] == 1'b0));
+   endmethod
+
+   method Action ma_debug_mode (Bool in_debug_mode);
+      rg_hold_mcycle <= (in_debug_mode && (rg_dcsr [10] == 1'b1));   // stopcount
    endmethod
 
    // Read dcsr.prv

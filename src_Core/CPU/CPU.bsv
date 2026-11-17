@@ -474,10 +474,27 @@ module mkCPU (CPU_IFC);
 
    (* no_implicit_conditions, fire_when_enabled *)
    rule rl_int_pending_bridge;
-      rg_int_pending <= csr_regfile.interrupt_pending (rg_cur_priv);
-      rg_nmi_pending <= csr_regfile.nmi_pending;
+`ifdef INCLUDE_GDB_CONTROL
+      // dcsr.step with dcsr.stepie clear: no interrupt or NMI is taken while single-stepping
+      // (debug spec; before, a pending interrupt turned the step into a trap entry)
+      Bool masked = csr_regfile.dcsr_step_masks_interrupts;
+`else
+      Bool masked = False;
+`endif
+      rg_int_pending <= (masked ? tagged Invalid : csr_regfile.interrupt_pending (rg_cur_priv));
+      rg_nmi_pending <= ((! masked) && csr_regfile.nmi_pending);
       rg_wfi_resume  <= csr_regfile.wfi_resume;
    endrule
+
+`ifdef INCLUDE_GDB_CONTROL
+   // dcsr.stopcount: the regfile holds mcycle while the hart is halted for the debugger
+   (* no_implicit_conditions, fire_when_enabled *)
+   rule rl_debug_mode_to_csrs;
+      csr_regfile.ma_debug_mode (   (rg_state == CPU_DEBUG_MODE)
+				 || (rg_state == CPU_GDB_PAUSING)
+				 || (rg_state == CPU_GDB_RESUMING));
+   endrule
+`endif
 
    Bool interrupt_pending = (isValid (rg_int_pending) || rg_nmi_pending);
 

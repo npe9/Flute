@@ -216,6 +216,9 @@ interface CSR_RegFile_IFC;
    // Break should enter Debug Mode
    method Bool dcsr_break_enters_debug (Priv_Mode cur_priv);
 
+   // Read dcsr.prv: the privilege a debugger resume runs at
+   method Priv_Mode read_dcsr_prv ();
+
    // Read dcsr.step
    method Bool read_dcsr_step ();
 
@@ -1081,7 +1084,7 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 					  wordxl  [4],       // mprvn
 					  rg_dcsr [3],       // nmip: read-only
 					  wordxl  [2],       // step
-					  wordxl  [1:0]};    // prv
+					  ((wordxl [1:0] == 2'b10) ? rg_dcsr [1:0] : wordxl [1:0])};  // prv: WARL, no H mode
 				       new_csr_value = zeroExtend (new_dcsr);
 				       rg_dcsr      <= new_dcsr;
 				    end
@@ -1548,6 +1551,11 @@ module mkCSR_RegFile (CSR_RegFile_IFC);
 		s_Priv_Mode: (rg_dcsr [13] == 1'b1);
 		u_Priv_Mode: (rg_dcsr [12] == 1'b1);
 	     endcase;
+   endmethod
+
+   // Read dcsr.prv
+   method Priv_Mode read_dcsr_prv ();
+      return rg_dcsr [1:0];
    endmethod
 
    // Read dcsr.step

@@ -99,6 +99,7 @@ typedef enum {CPU_RESET1,
 
 `ifdef INCLUDE_GDB_CONTROL
 	      CPU_GDB_PAUSING,      // On GDB breakpoint, while waiting for fence completion
+	      CPU_GDB_RESUMING,     // Debugger resume: caches flushing before the restart
 `endif
 	      CPU_DEBUG_MODE,       // Stopped (normally for debugger)
 	      CPU_RUNNING,          // Normal operation
@@ -121,6 +122,7 @@ function Bool fn_is_running (CPU_State  cpu_state);
 	   && (cpu_state != CPU_RESET2)
 `ifdef INCLUDE_GDB_CONTROL
 	   && (cpu_state != CPU_GDB_PAUSING)
+	   && (cpu_state != CPU_GDB_RESUMING)
 	   && (cpu_state != CPU_DEBUG_MODE)
 `endif
 	   );
@@ -2119,8 +2121,33 @@ module mkCPU (CPU_IFC);
    // Debug Module Run/Halt control
 
 `ifdef INCLUDE_GDB_CONTROL
+   // A resume (or single step) first flushes both caches, as entering Debug Mode does: while
+   // halted the debugger writes memory through the system bus (breakpoint instructions, loaded
+   // programs), and with no program buffer it cannot run FENCE.I itself, so lines the I-cache
+   // (which prefetches) or the D-cache filled during the halt would hide those writes
+   // (riscv-tests debug suite: StepTest, PrivRw, ProgramSwWatchpoint on the board).
+   Reg #(Bool) rg_dbg_resume_go <- mkReg (False);
+
    rule rl_debug_run ((f_run_halt_reqs.first == True) && (rg_state == CPU_DEBUG_MODE));
       f_run_halt_reqs.deq;
+      near_mem.server_fence_i.request.put (?);
+      rg_state <= CPU_GDB_RESUMING;
+      rg_dbg_resume_go <= False;      // a debug reset may have left it set
+   endrule
+
+   // The flush ack only sets a flag; the restart (fetch redirect) fires off registers alone, so
+   // near_mem's fence response RDY stays out of the fetch-request select (it routed 46-49 MHz).
+   rule rl_debug_run_flush_finish ((rg_state == CPU_GDB_RESUMING) && (! rg_dbg_resume_go));
+      let ack <- near_mem.server_fence_i.response.get;
+      rg_dbg_resume_go <= True;
+      // Resume at dcsr.prv (debug spec; before, a debugger's change of dcsr.prv was lost and the
+      // hart resumed in its old mode).  Set here, a cycle ahead, so the restart's first fetch
+      // (fa_stageF_redirect reads rg_cur_priv) already runs at the new privilege.
+      rg_cur_priv <= csr_regfile.read_dcsr_prv;
+   endrule
+
+   rule rl_debug_run_restart ((rg_state == CPU_GDB_RESUMING) && rg_dbg_resume_go);
+      rg_dbg_resume_go <= False;
 
       // Debugger 'resume' request (e.g., GDB 'continue' command)
       let dpc = csr_regfile.read_dpc;
@@ -2161,6 +2188,8 @@ module mkCPU (CPU_IFC);
    (* descending_urgency = "rl_reset_from_Debug_Module, rl_finish_FENCE_I" *)
    (* descending_urgency = "rl_reset_from_Debug_Module, rl_finish_FENCE" *)
    (* descending_urgency = "rl_reset_from_Debug_Module, rl_debug_run" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_debug_run_flush_finish" *)
+   (* descending_urgency = "rl_reset_from_Debug_Module, rl_debug_run_restart" *)
    (* descending_urgency = "rl_reset_from_Debug_Module, rl_pipe" *)
    (* descending_urgency = "rl_reset_from_Debug_Module, rl_reset_complete" *)
    (* descending_urgency = "rl_reset_from_Debug_Module, rl_stage1_CSRR_S_or_C_2" *)
@@ -2213,7 +2242,8 @@ module mkCPU (CPU_IFC);
    endrule
 
    rule rl_debug_halt_redundant (   (f_run_halt_reqs.first == False)
-				 && (! fn_is_running (rg_state)));
+				 && (! fn_is_running (rg_state))
+				 && (rg_state != CPU_GDB_RESUMING));   // waits: about to run
       f_run_halt_reqs.deq;
 
       // Notify debugger that we've 'halted'
@@ -2331,6 +2361,7 @@ module mkCPU (CPU_IFC);
    // at the head until the answer; the write / busy rules wait for it.
    Reg #(Bool) rg_dbg_csr_v <- mkReg (False);
    Reg #(Word) rg_dbg_csr   <- mkRegU;
+   Reg #(Bool) rg_dbg_csr_ok <- mkRegU;
 
    // LX39: every debug CSR response (read / write / busy) is staged in rg_dbg_rsp and
    // enqueued by rl_debug_csr_rsp_out alone, so f_csr_rsps' data and enqueue come from
@@ -2348,6 +2379,7 @@ module mkCPU (CPU_IFC);
       Bit #(12) csr_addr = f_csr_reqs.first.address;
       let m_data = csr_regfile.read_csr_port2 (csr_addr);
       rg_dbg_csr   <= fromMaybe (?, m_data);
+      rg_dbg_csr_ok <= isValid (m_data);     // a CSR that does not exist fails (cmderr)
       rg_dbg_csr_v <= True;
    endrule
 
@@ -2355,7 +2387,7 @@ module mkCPU (CPU_IFC);
       let req <- pop (f_csr_reqs);
       Bit #(12) csr_addr = req.address;
       let data = rg_dbg_csr;
-      let rsp = DM_CPU_Rsp {ok: True, data: data};
+      let rsp = DM_CPU_Rsp {ok: rg_dbg_csr_ok, data: data};
       rg_dbg_rsp   <= rsp;    // LX39
       rg_dbg_rsp_v <= True;
       rg_dbg_csr_v <= False;
@@ -2372,8 +2404,11 @@ module mkCPU (CPU_IFC);
       Bit #(12) csr_addr = req.address;
       let data = req.data;
       let csr_write_result <- csr_regfile.mav_csr_write (csr_addr, data);
+      // A CSR that does not exist fails (cmderr); mav_csr_write ignores its address.  The check
+      // only feeds the registered response, not the write enables.
+      Bool exists = isValid (csr_regfile.read_csr_port2 (csr_addr));
 
-      let rsp = DM_CPU_Rsp {ok: True, data: ?};
+      let rsp = DM_CPU_Rsp {ok: exists, data: ?};
       rg_dbg_rsp   <= rsp;    // LX39
       rg_dbg_rsp_v <= True;
 

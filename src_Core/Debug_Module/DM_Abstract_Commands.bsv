@@ -177,8 +177,16 @@ module mkDM_Abstract_Commands (DM_Abstract_Commands_IFC);
 	    end
 
 `ifdef RV32
-	    // Only lower 32-bit access is supported
-	    else if (size != DM_COMMAND_ACCESS_SIZE_LOWER32) begin
+	    // Lower 32-bit access, and 64-bit access to the 64-bit FPRs when D is present
+	    // (debug spec: an FPR must be accessible at its own size; OpenOCD reads FPRs at 64 bits
+	    // when misa.D is set and otherwise disables abstract FPR access).
+	    else if (   (size != DM_COMMAND_ACCESS_SIZE_LOWER32)
+`ifdef ISA_D
+		     && ! (   (size == DM_COMMAND_ACCESS_SIZE_LOWER64)
+			   && (fromInteger (dm_command_access_reg_regno_fpr_0) <= fn_command_access_reg_regno (dm_word))
+			   && (fn_command_access_reg_regno (dm_word) <= fromInteger (dm_command_access_reg_regno_fpr_1F)))
+`endif
+		     ) begin
 	       cmderr = DM_ABSTRACTCS_CMDERR_NOT_SUPPORTED;
 	       $display ("ERROR: Debug Module: Abstract Command write: [command] <= 0x%08h",
 			 dm_word);
@@ -297,7 +305,7 @@ module mkDM_Abstract_Commands (DM_Abstract_Commands_IFC);
       let rsp <- pop (f_hart0_csr_rsps);
       rg_abstractcs_cmderr <= (rsp.ok
 			       ? DM_ABSTRACTCS_CMDERR_NONE
-			       : DM_ABSTRACTCS_CMDERR_HALT_RESUME);
+			       : DM_ABSTRACTCS_CMDERR_EXCEPTION   /* no such CSR */);
       rg_abstractcs_busy   <= False;
 
       if (verbosity != 0)
@@ -332,7 +340,7 @@ module mkDM_Abstract_Commands (DM_Abstract_Commands_IFC);
       let rsp <- pop (f_hart0_csr_rsps);
       rg_abstractcs_cmderr <= (rsp.ok
 			       ? DM_ABSTRACTCS_CMDERR_NONE
-			       : DM_ABSTRACTCS_CMDERR_HALT_RESUME);
+			       : DM_ABSTRACTCS_CMDERR_EXCEPTION   /* no such CSR */);
 `ifdef RV32
       rg_data0 <= rsp.data;
 `endif

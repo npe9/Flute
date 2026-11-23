@@ -910,6 +910,19 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
    Reg #(Bool)        rg_udtlb_pmp_seen <- mkReg (False);
    Reg #(Bool)        rg_udtlb_tlb_seen <- mkReg (False);
    Reg #(Bool)        rg_udtlb_bypass   <- mkReg (False);    // this req: use rg_pa (partial memory page)
+   // LX50: a seq toggle alone cannot mark the entries dead: two changes with no fill between
+   // (two SFENCE.VMAs, a context change whose request faults before filling and then another)
+   // toggle it back, and the old entries look fresh again.  Every change also sets
+   // rg_udtlb_dirty, and only a fill that rewrites the entries clears it (formal/fv
+   // mmu_cache_tiny: an entry filled before two back-to-back SFENCE.VMAs hit after them).
+   Reg #(Bool)        rg_udtlb_dirty    <- mkReg (False);
+   // One set wire per method: a PulseWire's send conflicts with itself, so a shared wire made
+   // req, tlb_flush and ma_pmp conflict, and ma_pmp (called by the CPU every cycle) starved req.
+   PulseWire          pw_udtlb_dirty_ctx <- mkPulseWire;
+   PulseWire          pw_udtlb_dirty_tlb <- mkPulseWire;
+   PulseWire          pw_udtlb_dirty_pmp <- mkPulseWire;
+   PulseWire          pw_udtlb_dirty_clr <- mkPulseWire;
+   Bool udtlb_dirty_set = (pw_udtlb_dirty_ctx || pw_udtlb_dirty_tlb || pw_udtlb_dirty_pmp);
 
    // LX2: the fill translates from the TLB lookup registered one cycle
    // earlier (the probe cycle that missed, same rg_addr / rg_satp), with the
@@ -952,7 +965,14 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
    Bool udtlb_fresh = (   (rg_udtlb_ctx_seq == rg_udtlb_ctx_seen)
 		       && (rg_udtlb_pmp_seq == rg_udtlb_pmp_seen)
-		       && (rg_udtlb_tlb_seq == rg_udtlb_tlb_seen));
+		       && (rg_udtlb_tlb_seq == rg_udtlb_tlb_seen)
+		       && (! rg_udtlb_dirty));
+
+   // LX50: set wins (a change in the fill's own cycle leaves the new entry dead)
+   (* fire_when_enabled, no_implicit_conditions *)
+   rule rl_udtlb_dirty (udtlb_dirty_set || pw_udtlb_dirty_clr);
+      rg_udtlb_dirty <= udtlb_dirty_set;
+   endrule
 
    UDTLB_VPN udtlb_vpn = truncate (rg_addr >> 12);
    Bool      udtlb_ld  = ((rg_op == CACHE_LD) || is_AMO_LR);
@@ -1713,18 +1733,23 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 				 ok_st:  pte_st && rg_fx_pmp_w,
 				 ok_amo: pte_st && rg_fx_pmp_rw};
 
-	    // Stale entries (context / PMP / SFENCE.VMA changed) die here.
+	    // Stale entries (context / PMP / SFENCE.VMA changed) die here, and so does any
+	    // other entry for this page (LX50: one that lacked this op's permission, filled under
+	    // an older PTE).  Two entries for one page with different PPNs would both match a
+	    // later op: the PA would be the OR of their PPNs, and the tag compare (per entry)
+	    // would never match the line the refill installs there, so the op refilled forever.
 	    UDTLB_Index slot = (udtlb_fresh ? rg_udtlb_victim : 0);
 	    for (Integer i = 0; i < valueOf (UDTLB_Size); i = i + 1) begin
 	       if (fromInteger (i) == slot)
 		  vrg_udtlb [i] <= e;
-	       else if (! udtlb_fresh)
+	       else if ((! udtlb_fresh) || (vrg_udtlb [i].vpn == udtlb_vpn))
 		  vrg_udtlb [i] <= unpack (0);
 	    end
 	    rg_udtlb_victim   <= slot + 1;
 	    rg_udtlb_ctx_seen <= rg_udtlb_ctx_cap;
 	    rg_udtlb_pmp_seen <= rg_udtlb_pmp_cap;
 	    rg_udtlb_tlb_seen <= rg_udtlb_tlb_cap;
+	    pw_udtlb_dirty_clr.send;
 
 	    rg_state <= CACHE_REREQ;    // LX7: re-capture the lookup
 	    if (cfg_verbosity > 1)
@@ -2752,8 +2777,10 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
       // uDTLB: entries are valid only for the context they were filled in
       if (   (priv != rg_priv) || (sstatus_SUM != rg_sstatus_SUM)
-	  || (mstatus_MXR != rg_mstatus_MXR) || (satp != rg_satp))
+	  || (mstatus_MXR != rg_mstatus_MXR) || (satp != rg_satp)) begin
 	 rg_udtlb_ctx_seq <= ! rg_udtlb_ctx_seq;
+	 pw_udtlb_dirty_ctx.send;
+      end
 
       rg_priv        <= priv;
       rg_sstatus_SUM <= sstatus_SUM;
@@ -2833,6 +2860,7 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
       // Near_Mem's rl_sfence_vma waits for !mv_busy before calling this.
       tlb.flush;
       rg_udtlb_tlb_seq <= ! rg_udtlb_tlb_seq;
+      pw_udtlb_dirty_tlb.send;
       if (cfg_verbosity > 1)
 	 $display ("%0d: %s.tlb_flush", cur_cycle, d_or_i);
 `else
@@ -2929,7 +2957,10 @@ module mkMMU_Cache  #(parameter Bool dmem_not_imem)  (MMU_Cache_IFC);
 
    method Action ma_pmp (PMP_Table t);
       rg_pmp <= t;
-      if (pack (t) != pack (rg_pmp)) rg_udtlb_pmp_seq <= ! rg_udtlb_pmp_seq;
+      if (pack (t) != pack (rg_pmp)) begin
+	 rg_udtlb_pmp_seq <= ! rg_udtlb_pmp_seq;
+	 pw_udtlb_dirty_pmp.send;
+      end
    endmethod
 
 endmodule: mkMMU_Cache

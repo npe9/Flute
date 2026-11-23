@@ -211,7 +211,14 @@ module mkBranch_Predictor (Branch_Predictor_IFC);
    // stageF.out (predict_rsp) is only consumed when imem.valid, so the extra
    // read latency is hidden.  Cuts the BRAM-output mux -> tag compare ->
    // pred_pc -> imem_req_addr cone (e5 census 23.6 levels) at the BRAM.
+`ifdef BTB_OUTREG
+   // game2d (2026-11-23): with the VDP the BTB loop (RAM clock-to-out 5.6 ns -> tag compare ->
+   // predict -> imem_req_addr -> RAM address) is the sys_clk critical path; the register takes
+   // the RAM's clock-to-out off it.  make BTB_OUTREG=1.
+   Bool bram_has_output_reg = True;
+`else
    Bool bram_has_output_reg = False;   // E7 (registered BTB read) measured no gain: reverted 2026-10-17
+`endif
    BRAM_DUAL_PORT #(BTB_Index, BTB_Entry) btb_bramcore2 <- mkBRAMCore2 (btb_num_sets,
 									bram_has_output_reg);
 

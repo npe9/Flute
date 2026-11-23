@@ -93,7 +93,7 @@ import Fabric_Defs :: *;    // Only for type Fabric_Addr
 
 typedef Bit #(TLog #(Num_Slaves))  Slave_Num;
 
-typedef enum {Dev_BootROM, Dev_SDRAM, Dev_CLINT, Dev_UART0, Dev_GPIO, Dev_PLIC, Dev_SoCInfo, Dev_SPI0, Dev_Video, Dev_I2C0, Dev_GPIO1, Dev_Audio, Dev_SPI2, Dev_UART1, Dev_SDH}
+typedef enum {Dev_BootROM, Dev_SDRAM, Dev_CLINT, Dev_UART0, Dev_GPIO, Dev_PLIC, Dev_SoCInfo, Dev_SPI0, Dev_Video, Dev_I2C0, Dev_GPIO1, Dev_Audio, Dev_SPI2, Dev_UART1, Dev_SDH, Dev_VDP}
         DeviceId deriving (Bits, Eq);
 
 typedef struct {
@@ -189,6 +189,22 @@ Fabric_Addr audio_addr_lim  = audio_addr_base + audio_addr_size;
 Fabric_Addr sdh_addr_base   = 'hC000_D000;
 Fabric_Addr sdh_addr_size   = 'h0000_1000;    // 4K
 Fabric_Addr sdh_addr_lim    = sdh_addr_base + sdh_addr_size;
+`ifdef INCLUDE_VDP
+// src/Vdp.v (game2d): the tile-and-sprite engine's registers and sprite table, and its VRAM
+Fabric_Addr vdp_addr_base      = 'hC002_0000;
+Fabric_Addr vdp_addr_size      = 'h0000_1000;    // 4K
+Fabric_Addr vdp_addr_lim       = vdp_addr_base + vdp_addr_size;
+Fabric_Addr vdp_vram_addr_base = 'hC108_0000;
+Fabric_Addr vdp_vram_addr_size = 'h0001_0000;    // 64K
+Fabric_Addr vdp_vram_addr_lim  = vdp_vram_addr_base + vdp_vram_addr_size;
+`endif
+`ifdef INCLUDE_APU
+// src/Apu.v (game2d): APU1, the sound chip -- registers and wave RAM; a second region of the audio
+// device (its stream goes out through src/Audio.v), so no new DeviceId
+Fabric_Addr apu_addr_base      = 'hC004_0000;
+Fabric_Addr apu_addr_size      = 'h0001_0000;    // 64K
+Fabric_Addr apu_addr_lim       = apu_addr_base + apu_addr_size;
+`endif
 `endif
 
 // ---- address predicates (package level; used by the module methods)
@@ -242,6 +258,13 @@ function List #(MemRegion) fn_soc_memmap ();
    rs = List::cons (MemRegion {name: "gpio1",    device: Dev_GPIO1,  base: truncate (gpio1_addr_base),       size: truncate (gpio1_addr_size),       bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
    rs = List::cons (MemRegion {name: "audio",    device: Dev_Audio,  base: truncate (audio_addr_base),       size: truncate (audio_addr_size),       bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
    rs = List::cons (MemRegion {name: "sdh",      device: Dev_SDH,    base: truncate (sdh_addr_base),         size: truncate (sdh_addr_size),         bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
+`ifdef INCLUDE_VDP
+   rs = List::cons (MemRegion {name: "vdp",      device: Dev_VDP,    base: truncate (vdp_addr_base),         size: truncate (vdp_addr_size),         bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
+   rs = List::cons (MemRegion {name: "vdp_vram", device: Dev_VDP,    base: truncate (vdp_vram_addr_base),    size: truncate (vdp_vram_addr_size),    bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
+`endif
+`ifdef INCLUDE_APU
+   rs = List::cons (MemRegion {name: "apu",      device: Dev_Audio,  base: truncate (apu_addr_base),         size: truncate (apu_addr_size),         bus: "axi",      fabric_decoded: True, irq: 32'h0000_00FF, flags: 1}, rs);
+`endif
 `endif
    return rs;
 endfunction
@@ -271,6 +294,9 @@ function Slave_Num fn_dev_slave_num (DeviceId d);
       Dev_GPIO1:  return fromInteger (periph_slave_num);
       Dev_Audio:  return fromInteger (periph_slave_num);
       Dev_SDH:    return fromInteger (periph_slave_num);
+`ifdef INCLUDE_VDP
+      Dev_VDP:    return fromInteger (periph_slave_num);
+`endif
 `endif
       default:    return fromInteger (0);
    endcase
@@ -476,6 +502,13 @@ module mkSoC_Map (SoC_Map_IFC);
 	      || ((gpio1_addr_base <= addr) && (addr < gpio1_addr_lim))
 	      || ((audio_addr_base <= addr) && (addr < audio_addr_lim))
 	      || ((sdh_addr_base <= addr) && (addr < sdh_addr_lim))
+`ifdef INCLUDE_VDP
+	      || ((vdp_addr_base <= addr) && (addr < vdp_addr_lim))
+	      || ((vdp_vram_addr_base <= addr) && (addr < vdp_vram_addr_lim))
+`endif
+`ifdef INCLUDE_APU
+	      || ((apu_addr_base <= addr) && (addr < apu_addr_lim))
+`endif
 `endif
 `ifdef INCLUDE_ACCEL0
 	      || fn_is_accel0_addr  (addr)
@@ -638,7 +671,7 @@ Integer regbus_periph_num         = valueOf (Num_Periph) - 1;
 function Bool fn_dev_is_periph (DeviceId d);
    return (d == Dev_UART0) || (d == Dev_SoCInfo) || (d == Dev_SPI0) || (d == Dev_Video)
           || (d == Dev_I2C0) || (d == Dev_GPIO1) || (d == Dev_Audio) || (d == Dev_SPI2) || (d == Dev_UART1)
-          || (d == Dev_SDH);
+          || (d == Dev_SDH) || (d == Dev_VDP);
 endfunction
 
 function Periph_Num fn_dev_periph_num (DeviceId d);
@@ -660,6 +693,9 @@ function Periph_Num fn_dev_periph_num (DeviceId d);
       Dev_GPIO1:   return fromInteger (regbus_periph_num);
       Dev_Audio:   return fromInteger (regbus_periph_num);
       Dev_SDH:     return fromInteger (regbus_periph_num);
+`ifdef INCLUDE_VDP
+      Dev_VDP:     return fromInteger (regbus_periph_num);
+`endif
 `endif
       default:     return 0;
    endcase

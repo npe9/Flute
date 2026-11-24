@@ -211,14 +211,19 @@ module mkBranch_Predictor (Branch_Predictor_IFC);
    // stageF.out (predict_rsp) is only consumed when imem.valid, so the extra
    // read latency is hidden.  Cuts the BRAM-output mux -> tag compare ->
    // pred_pc -> imem_req_addr cone (e5 census 23.6 levels) at the BRAM.
+   // E7 is wrong as stated above: imem.valid CAN come the cycle after imem.req (the shim's
+   // cword queue already holds the word, the sequential case), and then the registered output
+   // still holds the previous request's entry.  Measured on the board (2026-11-23, game2d):
+   // loop kernels CPI 2.0-2.4 -> 3.5-4.8, Dhrystone -23%, CoreMark -30%.  Kept only as a
+   // build option for the record (make BTB_OUTREG=1); do not use.
 `ifdef BTB_OUTREG
-   // game2d (2026-11-23): with the VDP the BTB loop (RAM clock-to-out 5.6 ns -> tag compare ->
-   // predict -> imem_req_addr -> RAM address) is the sys_clk critical path; the register takes
-   // the RAM's clock-to-out off it.  make BTB_OUTREG=1.
    Bool bram_has_output_reg = True;
 `else
-   Bool bram_has_output_reg = False;   // E7 (registered BTB read) measured no gain: reverted 2026-10-17
+   Bool bram_has_output_reg = False;
 `endif
+   // A 64-set BTB in LUT RAM (read in the fetch cycle) was also tried for game2d (2026-11-23):
+   // s3/s5 44.48 / 49.07 MHz post-route (worse than the BRAM BTB) -- the loop is routing (18.5
+   // of 22.5 ns on s3), not the RAM.
    BRAM_DUAL_PORT #(BTB_Index, BTB_Entry) btb_bramcore2 <- mkBRAMCore2 (btb_num_sets,
 									bram_has_output_reg);
 
